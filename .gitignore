@@ -1,0 +1,16 @@
+.bloop/
+.bsp/
+.metals/
+.scala-build/
+.vscode-test/
+target/
+project/target/
+project/project/
+modules/**/target/
+examples/**/target/
+examples/**/project/target/
+modules/vscode/node_modules/
+modules/vscode/dist/
+modules/vscode/*.vsix
+*.log
+.DS_Store

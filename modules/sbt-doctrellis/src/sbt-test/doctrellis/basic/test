@@ -1,0 +1,6 @@
+> doctrellisBuild
+$ exists target/doctrellis/mdoc/index.md
+$ exec grep -Fq res0: target/doctrellis/mdoc/index.md
+$ exists target/doctrellis/site/index.html
+$ exec grep -Fq Scripted target/doctrellis/site/index.html
+$ exec grep -Fq res0 target/doctrellis/site/index.html

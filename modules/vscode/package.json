@@ -1,0 +1,97 @@
+{
+  "name": "doctrellis-vscode",
+  "displayName": "DocTrellis",
+  "description": "Start and manage a local DocTrellis documentation preview from VS Code.",
+  "version": "0.1.0",
+  "publisher": "doctrellis",
+  "private": true,
+  "license": "UNLICENSED",
+  "homepage": "https://doctrellis.org",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DocTrellis/sbt-doctrellis.git",
+    "directory": "modules/vscode"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": ["Other"],
+  "keywords": ["scala", "sbt", "documentation", "mdoc", "laika"],
+  "type": "commonjs",
+  "main": "./dist/extension.js",
+  "extensionKind": ["workspace"],
+  "activationEvents": [
+    "onCommand:doctrellis.startPreview",
+    "onCommand:doctrellis.stopPreview",
+    "onCommand:doctrellis.restartPreview",
+    "onCommand:doctrellis.openPreview",
+    "onCommand:doctrellis.showOutput"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Preview start, restart, and open commands are disabled because the workspace configuration controls a local process."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "doctrellis.startPreview",
+        "title": "DocTrellis: Start Preview",
+        "enablement": "isWorkspaceTrusted"
+      },
+      {
+        "command": "doctrellis.stopPreview",
+        "title": "DocTrellis: Stop Preview"
+      },
+      {
+        "command": "doctrellis.restartPreview",
+        "title": "DocTrellis: Restart Preview",
+        "enablement": "isWorkspaceTrusted"
+      },
+      {
+        "command": "doctrellis.openPreview",
+        "title": "DocTrellis: Open Preview",
+        "enablement": "isWorkspaceTrusted"
+      },
+      {
+        "command": "doctrellis.showOutput",
+        "title": "DocTrellis: Show Output"
+      }
+    ],
+    "configuration": {
+      "title": "DocTrellis",
+      "properties": {
+        "doctrellis.openPreviewWhenReady": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the preview inside VS Code after the configured URL becomes ready."
+        },
+        "doctrellis.pollIntervalMs": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 10000,
+          "description": "Interval between preview readiness checks."
+        }
+      }
+    },
+    "jsonValidation": [
+      {
+        "fileMatch": "**/.doctrellis.json",
+        "url": "./schema/doctrellis.schema.json"
+      }
+    ]
+  },
+  "scripts": {
+    "build:fast": "node ./scripts/build.mjs fast",
+    "build:full": "node ./scripts/build.mjs full",
+    "test": "node ./scripts/build.mjs test",
+    "vscode:prepublish": "npm run build:full",
+    "vsix": "vsce package --no-dependencies --skip-license --out doctrellis-0.1.0.vsix",
+    "vsix:list": "vsce ls --no-dependencies"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "3.9.2"
+  }
+}

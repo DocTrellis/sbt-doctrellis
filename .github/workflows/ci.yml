@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: sbt
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: modules/vscode/package-lock.json
+
+      - name: Check formatting
+        run: sbt --batch 'scalafmtCheckAll; scalafmtSbtCheck'
+
+      - name: Run Scala unit tests
+        run: sbt --batch testFull
+
+      - name: Run sbt plugin integration tests
+        run: sbt --batch 'sbtDoctrellis / scripted'
+
+      - name: Verify the basic example
+        shell: bash
+        run: |
+          sbt --batch 'sbtDoctrellis / publishLocal'
+          cd examples/basic
+          sbt --batch doctrellisBuild
+          test -f target/doctrellis/mdoc/index.md
+          grep -F 'MDOC + LAIKA + HELIUM' target/doctrellis/mdoc/index.md
+          test -f target/doctrellis/site/index.html
+
+      - name: Verify the local preview server
+        shell: bash
+        run: |
+          cd examples/basic
+          setsid sbt --server --batch doctrellisPreview > /tmp/doctrellis-preview.log 2>&1 &
+          preview_pid=$!
+          preview_group="-$preview_pid"
+
+          cleanup() {
+            trap - EXIT INT TERM
+            if kill -0 -- "$preview_group" 2>/dev/null; then
+              kill -TERM -- "$preview_group" 2>/dev/null || true
+              for _ in $(seq 1 10); do
+                if ! kill -0 -- "$preview_group" 2>/dev/null; then
+                  break
+                fi
+                sleep 1
+              done
+              if kill -0 -- "$preview_group" 2>/dev/null; then
+                kill -KILL -- "$preview_group" 2>/dev/null || true
+              fi
+            fi
+            wait "$preview_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          ready=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:4242/ > /tmp/doctrellis-preview.html 2>/dev/null; then
+              ready=true
+              break
+            fi
+            if ! kill -0 -- "$preview_group" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != true ]; then
+            cat /tmp/doctrellis-preview.log
+            exit 1
+          fi
+
+          if ! grep -F 'DocTrellis Basic Example' /tmp/doctrellis-preview.html; then
+            cat /tmp/doctrellis-preview.log
+            exit 1
+          fi
+          cleanup
+
+      - name: Link the Scala.js extension
+        run: sbt --batch 'vscode / Compile / fastLinkJS; vscode / Compile / fullLinkJS'
+
+      - name: Install local VSIX tooling
+        working-directory: modules/vscode
+        run: npm ci
+
+      - name: Build local VSIX
+        working-directory: modules/vscode
+        run: npm run vsix
+
+      - name: Inspect VSIX contents
+        shell: bash
+        run: |
+          unzip -Z1 modules/vscode/doctrellis-0.1.0.vsix > /tmp/doctrellis-vsix-files.txt
+          grep -F 'extension/dist/extension.js' /tmp/doctrellis-vsix-files.txt
+          grep -F 'extension/schema/doctrellis.schema.json' /tmp/doctrellis-vsix-files.txt
+          if grep -E '^extension/(application|domain|extension|node_modules|scripts|target)/|(^|/)(node_modules|src|target)/|\.(scala|sbt)$' /tmp/doctrellis-vsix-files.txt; then
+            echo 'VSIX contains excluded development files' >&2
+            exit 1
+          fi

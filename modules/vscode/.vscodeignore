@@ -1,0 +1,12 @@
+.vscodeignore
+application/**
+domain/**
+extension/**
+scripts/**
+node_modules/**
+package-lock.json
+target/**
+*.vsix
+**/*.scala
+**/*.sbt
+**/target/**

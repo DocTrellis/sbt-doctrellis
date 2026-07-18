@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://doctrellis.org/schema/v1/doctrellis.schema.json",
+  "title": "DocTrellis workspace configuration",
+  "description": "Configures the local preview process launched by the DocTrellis VS Code extension.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "preview"],
+  "properties": {
+    "version": {
+      "description": "DocTrellis configuration schema version.",
+      "const": 1
+    },
+    "preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "args", "workingDirectory", "url", "startupTimeoutMs"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Executable to spawn directly. This is not interpreted as a shell string."
+        },
+        "args": {
+          "type": "array",
+          "description": "Arguments passed directly to the executable.",
+          "items": { "type": "string" }
+        },
+        "workingDirectory": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Directory relative to the workspace folder. It must remain inside that folder."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "description": "HTTP(S) URL polled until a 2xx or 3xx response is available."
+        },
+        "startupTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600000,
+          "description": "Maximum time to wait for the preview URL."
+        }
+      }
+    }
+  }
+}
