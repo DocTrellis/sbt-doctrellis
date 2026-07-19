@@ -355,8 +355,6 @@ blocks, and nested structures.
 
 Every behavior change must have a test at the lowest layer that can prove it.
 
-- Use MUnit for pure and JVM tests and MUnit Cats Effect with `IO` as the test
-  interpreter for effect-polymorphic programs.
 - Test opaque parsers with accepted boundary values and representative invalid
   values.
 - Test application services through fake ports; do not load Node or VS Code to
@@ -376,6 +374,67 @@ Every behavior change must have a test at the lowest layer that can prove it.
 A bug fix should include a regression test that fails for the original bug.
 Production WartRemover rules also apply as review rules in test code, even when
 the test configuration does not enforce every wart mechanically.
+
+### Property-based testing
+
+Use property-based tests when behavior can be expressed as a law over a broad
+input space. They complement example-based tests; retain focused examples for
+boundary cases, regressions, and executable documentation.
+
+Prefer `scala-hedgehog` when introducing property-based tests. Its integrated
+shrinking keeps generated values and their shrunk counterexamples within the
+same construction rules, and its state-machine support fits lifecycle and
+resource-management testing. Use another property-testing library only when a
+concrete platform or integration constraint outweighs those benefits, and
+record the reason near the build dependency.
+
+Integrate Hedgehog through `hedgehog-munit` so property-based and example-based
+suites use the MUnit test framework. Do not add the separate Hedgehog sbt test
+framework unless a concrete integration constraint requires it.
+
+- State the property in domain terms before choosing generators.
+- Prefer round trips for encoders, decoders, and reversible transformations.
+- Compare stateful services with a small, pure reference model by generating
+  sequences of commands and checking their postconditions.
+- Check invariants preserved by transformations, including content, size,
+  containment, ordering, and resource ownership where applicable.
+- Check idempotence for normalization, stopping, cleanup, and other operations
+  whose contract says repeated application has no additional effect.
+- Check that distinct paths which the contract says are equivalent reach the
+  same result. Test commutativity, associativity, and type class laws only when
+  each law is part of the public contract.
+- Use structural properties for recursive data and black-box oracles when
+  producing a result is difficult but independently checking it is simple.
+- Generate valid domain values by construction. Generate malformed raw values
+  separately when testing parsers and other boundaries.
+- Keep generators and reference models simpler than the production
+  implementation; duplicating its algorithm proves little.
+- Choose explicit Hedgehog ranges and classifications that cover empty,
+  boundary, ordinary, and large cases relevant to the property. Avoid relying
+  on filtering when a generator can construct the intended domain directly.
+- Turn the smallest counterexample reported by Hedgehog into a focused
+  regression test. Record the seed reported in the failure output and reproduce
+  the generated run by setting that value through the `HEDGEHOG_SEED`
+  environment variable.
+- For effectful or concurrent code, generate operation sequences against a
+  deterministic model.
+
+### Effect interpreters in example-based tests
+
+Use MUnit for example-based tests. When an example-based test must execute
+effects or manage a `Resource`, prefer MUnit Cats Effect and let the test return
+its effect directly; do not call `unsafeRunSync`.
+
+- Choose the least powerful test interpreter that can exercise the behavior.
+  When an effect-polymorphic implementation requires only synchronous effects,
+  instantiate it with `SyncIO`. This verifies that the implementation and its
+  ports are not accidentally coupled to `IO`.
+- Use `IO` when the behavior involves concurrency, fibers, cancellation,
+  scheduling, time, asynchronous callbacks, or runtime-specific blocking
+  semantics. A `SyncIO` test can verify ordinary and failed resource release,
+  but it cannot prove cancellation or concurrent lifecycle behavior.
+- Do not repeat the same test with both `SyncIO` and `IO` unless
+  interpreter-specific behavior is part of the contract.
 
 ## Documentation and contracts
 
@@ -456,6 +515,10 @@ Before requesting review, confirm that:
 - [Parse, don't validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)
 - [Iron: refined types for Scala](https://github.com/Iltotore/iron)
 - [Cats Effect documentation](https://typelevel.org/cats-effect/docs/getting-started)
+- [MUnit Cats Effect](https://github.com/typelevel/munit-cats-effect)
+- [Hedgehog for Scala](https://hedgehogqa.github.io/scala-hedgehog/)
+- [Hedgehog integration with MUnit](https://hedgehogqa.github.io/scala-hedgehog/docs/integration-munit/)
+- [스칼라에서 속성 기반 테스트로 블록체인 개발하기](https://github.com/sungkmi/liftio-2022-slides/blob/main/liftio-2022-slides.md)
 - [Scalafix `OrganizeImports`](https://scalacenter.github.io/scalafix/docs/rules/OrganizeImports.html)
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [sigilaris/sigilaris](https://github.com/sigilaris/sigilaris)
