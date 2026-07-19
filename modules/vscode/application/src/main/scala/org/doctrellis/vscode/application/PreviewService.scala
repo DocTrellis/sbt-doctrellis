@@ -34,6 +34,11 @@ final case class PreviewExited(url: PreviewUrl, exit: ProcessExit)
       s"Preview process exited before ${url.value} became ready (${exit.render}).",
     )
 
+final case class PreviewStoppedDuringStartup(url: PreviewUrl)
+    extends PreviewFailure(
+      s"Preview startup for ${url.value} was stopped before it became ready.",
+    )
+
 final class PreviewService[F[_]] private (
     ports: PreviewPorts[F],
     sessions: Ref[F, Map[String, PreviewSession[F]]],
@@ -41,7 +46,7 @@ final class PreviewService[F[_]] private (
     supervisor: Supervisor[F],
 )(using F: Temporal[F]):
   def start(workspace: Workspace): F[Unit] =
-    mutex.lock.surround(getOrStart(workspace)).flatMap(_.awaitReady)
+    getOrStart(workspace).flatMap(_.awaitReady)
 
   def stop(workspace: Workspace): F[Unit] =
     stopSession(workspace, reportMissing = true)
@@ -53,24 +58,18 @@ final class PreviewService[F[_]] private (
       workspace: Workspace,
       reportMissing: Boolean,
   ): F[Unit] =
-    signalStopping(workspace.key).flatMap: wasActive =>
-      mutex.lock.surround:
-        sessions.get.flatMap:
-          _.get(workspace.key) match
-            case Some(session) =>
-              session.status.set(PreviewStatus.Stopping) *>
-                session.ready.complete(Right(())).void *>
-                session.close.guarantee(
-                  removeExact(workspace.key, session) *>
-                    updateView(workspace, PreviewViewState.Stopped),
-                )
-            case None if reportMissing && !wasActive =>
-              ports.info(
-                s"No DocTrellis preview is running for ${workspace.name}.",
-              )
-            case None if wasActive =>
-              updateView(workspace, PreviewViewState.Stopped)
-            case None => F.unit
+    F.uncancelable: _ =>
+      selectForStop(workspace.key).flatMap:
+        case Some(session) =>
+          val stopped = PreviewStoppedDuringStartup(session.command.url)
+          session.ready.complete(Left(stopped)).void *>
+            session.close *>
+            removeAndStopView(workspace, session)
+        case None if reportMissing =>
+          ports.info(
+            s"No DocTrellis preview is running for ${workspace.name}.",
+          )
+        case None => F.unit
 
   def restart(workspace: Workspace): F[Unit] =
     stop(workspace) *> start(workspace)
@@ -104,32 +103,44 @@ final class PreviewService[F[_]] private (
             .flatMap(command => ports.openExternal(command.url))
 
   def stopAll: F[Unit] =
-    mutex.lock.surround:
-      sessions
-        .getAndSet(Map.empty)
-        .flatMap:
-          _.values.toList.traverse_(session =>
-            (session.status.set(PreviewStatus.Stopping) *>
-              session.ready.complete(Right(())).void *>
-              session.close *>
-              updateView(session.workspace, PreviewViewState.Stopped))
-              .handleErrorWith(error =>
-                report(
-                  s"Failed to stop preview at ${session.command.url.value}: ${message(error)}",
-                ),
+    F.uncancelable: _ =>
+      selectAllForStop.flatMap: selected =>
+        selected.traverse_(session =>
+          val stopped = PreviewStoppedDuringStartup(session.command.url)
+          (session.ready.complete(Left(stopped)).void *>
+            session.close *>
+            removeAndStopView(session.workspace, session))
+            .handleErrorWith(error =>
+              report(
+                s"Failed to stop preview at ${session.command.url.value}: ${message(error)}",
               ),
-          )
+            ),
+        )
 
   private def getOrStart(workspace: Workspace): F[PreviewSession[F]] =
-    sessions.get.flatMap:
-      _.get(workspace.key) match
-        case Some(session) =>
-          ports
-            .info(
-              s"DocTrellis preview is already active for ${workspace.name}.",
-            )
-            .as(session)
-        case None => createSession(workspace)
+    mutex.lock
+      .surround:
+        sessions.get.flatMap:
+          _.get(workspace.key) match
+            case Some(session) =>
+              session.status.get.flatMap:
+                case PreviewStatus.Starting | PreviewStatus.Ready =>
+                  ports
+                    .info(
+                      s"DocTrellis preview is already active for ${workspace.name}.",
+                    )
+                    .as(StartDecision.Use(session))
+                case PreviewStatus.Stopping | PreviewStatus.Terminal(_) =>
+                  session.isClosed.flatMap:
+                    case true =>
+                      removeExact(workspace.key, session) *>
+                        createSession(workspace).map(StartDecision.Use(_))
+                    case false => F.pure(StartDecision.Wait(session))
+            case None => createSession(workspace).map(StartDecision.Use(_))
+      .flatMap:
+        case StartDecision.Use(session)  => F.pure(session)
+        case StartDecision.Wait(session) =>
+          session.awaitClosed *> getOrStart(workspace)
 
   private def createSession(workspace: Workspace): F[PreviewSession[F]] =
     (for
@@ -160,12 +171,12 @@ final class PreviewService[F[_]] private (
                 s"Preview lifecycle failed for ${workspace.name}: ${message(error)}",
               )
           .guarantee(
-            removeExact(workspace.key, session) *>
-              session.close.handleErrorWith(error =>
+            session.close.attempt.flatMap:
+              case Right(_)    => removeExactLocked(workspace.key, session)
+              case Left(error) =>
                 report(
                   s"Failed to release preview for ${workspace.name}: ${message(error)}",
                 ),
-              ),
           )
         val publish = sessions.update(_.updated(workspace.key, session)) *>
           updateView(workspace, PreviewViewState.Starting) *>
@@ -189,20 +200,15 @@ final class PreviewService[F[_]] private (
           for
             status <- Ref.of[F, PreviewStatus](PreviewStatus.Starting)
             ready  <- Deferred[F, Either[Throwable, Unit]]
-            closed <- Ref.of[F, Boolean](false)
-            close = closed
-              .modify:
-                case true  => true -> F.unit
-                case false => true -> release
-              .flatten
+            closer <- SessionCloser.create(release)
           yield PreviewSession(
-            workspace,
-            command,
-            policy,
-            running,
-            status,
-            ready,
-            close,
+            workspace = workspace,
+            command = command,
+            policy = policy,
+            running = running,
+            status = status,
+            ready = ready,
+            closer = closer,
           )
 
   private def monitor(
@@ -241,15 +247,32 @@ final class PreviewService[F[_]] private (
         case PreviewStatus.Stopping => PreviewStatus.Stopping -> false
         case _                      => PreviewStatus.Ready    -> true
       .flatMap:
-        case false => session.ready.complete(Right(())).void
-        case true  =>
+        case false =>
+          session.ready
+            .complete(Left(PreviewStoppedDuringStartup(session.command.url)))
+            .void
+        case true =>
           ports
             .info(s"DocTrellis preview is ready for ${workspace.name}.")
             .attempt
             .void *>
             displayReady(workspace, session).flatMap: displayed =>
-              session.ready.complete(Right(())).void *>
-                F.whenA(displayed)(continueReadySession(workspace, session))
+              session.status.get.flatMap:
+                case PreviewStatus.Ready =>
+                  session.ready.complete(Right(())).void *>
+                    F.whenA(displayed)(continueReadySession(workspace, session))
+                case PreviewStatus.Stopping =>
+                  session.ready
+                    .complete(
+                      Left(PreviewStoppedDuringStartup(session.command.url)),
+                    )
+                    .void
+                case PreviewStatus.Starting | PreviewStatus.Terminal(_) =>
+                  session.ready
+                    .complete(
+                      Left(PreviewStoppedDuringStartup(session.command.url)),
+                    )
+                    .void
 
   private def continueReadySession(
       workspace: Workspace,
@@ -290,14 +313,14 @@ final class PreviewService[F[_]] private (
       case None            => F.pure(false)
       case Some(displayed) =>
         session.close.attempt.flatMap: released =>
-          convergeReleasedTerminal(workspace, session, displayed)
-            .flatTap(_ =>
-              released.swap.toOption.traverse_(error =>
-                report(
-                  s"Failed to release preview for ${workspace.name}: ${message(error)}",
-                ),
-              ),
-            )
+          released match
+            case Right(_) =>
+              removeExactLocked(workspace.key, session) *>
+                convergeReleasedTerminal(workspace, session, displayed)
+            case Left(error) =>
+              report(
+                s"Failed to release preview for ${workspace.name}: ${message(error)}",
+              ).as(false)
 
   private def prepareTerminalView(
       workspace: Workspace,
@@ -319,7 +342,6 @@ final class PreviewService[F[_]] private (
                       updateView(workspace, PreviewViewState.Stopped).as(false)
                     case _ => F.pure(true)
             display
-              .flatTap(_ => removeExact(workspace.key, session))
               .map(Some(_))
           case _ => F.pure(None)
 
@@ -363,12 +385,36 @@ final class PreviewService[F[_]] private (
         case Some(actual) if actual.eq(expected) => current.removed(key)
         case _                                   => current
 
-  private def signalStopping(key: String): F[Boolean] =
-    sessions.get.flatMap:
-      _.get(key) match
-        case Some(session) =>
-          session.status.set(PreviewStatus.Stopping).as(true)
-        case None => F.pure(false)
+  private def selectForStop(key: String): F[Option[PreviewSession[F]]] =
+    mutex.lock.surround:
+      sessions.get.flatMap:
+        _.get(key).traverse: session =>
+          session.status.set(PreviewStatus.Stopping).as(session)
+
+  private def selectAllForStop: F[List[PreviewSession[F]]] =
+    mutex.lock.surround:
+      sessions.get.flatMap: current =>
+        current.values.toList.traverse: session =>
+          session.status.set(PreviewStatus.Stopping).as(session)
+
+  private def removeExactLocked(
+      key: String,
+      expected: PreviewSession[F],
+  ): F[Unit] =
+    mutex.lock.surround(removeExact(key, expected))
+
+  private def removeAndStopView(
+      workspace: Workspace,
+      expected: PreviewSession[F],
+  ): F[Unit] =
+    mutex.lock.surround:
+      sessions.get.flatMap:
+        _.get(workspace.key) match
+          case Some(actual) if actual.eq(expected) =>
+            removeExact(workspace.key, expected) *>
+              updateView(workspace, PreviewViewState.Stopped)
+          case None    => updateView(workspace, PreviewViewState.Stopped)
+          case Some(_) => F.unit
 
   private def sessionView(
       session: PreviewSession[F],
@@ -480,10 +526,91 @@ private final case class PreviewSession[F[_]](
     running: RunningProcess[F],
     status: Ref[F, PreviewStatus],
     ready: Deferred[F, Either[Throwable, Unit]],
-    close: F[Unit],
+    closer: SessionCloser[F],
 ):
   def awaitReady(using F: Temporal[F]): F[Unit] =
     ready.get.flatMap(_.liftTo[F])
+
+  def close: F[Unit] = closer.close
+
+  def awaitClosed: F[Unit] = closer.awaitClosed
+
+  def isClosed: F[Boolean] = closer.isClosed
+
+private final class SessionCloser[F[_]] private (
+    release: F[Unit],
+    state: Ref[F, SessionCloseState[F]],
+    started: Deferred[F, Unit],
+)(using F: Temporal[F]):
+  def close: F[Unit] =
+    F.uncancelable: poll =>
+      Deferred[F, Either[Throwable, Unit]].flatMap: candidate =>
+        state
+          .modify:
+            case SessionCloseState.Fresh() | SessionCloseState.Failed() =>
+              SessionCloseState.Running(candidate) ->
+                SessionCloseDecision.Owner(candidate)
+            case current @ SessionCloseState.Running(result) =>
+              current -> SessionCloseDecision.Wait(result)
+            case SessionCloseState.Closed() =>
+              SessionCloseState.Closed() -> SessionCloseDecision.Done()
+          .flatMap:
+            case SessionCloseDecision.Owner(result) =>
+              started.complete(()).void *>
+                release.attempt.flatMap: outcome =>
+                  val finish = outcome match
+                    case Right(_) =>
+                      state.set(SessionCloseState.Closed())
+                    case Left(_) => state.set(SessionCloseState.Failed())
+                  finish *>
+                    result.complete(outcome).void *>
+                    outcome.liftTo[F]
+            case SessionCloseDecision.Wait(result) =>
+              poll(result.get).flatMap(_.liftTo[F])
+            case SessionCloseDecision.Done() => F.unit
+
+  def awaitClosed: F[Unit] =
+    state.get.flatMap:
+      case SessionCloseState.Fresh()         => started.get *> awaitClosed
+      case SessionCloseState.Running(result) =>
+        result.get.flatMap:
+          case Right(_) => F.unit
+          case Left(_)  => close
+      case SessionCloseState.Failed() => close
+      case SessionCloseState.Closed() => F.unit
+
+  def isClosed: F[Boolean] =
+    state.get.map:
+      case SessionCloseState.Closed() => true
+      case _                          => false
+
+private object SessionCloser:
+  def create[F[_]](
+      release: F[Unit],
+  )(using F: Temporal[F]): F[SessionCloser[F]] =
+    for
+      state   <- Ref.of[F, SessionCloseState[F]](SessionCloseState.Fresh())
+      started <- Deferred[F, Unit]
+    yield SessionCloser(
+      release = release,
+      state = state,
+      started = started,
+    )
+
+private enum SessionCloseState[F[_]]:
+  case Fresh()
+  case Failed()
+  case Closed()
+  case Running(result: Deferred[F, Either[Throwable, Unit]])
+
+private enum SessionCloseDecision[F[_]]:
+  case Owner(result: Deferred[F, Either[Throwable, Unit]])
+  case Wait(result: Deferred[F, Either[Throwable, Unit]])
+  case Done()
+
+private enum StartDecision[F[_]]:
+  case Use(session: PreviewSession[F])
+  case Wait(session: PreviewSession[F])
 
 object PreviewService:
   def resource[F[_]](

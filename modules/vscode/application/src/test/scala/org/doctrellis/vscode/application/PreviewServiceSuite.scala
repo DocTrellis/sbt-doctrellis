@@ -82,6 +82,245 @@ class PreviewServiceSuite extends CatsEffectSuite:
       released <- releases.get
     yield assertEquals(released, 1)
 
+  test("stop is idempotent"):
+    for
+      launches <- Ref.of[IO, Int](0)
+      releases <- Ref.of[IO, Int](0)
+      ports = healthyPorts(launches, releases)
+      _ <- PreviewService
+        .resource(ports)
+        .use: service =>
+          service.start(workspace) *>
+            service.stop(workspace) *>
+            service.stop(workspace)
+      released <- releases.get
+    yield assertEquals(released, 1)
+
+  test("concurrent stops share one in-flight release"):
+    for
+      closeEntered  <- Deferred[IO, Unit]
+      continueClose <- Deferred[IO, Unit]
+      releases      <- Ref.of[IO, Int](0)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(IO.pure(RunningProcess(IO.never)))(_ =>
+            releases.update(_ + 1) *>
+              closeEntered.complete(()).void *>
+              continueClose.get,
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      count <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _      <- service.start(workspace)
+            first  <- service.stop(workspace).start
+            _      <- closeEntered.get
+            second <- service.stop(workspace).start
+            _      <- IO.cede
+            _      <- continueClose.complete(())
+            _      <- (first.joinWithNever, second.joinWithNever).parTupled
+            actual <- releases.get
+          yield actual
+    yield assertEquals(count, 1)
+
+  test("a failed release can be retried before a replacement starts"):
+    val failure = IllegalStateException("transient release failure")
+    for
+      launches <- Ref.of[IO, Int](0)
+      releases <- Ref.of[IO, Int](0)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            launches.update(_ + 1).as(RunningProcess(IO.never)),
+          )(_ =>
+            releases
+              .modify(count => (count + 1) -> count)
+              .flatMap:
+                case 0 => IO.raiseError(failure)
+                case _ => IO.unit,
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _         <- service.start(workspace)
+            firstStop <- service.stop(workspace).attempt
+            _         <- service.start(workspace)
+            launched  <- launches.get
+            released  <- releases.get
+          yield (firstStop, launched, released)
+      (firstStop, launched, released) = result
+    yield
+      assertEquals(firstStop, Left(failure))
+      assertEquals(launched, 2)
+      assertEquals(released, 2)
+
+  test("restart waits for the previous release before launching"):
+    for
+      launches      <- Ref.of[IO, Int](0)
+      closeEntered  <- Deferred[IO, Unit]
+      continueClose <- Deferred[IO, Unit]
+      ordering      <- Ref.of[IO, Vector[String]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            launches
+              .updateAndGet(_ + 1)
+              .flatTap: count =>
+                IO.whenA(count == 2)(ordering.update(_ :+ "new-launch"))
+              .as(RunningProcess(IO.never)),
+          )(_ =>
+            launches.get.flatMap: count =>
+              IO.whenA(count == 1):
+                closeEntered.complete(()).void *>
+                  continueClose.get *>
+                  ordering.update(_ :+ "old-released"),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _       <- service.start(workspace)
+            restart <- service.restart(workspace).start
+            _       <- closeEntered.get
+            before  <- launches.get
+            _       <- continueClose.complete(())
+            _       <- restart.joinWithNever
+            order   <- ordering.get
+          yield before -> order
+      (before, order) = actual
+    yield
+      assertEquals(before, 1)
+      assertEquals(order, Vector("old-released", "new-launch"))
+
+  test("a completed stop cannot overwrite a replacement starting view"):
+    for
+      launches         <- Ref.of[IO, Int](0)
+      closeEntered     <- Deferred[IO, Unit]
+      continueClose    <- Deferred[IO, Unit]
+      replacementSeen  <- Deferred[IO, Unit]
+      replacementReady <- Deferred[IO, Unit]
+      states           <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource
+            .make(
+              launches
+                .updateAndGet(_ + 1)
+                .map(count => count -> RunningProcess[IO](IO.never)),
+            ):
+              case (count, _) =>
+                IO.whenA(count == 1):
+                  closeEntered.complete(()).void *> continueClose.get
+            .map(_._2),
+        probe = _ =>
+          launches.get.flatMap:
+            case 1 => IO.pure(true)
+            case _ => replacementReady.get.as(true),
+        show = (_, _) => IO.unit,
+        update = (_, state) =>
+          states.update(_ :+ state) *>
+            (state match
+              case PreviewViewState.Starting =>
+                launches.get.flatMap(count =>
+                  IO.whenA(count == 2)(replacementSeen.complete(()).void),
+                )
+              case _ => IO.unit),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _       <- service.start(workspace)
+            stop    <- service.stop(workspace).start
+            _       <- closeEntered.get
+            replace <- service.start(workspace).start
+            _       <- continueClose.complete(())
+            _       <- replacementSeen.get
+            _       <- stop.joinWithNever
+            current <- states.get
+            _       <- replacementReady.complete(())
+            _       <- replace.joinWithNever
+          yield current
+    yield assertEquals(actual.lastOption, Some(PreviewViewState.Starting))
+
+  test("silent workspace cleanup stops only the selected workspace"):
+    val second = workspace.copy(
+      key = "file:///workspace-two",
+      name = "example-two",
+      root = "/workspace-two",
+      uri = "file:///workspace-two",
+    )
+    for
+      releases <- Ref.of[IO, Vector[String]](Vector.empty)
+      launches <- Ref.of[IO, Map[String, Int]](Map.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (current, _) =>
+          Resource.make(
+            launches
+              .update(values =>
+                values.updated(
+                  current.key,
+                  values.getOrElse(current.key, 0) + 1,
+                ),
+              )
+              .as(RunningProcess(IO.never)),
+          )(_ => releases.update(_ :+ current.key)),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          service.start(workspace) *>
+            service.start(second) *>
+            service.stopSilently(workspace) *>
+            service.start(second) *>
+            (releases.get, launches.get).tupled
+      (releasedDuringUse, launched) = result
+    yield
+      assertEquals(releasedDuringUse, Vector(workspace.key))
+      assertEquals(launched.get(workspace.key), Some(1))
+      assertEquals(launched.get(second.key), Some(1))
+
   test("explicit stop leaves an existing preview view in the stopped state"):
     for
       launches <- Ref.of[IO, Int](0)
@@ -267,11 +506,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .resource(ports)
         .use: service =>
           for
-            start <- service.start(workspace).start
-            _     <- launched.get
-            _     <- service.open(workspace)
-            _     <- service.stop(workspace)
-            _     <- start.joinWithNever
+            start  <- service.start(workspace).attempt.start
+            _      <- launched.get
+            _      <- service.open(workspace)
+            _      <- service.stop(workspace)
+            result <- start.joinWithNever
+            _      <- IO(assertStoppedDuringStartup(result))
           yield ()
       states <- shown.get
     yield assertEquals(states, Vector(PreviewViewState.Starting))
@@ -523,10 +763,11 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .resource(ports)
         .use: service =>
           for
-            start <- service.start(workspace).start
-            _     <- launched.get
-            _     <- service.stop(workspace)
-            _     <- start.joinWithNever
+            start  <- service.start(workspace).attempt.start
+            _      <- launched.get
+            _      <- service.stop(workspace)
+            result <- start.joinWithNever
+            _      <- IO(assertStoppedDuringStartup(result))
           yield ()
       count  <- released.get
       actual <- states.get
@@ -559,11 +800,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .resource(ports)
         .use: service =>
           for
-            start <- service.start(workspace).start
-            _     <- infoEntered.get
-            _     <- service.stop(workspace)
-            _     <- continueInfo.complete(())
-            _     <- start.joinWithNever
+            start  <- service.start(workspace).attempt.start
+            _      <- infoEntered.get
+            _      <- service.stop(workspace)
+            _      <- continueInfo.complete(())
+            result <- start.joinWithNever
+            _      <- IO(assertStoppedDuringStartup(result))
           yield ()
       actual <- states.get
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
@@ -606,12 +848,13 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .resource(ports)
         .use: service =>
           for
-            firstStart <- service.start(workspace).start
+            firstStart <- service.start(workspace).attempt.start
             _          <- infoEntered.get
             restart    <- service.restart(workspace).start
             _          <- replacementReady.get
             _          <- continueInfo.complete(())
-            _          <- firstStart.joinWithNever
+            first      <- firstStart.joinWithNever
+            _          <- IO(assertStoppedDuringStartup(first))
             _          <- restart.joinWithNever
             current    <- states.get
           yield current
@@ -854,7 +1097,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield ()
     yield ()
 
-  test("attempts every release when one session cleanup fails"):
+  test("attempts every release and retries a failed session cleanup"):
     val second = workspace.copy(
       key = "file:///workspace-two",
       name = "example-two",
@@ -887,7 +1130,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
             service.start(second) *>
             service.stopAll
       count <- releases.get
-    yield assertEquals(count, 2)
+    yield assertEquals(count, 4)
 
   private def healthyPorts(
       launches: Ref[IO, Int],
@@ -910,3 +1153,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)
+
+  private def assertStoppedDuringStartup(
+      result: Either[Throwable, Unit],
+  ): Unit =
+    assert(result.swap.exists:
+      case PreviewStoppedDuringStartup(_) => true
+      case _                              => false)

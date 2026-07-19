@@ -19,11 +19,11 @@
         "command": {
           "type": "string",
           "minLength": 1,
-          "description": "Executable to spawn directly. This is not interpreted as a shell string."
+          "description": "Native executable to spawn directly. This is not interpreted as a shell string; Windows .bat and .cmd launchers require a native executable shim."
         },
         "args": {
           "type": "array",
-          "description": "Arguments passed directly to the executable.",
+          "description": "Arguments passed directly to the executable. For sbt 2 previews, use [\"--server\", \"--batch\", \"doctrellisPreview\"] so the extension owns the foreground JVM.",
           "items": { "type": "string" }
         },
         "workingDirectory": {

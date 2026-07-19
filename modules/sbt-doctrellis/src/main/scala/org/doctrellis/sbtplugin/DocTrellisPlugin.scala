@@ -14,6 +14,7 @@ import sbt.Keys.*
 import java.io.IOException
 import java.net.{BindException, InetSocketAddress}
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.{CountDownLatch, Executors}
 import scala.util.control.NonFatal
 
@@ -158,25 +159,61 @@ private[sbtplugin] object PreviewServer:
     server.createContext("/", StaticSiteHandler(root))
     server.setExecutor(executor)
 
+    val shutdown = PreviewServerShutdown(
+      stopServer = () => server.stop(0),
+      stopExecutor = () => executor.shutdownNow(),
+      signalStopped = () => stopped.countDown(),
+    )
+
     val shutdownHook = Thread(
-      () =>
-        server.stop(0)
-        executor.shutdownNow()
-        stopped.countDown()
-      ,
+      () => shutdown.stop(),
       "doctrellis-preview-shutdown",
     )
 
     java.lang.Runtime.getRuntime.addShutdownHook(shutdownHook)
+    var primaryFailure = Option.empty[Throwable]
     try
       server.start()
       log.success(s"DocTrellis preview ready at http://$host:$port")
       log.info("Press Ctrl+C to stop the preview server.")
       stopped.await()
-    catch case _: InterruptedException => Thread.currentThread().interrupt()
+    catch
+      case _: InterruptedException => Thread.currentThread().interrupt()
+      case error: Throwable        =>
+        primaryFailure = Some(error)
+        throw error
     finally
-      server.stop(0)
-      executor.shutdownNow()
-      stopped.countDown()
-      try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook)
-      catch case _: IllegalStateException => ()
+      try shutdown.stopPreserving(primaryFailure)
+      finally
+        try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook)
+        catch case _: IllegalStateException => ()
+
+private[sbtplugin] final class PreviewServerShutdown(
+    stopServer: () => Unit,
+    stopExecutor: () => Unit,
+    signalStopped: () => Unit,
+):
+  private val stopped = AtomicBoolean(false)
+
+  def stop(): Unit =
+    if stopped.compareAndSet(false, true) then
+      var failure = Option.empty[Throwable]
+
+      def attempt(action: () => Unit): Unit =
+        try action()
+        catch
+          case NonFatal(error) =>
+            if failure.isEmpty then failure = Some(error)
+
+      attempt(stopServer)
+      attempt(stopExecutor)
+      attempt(signalStopped)
+      failure.foreach(throw _)
+
+  def stopPreserving(primary: Option[Throwable]): Unit =
+    try stop()
+    catch
+      case NonFatal(cleanup) =>
+        primary match
+          case Some(error) => error.addSuppressed(cleanup)
+          case None        => throw cleanup

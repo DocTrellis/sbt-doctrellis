@@ -150,7 +150,7 @@ Create `.doctrellis.json` at each workspace folder root:
   "version": 1,
   "preview": {
     "command": "sbt",
-    "args": ["doctrellisPreview"],
+    "args": ["--server", "--batch", "doctrellisPreview"],
     "workingDirectory": ".",
     "url": "http://127.0.0.1:4242",
     "startupTimeoutMs": 90000
@@ -164,6 +164,20 @@ resolved before use, including a check that symlinks do not escape the
 workspace. The extension accepts schema version 1 only and reports malformed,
 missing, and unexpected fields before starting a process.
 
+For sbt 2, keep `--server` and `--batch` in the configured argument vector as
+shown above. This foreground form keeps the preview JVM in the exact process
+tree owned by the extension, so Stop, workspace close, and deactivation can
+terminate it and wait for the HTTP listener to close. Existing version 1
+configurations remain valid and commands are always used verbatim; the
+extension never inserts sbt-specific arguments into arbitrary executables.
+On Windows, `command` must resolve to a native executable such as an
+`sbt.exe` package-manager shim (or its absolute path). Node intentionally does
+not invoke a shell, so `.bat` and `.cmd` launchers are not directly executable;
+the `args` vector remains the same foreground form.
+Windows cleanup relies on the spawned native launcher's PID tree remaining
+addressable through `taskkill /T`; if a launcher detaches and disappears first,
+Stop reports failure rather than targeting processes by name or port.
+
 In a trusted workspace, use these Command Palette commands:
 
 - **DocTrellis: Start Preview**
@@ -174,9 +188,12 @@ In a trusted workspace, use these Command Palette commands:
 - **DocTrellis: Show Output**
 
 For a multi-root workspace, DocTrellis asks which folder to use. It manages at
-most one child process per folder, sends output to the `DocTrellis` Output
-Channel, and stops children when their folder closes or the extension
-deactivates. It does not start commands automatically. The default open action
+most one owned process tree per folder, sends output to the `DocTrellis` Output
+Channel, and stops the selected tree when its folder closes or the extension
+deactivates. On POSIX it uses a dedicated process group; on Windows it targets
+the spawned PID's process tree. Graceful shutdown is attempted first, with a
+bounded exact-tree force fallback. It does not start commands automatically.
+The default open action
 uses one `DocTrellis Preview` Webview panel per workspace folder, reuses that
 panel across repeated opens and restarts, and shows stopped, startup-failure,
 or unexpected-exit status without closing the tab. Preview HTTP URLs pass

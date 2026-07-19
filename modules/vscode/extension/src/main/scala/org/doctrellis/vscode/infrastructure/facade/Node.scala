@@ -10,6 +10,7 @@ trait ReadableStream extends js.Object:
 
 @js.native
 trait ChildProcess extends js.Object:
+  val pid: js.UndefOr[Int]                                     = js.native
   val stdout: ReadableStream                                   = js.native
   val stderr: ReadableStream                                   = js.native
   val exitCode: js.Any                                         = js.native
@@ -37,6 +38,14 @@ object NodeChildProcess extends js.Object:
       args: js.Array[String],
       options: js.Object,
   ): ChildProcess = js.native
+
+@js.native
+@JSImport("node:process", JSImport.Namespace)
+object NodeRuntime extends js.Object:
+  val env: js.Dictionary[js.UndefOr[String]]  = js.native
+  val platform: String                        = js.native
+  def kill(pid: Int, signal: String): Boolean = js.native
+  def kill(pid: Int, signal: Int): Boolean    = js.native
 
 @js.native
 @JSImport("node:fs/promises", JSImport.Namespace)

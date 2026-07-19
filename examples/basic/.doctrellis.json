@@ -2,7 +2,7 @@
   "version": 1,
   "preview": {
     "command": "sbt",
-    "args": ["doctrellisPreview"],
+    "args": ["--server", "--batch", "doctrellisPreview"],
     "workingDirectory": ".",
     "url": "http://127.0.0.1:4242",
     "startupTimeoutMs": 90000
