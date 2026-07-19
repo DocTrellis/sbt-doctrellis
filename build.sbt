@@ -1,12 +1,26 @@
 import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle}
+import sbt.AutoPlugin
 
 ThisBuild / organization := "org.doctrellis"
 ThisBuild / version      := "0.1.0-SNAPSHOT"
 ThisBuild / homepage     := Some(uri("https://doctrellis.org"))
 
+private def selfHostedDocTrellisPlugin: Seq[AutoPlugin] =
+  if (sys.props.get("doctrellis.selfHost").contains("true")) {
+    // A fresh checkout must publish the plugin before loading it as a build
+    // dependency. This boundary is therefore only resolved by the explicit
+    // self-host Preview process, never by ordinary builds or CI.
+    val module = Class
+      .forName("org.doctrellis.sbtplugin.DocTrellisPlugin$")
+      .getField("MODULE$")
+      .get(null)
+    Seq(module.asInstanceOf[AutoPlugin])
+  } else Seq.empty
+
 lazy val root = project
   .in(file("."))
   .aggregate(sbtDoctrellis, vscodeDomain, vscodeApplication, vscode)
+  .enablePlugins(selfHostedDocTrellisPlugin *)
   .settings(
     name           := "doctrellis",
     publish / skip := true,

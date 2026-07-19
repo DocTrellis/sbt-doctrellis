@@ -61,6 +61,15 @@ local sbt repository:
 sbt --batch 'sbtDoctrellis / publishLocal'
 ```
 
+This source repository also consumes that local artifact to preview its own
+ADRs. After publishing it, open the repository root in VS Code and run
+**DocTrellis: Start Preview**. The root `.doctrellis.json` starts the root
+project, whose `docs/index.md` links the architecture decision records. The
+Preview command opts into this local artifact explicitly, so ordinary builds
+and CI do not require it. When developing the plugin itself, run
+`sbtDoctrellis / publishLocal` again and restart Preview before checking
+behavior changed in the plugin.
+
 Add the plugin to `project/plugins.sbt`:
 
 ```scala

@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "preview": {
+    "command": "sbt",
+    "args": [
+      "-Ddoctrellis.selfHost=true",
+      "--server",
+      "--batch",
+      "set doctrellisPort := 0",
+      "doctrellisPreview"
+    ],
+    "workingDirectory": ".",
+    "endpoint": {
+      "source": "ipc",
+      "protocol": "doctrellis-preview-v1"
+    },
+    "startupTimeoutMs": 90000
+  }
+}
