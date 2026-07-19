@@ -1,13 +1,15 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.{Deferred, IO}
-import cats.syntax.all.*
-import munit.CatsEffectSuite
-import org.doctrellis.vscode.domain.*
-
 import scala.collection.mutable
 import scala.scalajs.js
 import scala.scalajs.js.annotation.JSImport
+
+import cats.effect.{Deferred, IO}
+import cats.syntax.all.*
+
+import munit.CatsEffectSuite
+
+import org.doctrellis.vscode.domain.*
 
 class WebviewPreviewSuite extends CatsEffectSuite:
   private val first =

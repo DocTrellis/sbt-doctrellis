@@ -1,11 +1,12 @@
 package org.doctrellis.vscode.infrastructure
 
+import scala.scalajs.js
+
 import cats.effect.IO
 import cats.syntax.all.*
+
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.{NodeFsPromises, NodePath}
-
-import scala.scalajs.js
 
 private[infrastructure] object ConfigParser:
   private enum ConfigVersion:

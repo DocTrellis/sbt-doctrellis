@@ -1,14 +1,15 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
+import scala.concurrent.duration.*
+import scala.scalajs.js
+
 import cats.effect.{Deferred, IO, Ref, Resource}
+import cats.effect.std.Dispatcher
 import cats.syntax.all.*
+
 import org.doctrellis.vscode.application.RunningProcess
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
-
-import scala.concurrent.duration.*
-import scala.scalajs.js
 
 private[infrastructure] final case class WorkspaceChannelEndpoint(
     canonicalWorkspace: String,

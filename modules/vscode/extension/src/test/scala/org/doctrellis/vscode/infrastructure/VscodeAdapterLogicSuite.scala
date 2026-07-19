@@ -1,10 +1,11 @@
 package org.doctrellis.vscode.infrastructure
 
-import munit.FunSuite
-import org.doctrellis.vscode.domain.*
-
 import scala.concurrent.duration.*
 import scala.scalajs.js
+
+import munit.FunSuite
+
+import org.doctrellis.vscode.domain.*
 
 class VscodeAdapterLogicSuite extends FunSuite:
   test("multi-root selection keeps labels and workspaces independent"):

@@ -1,14 +1,15 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
+import scala.scalajs.js
+import scala.scalajs.js.JSConverters.*
+
 import cats.effect.{IO, Resource}
+import cats.effect.std.Dispatcher
 import cats.syntax.all.*
+
 import org.doctrellis.vscode.application.PreviewService
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
-
-import scala.scalajs.js
-import scala.scalajs.js.JSConverters.*
 
 private[infrastructure] final class VscodeOutput private (
     channel: OutputChannel,

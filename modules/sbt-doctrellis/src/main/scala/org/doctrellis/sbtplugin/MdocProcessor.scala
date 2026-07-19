@@ -1,13 +1,14 @@
 package org.doctrellis.sbtplugin
 
-import mdoc.interfaces.{DiagnosticSeverity, Mdoc}
-
 import java.net.{URL, URLClassLoader}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardCopyOption}
 import java.util.ServiceLoader
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
+
+import mdoc.interfaces.{DiagnosticSeverity, Mdoc}
 
 private[sbtplugin] object MdocProcessor:
   def process(

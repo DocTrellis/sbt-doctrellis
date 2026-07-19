@@ -1,11 +1,11 @@
 package org.doctrellis.sbtplugin
 
-import com.sun.net.httpserver.{HttpExchange, HttpHandler}
-
 import java.io.IOException
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
+
+import com.sun.net.httpserver.{HttpExchange, HttpHandler}
 
 private[sbtplugin] final class StaticSiteHandler private (root: Path)
     extends HttpHandler:

@@ -1,9 +1,15 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
+import scala.concurrent.duration.*
+import scala.scalajs.js
+import scala.util.matching.Regex
+
 import cats.effect.{Deferred, IO, Ref, Resource}
+import cats.effect.std.Dispatcher
 import cats.syntax.all.*
+
 import munit.CatsEffectSuite
+
 import org.doctrellis.vscode.application.RunningProcess
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.{
@@ -14,10 +20,6 @@ import org.doctrellis.vscode.infrastructure.facade.{
   TestNodeFsPromises,
   TestNodeRuntime,
 }
-
-import scala.concurrent.duration.*
-import scala.scalajs.js
-import scala.util.matching.Regex
 
 class NodeProcessSuite extends CatsEffectSuite:
   private val workspace = Workspace(

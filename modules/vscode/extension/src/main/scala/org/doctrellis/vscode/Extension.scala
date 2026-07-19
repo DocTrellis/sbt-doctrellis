@@ -1,12 +1,13 @@
 package org.doctrellis.vscode
 
-import cats.effect.IO
-import cats.effect.unsafe.IORuntime
-import org.doctrellis.vscode.infrastructure.ExtensionRuntime
-import org.doctrellis.vscode.infrastructure.facade.ExtensionContext
-
 import scala.scalajs.js
 import scala.scalajs.js.annotation.JSExportTopLevel
+
+import cats.effect.IO
+import cats.effect.unsafe.IORuntime
+
+import org.doctrellis.vscode.infrastructure.ExtensionRuntime
+import org.doctrellis.vscode.infrastructure.facade.ExtensionContext
 
 object Extension:
   private given IORuntime       = IORuntime.global

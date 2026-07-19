@@ -1,7 +1,8 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
 import cats.effect.{IO, Resource}
+import cats.effect.std.Dispatcher
+
 import org.doctrellis.vscode.application.{PreviewPorts, PreviewService}
 import org.doctrellis.vscode.infrastructure.facade.ExtensionContext
 

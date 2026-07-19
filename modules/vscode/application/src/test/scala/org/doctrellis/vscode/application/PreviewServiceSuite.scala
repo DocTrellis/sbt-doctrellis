@@ -1,11 +1,13 @@
 package org.doctrellis.vscode.application
 
+import scala.concurrent.duration.*
+
 import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.syntax.all.*
-import munit.CatsEffectSuite
-import org.doctrellis.vscode.domain.*
 
-import scala.concurrent.duration.*
+import munit.CatsEffectSuite
+
+import org.doctrellis.vscode.domain.*
 
 class PreviewServiceSuite extends CatsEffectSuite:
   private val workspace =

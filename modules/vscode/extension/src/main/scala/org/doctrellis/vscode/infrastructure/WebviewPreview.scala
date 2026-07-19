@@ -1,12 +1,13 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.{Dispatcher, Mutex}
+import scala.scalajs.js
+
 import cats.effect.{IO, Ref, Resource}
+import cats.effect.std.{Dispatcher, Mutex}
 import cats.syntax.all.*
+
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
-
-import scala.scalajs.js
 
 private[infrastructure] trait PreviewPanel:
   def setHtml(value: String): IO[Unit]

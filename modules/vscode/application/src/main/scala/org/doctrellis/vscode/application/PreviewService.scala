@@ -1,11 +1,12 @@
 package org.doctrellis.vscode.application
 
 import cats.FlatMap
-import cats.effect.kernel.Temporal
-import cats.effect.std.{Mutex, Supervisor}
 import cats.effect.{Deferred, Ref, Resource}
 import cats.effect.implicits.*
+import cats.effect.kernel.Temporal
+import cats.effect.std.{Mutex, Supervisor}
 import cats.syntax.all.*
+
 import org.doctrellis.vscode.domain.*
 
 final class RunningProcess[F[_]] private (

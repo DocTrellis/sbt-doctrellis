@@ -1,13 +1,15 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
-import cats.effect.{Deferred, IO, Ref}
-import munit.CatsEffectSuite
-import org.doctrellis.vscode.domain.*
-import org.doctrellis.vscode.infrastructure.facade.*
-
 import scala.concurrent.duration.*
 import scala.scalajs.js
+
+import cats.effect.{Deferred, IO, Ref}
+import cats.effect.std.Dispatcher
+
+import munit.CatsEffectSuite
+
+import org.doctrellis.vscode.domain.*
+import org.doctrellis.vscode.infrastructure.facade.*
 
 class WorkspaceChannelSuite extends CatsEffectSuite:
   private val firstUrl  = right(PreviewUrl.parse("http://127.0.0.1:43123"))

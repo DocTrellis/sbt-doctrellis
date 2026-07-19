@@ -1,6 +1,7 @@
 package org.doctrellis.sbtplugin
 
 import java.nio.file.{Files, Path}
+
 import scala.util.control.NonFatal
 
 private[sbtplugin] enum DocTrellisDirectoryRole:

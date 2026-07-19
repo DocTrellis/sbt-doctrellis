@@ -1,7 +1,5 @@
 package org.doctrellis.sbtplugin
 
-import sbt.util.LogExchange
-
 import java.net.{InetSocketAddress, ServerSocket, URI, UnixDomainSocketAddress}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.ByteBuffer
@@ -9,8 +7,11 @@ import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
+
+import sbt.util.LogExchange
 
 class PreviewControlChannelSuite extends munit.FunSuite:
   private val launchId = "test-launch"

@@ -1,15 +1,16 @@
 package org.doctrellis.vscode.infrastructure
 
-import cats.effect.std.Dispatcher
-import cats.effect.{Deferred, IO, Resource}
-import cats.syntax.all.*
-import org.doctrellis.vscode.application.RunningProcess
-import org.doctrellis.vscode.domain.*
-import org.doctrellis.vscode.infrastructure.facade.*
-
 import scala.concurrent.duration.*
 import scala.scalajs.js
 import scala.scalajs.js.JSConverters.*
+
+import cats.effect.{Deferred, IO, Resource}
+import cats.effect.std.Dispatcher
+import cats.syntax.all.*
+
+import org.doctrellis.vscode.application.RunningProcess
+import org.doctrellis.vscode.domain.*
+import org.doctrellis.vscode.infrastructure.facade.*
 
 private[infrastructure] enum ProcessPlatform:
   case Posix, Windows

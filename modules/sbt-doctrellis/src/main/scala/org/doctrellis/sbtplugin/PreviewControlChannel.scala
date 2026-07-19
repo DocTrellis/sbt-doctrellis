@@ -1,7 +1,5 @@
 package org.doctrellis.sbtplugin
 
-import sbt.Logger
-
 import java.io.ByteArrayOutputStream
 import java.net.{
   InetSocketAddress,
@@ -18,8 +16,6 @@ import java.nio.channels.{
   SocketChannel,
 }
 import java.nio.charset.StandardCharsets
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{
   Files,
   InvalidPathException,
@@ -28,13 +24,17 @@ import java.nio.file.{
   StandardCopyOption,
   StandardOpenOption,
 }
+import java.nio.file.attribute.{BasicFileAttributes, PosixFilePermissions}
 import java.security.{MessageDigest, SecureRandom}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
+
 import scala.annotation.tailrec
 import scala.jdk.OptionConverters.*
 import scala.util.control.NonFatal
+
+import sbt.Logger
 
 private[sbtplugin] final case class PreviewControlConfig(
     runtimeDirectory: Path,

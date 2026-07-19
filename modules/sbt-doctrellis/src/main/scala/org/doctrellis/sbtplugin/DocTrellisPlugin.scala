@@ -1,7 +1,16 @@
 package org.doctrellis.sbtplugin
 
+import java.io.IOException
+import java.net.{BindException, InetSocketAddress}
+import java.nio.file.Path
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+
+import scala.util.control.NonFatal
+
 import cats.effect.IO as CatsIO
 import cats.effect.unsafe.implicits.global
+
 import laika.api.Transformer
 import laika.format.{HTML, Markdown}
 import laika.helium.Helium
@@ -10,13 +19,6 @@ import mdoc.MdocPlugin
 import mdoc.MdocPlugin.autoImport.*
 import sbt.*
 import sbt.Keys.*
-
-import java.io.IOException
-import java.net.{BindException, InetSocketAddress}
-import java.nio.file.Path
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
-import scala.util.control.NonFatal
 
 object DocTrellisPlugin extends AutoPlugin:
 
