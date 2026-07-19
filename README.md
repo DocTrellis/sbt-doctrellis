@@ -110,6 +110,13 @@ Or build and serve the site at `http://127.0.0.1:4242` with:
 sbt doctrellisPreview
 ```
 
+Preview performs a required initial build, then recursively watches
+`doctrellisSourceDirectory` and publishes successful rebuilds without
+restarting the preview JVM. A failed rebuild leaves the last successful site
+available and the next source change retries it. A normal browser must still
+be refreshed manually; a version 2 DocTrellis Webview refreshes automatically
+after each successful publication.
+
 `doctrellisPort` still defaults to `4242` for direct CLI use. Setting it to
 `0` asks the operating system to choose and bind a free port atomically; the
 server reports the positive port returned by its bound address.
@@ -156,7 +163,7 @@ The plugin exposes these settings and tasks:
 | `doctrellisHost` | `127.0.0.1` |
 | `doctrellisPort` | `4242` |
 | `doctrellisBuild` | mdoc, then Laika/Helium |
-| `doctrellisPreview` | build, then serve until interrupted |
+| `doctrellisPreview` | build, watch the source tree, and serve until interrupted |
 
 See [the basic example](examples/basic/README.md) for a complete consumer.
 
@@ -250,7 +257,11 @@ close or deactivation; the observing window merely releases its connection.
 Restart in an observing window releases and reacquires that read-only lease;
 it does not restart the owner window's process. Announced IPC mode also
 requires `doctrellisHost := "127.0.0.1"`, while direct fixed-port CLI use keeps
-the host configurable.
+the host configurable. With the current plugin, both owner and observer
+connections opt into successful-publication events. An event refreshes an
+existing panel at its stored URL without revealing it; it never recreates a
+panel that the user closed. Older plugins remain compatible because the opt-in
+field is additive and unknown fields are ignored.
 
 ## Develop and verify
 
@@ -311,8 +322,14 @@ The build tasks are also available through **Tasks: Run Task**.
 
 ## Current limitations
 
-- `doctrellisPreview` builds once when it starts. It does not yet watch Markdown
-  files; stop and restart it after documentation changes.
+- Preview watches files below `doctrellisSourceDirectory`. Changes to Scala
+  sources, project settings, the resolved classpath, or targets reached through
+  external symlinks still require restarting Preview. On macOS, JDK filesystem
+  polling can add several seconds before a change is detected.
+- A normal browser requires a manual page refresh after a rebuild. Version 1
+  fixed-URL Webviews have no authenticated event channel and must be closed and
+  reopened (or Preview restarted) to load a rebuilt site; only version 2 IPC
+  Webviews refresh automatically.
 - Preview binds to localhost and is intended for development only. There is no
   GitHub Pages, website deployment, or other remote publishing feature.
 - The Webview uses a script-free wrapper, restrictive content security policy,

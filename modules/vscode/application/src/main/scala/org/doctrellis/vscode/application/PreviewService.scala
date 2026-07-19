@@ -12,6 +12,7 @@ import org.doctrellis.vscode.domain.*
 final class RunningProcess[F[_]] private (
     val awaitExit: F[ProcessExit],
     private[application] val readiness: RunningReadiness[F],
+    private[application] val nextSiteRevision: Option[F[Option[SiteRevision]]],
 ):
   private[vscode] def announcedUrl: Option[F[PreviewUrl]] =
     readiness match
@@ -23,6 +24,7 @@ object RunningProcess:
     new RunningProcess(
       awaitExit = awaitExit,
       readiness = RunningReadiness.ConfiguredEndpoint(),
+      nextSiteRevision = None,
     )
 
   def announced[F[_]](
@@ -32,6 +34,18 @@ object RunningProcess:
     new RunningProcess(
       awaitExit = awaitExit,
       readiness = RunningReadiness.Announced(awaitUrl),
+      nextSiteRevision = None,
+    )
+
+  def announced[F[_]](
+      awaitExit: F[ProcessExit],
+      awaitUrl: F[PreviewUrl],
+      nextSiteRevision: F[Option[SiteRevision]],
+  ): RunningProcess[F] =
+    new RunningProcess(
+      awaitExit = awaitExit,
+      readiness = RunningReadiness.Announced(awaitUrl),
+      nextSiteRevision = Some(nextSiteRevision),
     )
 
 private[application] enum RunningReadiness[F[_]]:
@@ -139,7 +153,7 @@ final class PreviewService[F[_]] private (
         case Some(session) =>
           session.status.get.flatMap: initial =>
             showView(workspace, session.view(initial)) *>
-              convergeOpen(workspace, session, initial)
+              convergeDisplayedView(workspace, session, initial).void
         case None =>
           algebra
             .load(workspace)
@@ -165,8 +179,8 @@ final class PreviewService[F[_]] private (
       _.get(workspace.key) match
         case Some(session) =>
           session.status.get.flatMap:
-            case PreviewStatus.Ready(url) => algebra.openExternal(url)
-            case PreviewStatus.Starting   =>
+            case PreviewStatus.Ready(url, _) => algebra.openExternal(url)
+            case PreviewStatus.Starting      =>
               session.readiness match
                 case PreviewReadiness.Fixed(url)   => algebra.openExternal(url)
                 case PreviewReadiness.Announced(_) =>
@@ -214,7 +228,7 @@ final class PreviewService[F[_]] private (
             _.get(workspace.key) match
               case Some(session) =>
                 session.status.get.flatMap:
-                  case PreviewStatus.Starting | PreviewStatus.Ready(_) =>
+                  case PreviewStatus.Starting | PreviewStatus.Ready(_, _) =>
                     algebra
                       .info(
                         s"DocTrellis preview is already active for ${workspace.name}.",
@@ -386,7 +400,7 @@ final class PreviewService[F[_]] private (
             .void *>
             displayReady(workspace, session).flatMap: displayed =>
               session.status.get.flatMap:
-                case PreviewStatus.Ready(_) =>
+                case PreviewStatus.Ready(_, _) =>
                   F.whenA(displayed)(
                     continueReadySession(workspace, session),
                   )
@@ -410,29 +424,90 @@ final class PreviewService[F[_]] private (
     session.status.get.flatMap:
       case PreviewStatus.Stopping =>
         updateStoppedIfCurrent(workspace, session)
-      case PreviewStatus.Starting | PreviewStatus.Ready(_) |
+      case PreviewStatus.Starting | PreviewStatus.Ready(_, _) |
           PreviewStatus.Terminal(_) =>
-        session.running.awaitExit.attempt.flatMap:
-          case Left(error) =>
-            updateTerminalView(
-              workspace,
-              session,
-              PreviewTerminal.Failed(message(error)),
-            ).flatMap: displayed =>
-              F.whenA(displayed):
-                report(
-                  s"DocTrellis preview for ${workspace.name} failed: ${message(error)}",
-                )
-          case Right(exit) =>
-            updateTerminalView(
-              workspace,
-              session,
-              PreviewTerminal.Exited(exit),
-            ).flatMap: displayed =>
-              F.whenA(displayed):
-                report(
-                  s"DocTrellis preview for ${workspace.name} exited (${exit.render}).",
-                )
+        session.running.nextSiteRevision match
+          case None =>
+            session.running.awaitExit.attempt.flatMap(
+              handleReadyExit(workspace, session, _),
+            )
+          case Some(nextRevision) =>
+            session.running.awaitExit.attempt
+              .race(
+                observeSiteRevisions(workspace, session, nextRevision).attempt,
+              )
+              .flatMap:
+                case Left(exit) => handleReadyExit(workspace, session, exit)
+                case Right(Left(error)) =>
+                  handleReadyExit(workspace, session, Left(error))
+                case Right(Right(SiteRevisionObservation.ConnectionEnded)) =>
+                  session.running.awaitExit.attempt.flatMap(
+                    handleReadyExit(workspace, session, _),
+                  )
+                case Right(Right(SiteRevisionObservation.SessionInactive)) =>
+                  F.unit
+
+  private def observeSiteRevisions(
+      workspace: Workspace,
+      session: PreviewSession[F],
+      nextRevision: F[Option[SiteRevision]],
+  ): F[SiteRevisionObservation] =
+    nextRevision.flatMap:
+      case Some(revision) =>
+        refreshIfCurrent(workspace, session, revision).flatMap:
+          case true  => observeSiteRevisions(workspace, session, nextRevision)
+          case false => F.pure(SiteRevisionObservation.SessionInactive)
+      case None => F.pure(SiteRevisionObservation.ConnectionEnded)
+
+  private def refreshIfCurrent(
+      workspace: Workspace,
+      session: PreviewSession[F],
+      revision: SiteRevision,
+  ): F[Boolean] =
+    val accepted = workspaceMutexes.surround(workspace.key):
+      sessions.get.flatMap:
+        _.get(workspace.key) match
+          case Some(actual) if actual.eq(session) =>
+            session.status
+              .modify:
+                case PreviewStatus.Ready(url, _) =>
+                  val updated = PreviewStatus.Ready(url, Some(revision))
+                  updated -> Some(updated)
+                case current => current -> None
+          case _ => F.pure(None)
+
+    accepted.flatMap:
+      case Some(status) =>
+        updateView(workspace, session.view(status)) *>
+          convergeDisplayedView(workspace, session, status)
+      case None => F.pure(false)
+
+  private def handleReadyExit(
+      workspace: Workspace,
+      session: PreviewSession[F],
+      outcome: Either[Throwable, ProcessExit],
+  ): F[Unit] =
+    outcome match
+      case Left(error) =>
+        updateTerminalView(
+          workspace,
+          session,
+          PreviewTerminal.Failed(message(error)),
+        ).flatMap: displayed =>
+          F.whenA(displayed):
+            report(
+              s"DocTrellis preview for ${workspace.name} failed: ${message(error)}",
+            )
+      case Right(exit) =>
+        updateTerminalView(
+          workspace,
+          session,
+          PreviewTerminal.Exited(exit),
+        ).flatMap: displayed =>
+          F.whenA(displayed):
+            report(
+              s"DocTrellis preview for ${workspace.name} exited (${exit.render}).",
+            )
 
   private def updateTerminalView(
       workspace: Workspace,
@@ -583,20 +658,6 @@ final class PreviewService[F[_]] private (
           case None    => updateView(workspace, PreviewViewState.Stopped)
           case Some(_) => F.unit
 
-  private def convergeOpen(
-      workspace: Workspace,
-      session: PreviewSession[F],
-      initial: PreviewStatus,
-  ): F[Unit] =
-    workspaceMutexes.surround(workspace.key):
-      sessions.get.flatMap:
-        _.get(workspace.key) match
-          case Some(actual) if actual.eq(session) =>
-            session.status.get.flatMap: current =>
-              F.whenA(current != initial):
-                updateView(workspace, session.view(current))
-          case _ => F.unit
-
   private def displayReady(
       workspace: Workspace,
       session: PreviewSession[F],
@@ -606,46 +667,65 @@ final class PreviewService[F[_]] private (
         _.get(workspace.key) match
           case Some(actual) if actual.eq(session) =>
             session.status.get.map:
-              case PreviewStatus.Ready(url) => Some(url)
-              case _                        => None
+              case ready @ PreviewStatus.Ready(_, _) => Some(ready)
+              case _                                 => None
           case _ => F.pure(None)
 
     current.flatMap:
-      case None      => F.pure(false)
-      case Some(url) =>
+      case None         => F.pure(false)
+      case Some(status) =>
+        val state   = session.view(status)
         val display =
-          if session.policy.openWhenReady then
-            showView(
-              workspace,
-              PreviewViewState.Ready(url),
-            )
-          else
-            updateView(
-              workspace,
-              PreviewViewState.Ready(url),
-            )
-        display *> convergeReadyDisplay(workspace, session)
+          if session.policy.openWhenReady then showView(workspace, state)
+          else updateView(workspace, state)
+        display *> convergeDisplayedView(workspace, session, status)
 
-  private def convergeReadyDisplay(
+  private def convergeDisplayedView(
       workspace: Workspace,
-      session: PreviewSession[F],
+      displayedSession: PreviewSession[F],
+      displayedStatus: PreviewStatus,
   ): F[Boolean] =
-    workspaceMutexes.surround(workspace.key):
+    convergeDisplayedView(
+      workspace = workspace,
+      expectedSession = displayedSession,
+      displayedSession = displayedSession,
+      displayedStatus = displayedStatus,
+    )
+
+  private def convergeDisplayedView(
+      workspace: Workspace,
+      expectedSession: PreviewSession[F],
+      displayedSession: PreviewSession[F],
+      displayedStatus: PreviewStatus,
+  ): F[Boolean] =
+    val decision = workspaceMutexes.surround(workspace.key):
       sessions.get.flatMap:
         _.get(workspace.key) match
-          case Some(actual) if actual.eq(session) =>
-            session.status.get.flatMap:
-              case PreviewStatus.Ready(_) => F.pure(true)
-              case current                =>
-                updateView(workspace, session.view(current)).as(false)
           case Some(actual) =>
-            actual.status.get.flatMap: current =>
-              updateView(workspace, actual.view(current)).as(false)
+            actual.status.get.map: current =>
+              if actual.eq(displayedSession) && current == displayedStatus then
+                ViewConvergence.Stable(
+                  actual.eq(expectedSession) && (current match
+                    case PreviewStatus.Ready(_, _) => true
+                    case _                         => false),
+                )
+              else ViewConvergence.Render(actual, current)
           case None =>
-            session.status.get.flatMap:
-              case PreviewStatus.Ready(_) => F.pure(false)
-              case current                =>
-                updateView(workspace, session.view(current)).as(false)
+            displayedSession.status.get.map: current =>
+              if current == displayedStatus then
+                ViewConvergence.Stable(active = false)
+              else ViewConvergence.Render(displayedSession, current)
+
+    decision.flatMap:
+      case ViewConvergence.Stable(active) => F.pure(active)
+      case ViewConvergence.Render(currentSession, currentStatus) =>
+        updateView(workspace, currentSession.view(currentStatus)) *>
+          convergeDisplayedView(
+            workspace,
+            expectedSession,
+            currentSession,
+            currentStatus,
+          )
 
   private def updateStoppedIfCurrent(
       workspace: Workspace,
@@ -701,8 +781,10 @@ private final case class PreviewSession[F[_]](
 
   def view(status: PreviewStatus): PreviewViewState =
     status match
-      case PreviewStatus.Starting           => PreviewViewState.Starting
-      case PreviewStatus.Ready(url)         => PreviewViewState.Ready(url)
+      case PreviewStatus.Starting         => PreviewViewState.Starting
+      case PreviewStatus.Ready(url, None) => PreviewViewState.Ready(url)
+      case PreviewStatus.Ready(url, Some(revision)) =>
+        PreviewViewState.Refreshed(url, revision)
       case PreviewStatus.Stopping           => PreviewViewState.Stopped
       case PreviewStatus.Terminal(terminal) => terminal.viewState
 
@@ -722,8 +804,8 @@ private[application] object PreviewStatusTransition:
   ): (PreviewStatus, ReadyAcceptance) =
     current match
       case PreviewStatus.Starting =>
-        PreviewStatus.Ready(url) -> ReadyAcceptance.Accepted
-      case current @ PreviewStatus.Ready(_) =>
+        PreviewStatus.Ready(url, None) -> ReadyAcceptance.Accepted
+      case current @ PreviewStatus.Ready(_, _) =>
         current -> ReadyAcceptance.Accepted
       case PreviewStatus.Stopping =>
         PreviewStatus.Stopping -> ReadyAcceptance.Rejected
@@ -748,6 +830,14 @@ private[application] object PreviewReadyGate:
 private enum PreviewReadiness[F[_]]:
   case Fixed(url: PreviewUrl)
   case Announced(awaitUrl: F[PreviewUrl])
+
+private enum SiteRevisionObservation:
+  case ConnectionEnded
+  case SessionInactive
+
+private enum ViewConvergence[F[_]]:
+  case Stable(active: Boolean)
+  case Render(session: PreviewSession[F], status: PreviewStatus)
 
 private object PreviewReadiness:
   def parse[F[_]](

@@ -24,8 +24,10 @@ Start the blocking local server with:
 sbt doctrellisPreview
 ```
 
-Open `http://127.0.0.1:4242`, then press Ctrl+C to stop it. The current preview
-server builds once at startup; restart it after editing the documentation.
+Open `http://127.0.0.1:4242`, then press Ctrl+C to stop it. Preview watches the
+complete `docs/` tree and publishes successful rebuilds without restarting the
+JVM. A failed edit leaves the last successful site available and the next edit
+retries the build. Refresh the browser manually to load a published rebuild.
 The `4242` default is retained for this direct CLI workflow.
 
 To exercise the extension, open this directory as a trusted VS Code workspace
@@ -35,6 +37,9 @@ extension reads this example's `.doctrellis.json` and starts sbt with
 foreground JVM in its owned process tree. The plugin binds an OS-assigned port
 and announces its actual URL over the workspace IPC channel; no configured URL
 duplicates the port. The extension probes that URL and opens it in a reusable
-`DocTrellis Preview` Webview tab. Run **DocTrellis: Stop Preview** to wait for
-the server and listener to exit, or **DocTrellis: Open in External Browser** to
-open the resolved preview URL in the system browser instead.
+`DocTrellis Preview` Webview tab. Successful publications refresh that existing
+version 2 panel automatically, including when this window is observing a
+preview owned by another window. A closed panel is not recreated or revealed.
+Run **DocTrellis: Stop Preview** to wait for the server and listener to exit, or
+**DocTrellis: Open in External Browser** to open the resolved preview URL in the
+system browser instead.

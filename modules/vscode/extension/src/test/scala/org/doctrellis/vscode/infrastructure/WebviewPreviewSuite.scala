@@ -38,6 +38,32 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           assert(at(backend.created, 0).html.contains("forwarded.example:5252"))
           assert(at(backend.created, 1).html.contains("forwarded.example:6262"))
 
+  test("refreshes an existing panel without revealing or recreating it"):
+    val backend = FakeBackend()
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(first, PreviewViewState.Ready(url(4242)))
+          panel = at(backend.created, 0)
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(2)),
+          )
+          _ = assertEquals(panel.reveals, 1)
+          _ = assert(
+            panel.html.contains("data-doctrellis-revision=\"2\""),
+          )
+          _ <- panel.disposeFromUser
+          resolvedBefore = backend.resolved.size
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(3)),
+          )
+        yield
+          assertEquals(backend.created.size, 1)
+          assertEquals(backend.resolved.size, resolvedBefore)
+
   test("creates a new panel after the existing panel is disposed"):
     val backend = FakeBackend()
     PreviewPanelRegistry
@@ -123,6 +149,29 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     assert(
       failed.contains("bad &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
     )
+
+  test("uses inert revision markup to make same-URL refreshes distinct"):
+    val external = Some(
+      resolved("https://forwarded.example:4242/preview"),
+    )
+    val second = PreviewWebviewHtml.render(
+      first,
+      PreviewViewState.Refreshed(url(4242), revision(2)),
+      external,
+    )
+    val third = PreviewWebviewHtml.render(
+      first,
+      PreviewViewState.Refreshed(url(4242), revision(3)),
+      external,
+    )
+
+    assertNotEquals(second, third)
+    assert(second.contains("data-doctrellis-revision=\"2\""))
+    assert(third.contains("data-doctrellis-revision=\"3\""))
+    List(second, third).foreach: html =>
+      assert(html.contains("default-src 'none'"))
+      assert(html.contains("sandbox=\"\""))
+      assert(!html.contains("<script"))
 
   test("shows an unavailable state for a resolved URI with userinfo"):
     val actual = resolved(
@@ -525,6 +574,9 @@ class WebviewPreviewSuite extends CatsEffectSuite:
 
   private def resolved(value: String): ResolvedPreviewUri =
     ResolvedPreviewUri.parse(value).fold(fail(_), identity)
+
+  private def revision(value: Long): SiteRevision =
+    SiteRevision.parse(value).fold(problem => fail(problem.message), identity)
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)

@@ -37,3 +37,20 @@ class ModelSuite extends munit.FunSuite:
       error = Some("workspace IPC connection ended"),
     )
     assertEquals(exit.render, "workspace IPC connection ended")
+
+  test("parses only positive site revisions"):
+    val accepted = for
+      previous <- SiteRevision.parse(1L)
+      current  <- SiteRevision.parse(2L)
+    yield current.isAfter(previous)
+
+    assertEquals(accepted, Right(true))
+    assertEquals(SiteRevision.parse(1L).map(_.value), Right(1L))
+    assertEquals(
+      SiteRevision.parse(0L),
+      Left(SiteRevisionProblem.NonPositive(0L)),
+    )
+    assertEquals(
+      SiteRevision.parse(-1L),
+      Left(SiteRevisionProblem.NonPositive(-1L)),
+    )

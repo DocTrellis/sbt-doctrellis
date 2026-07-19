@@ -3,6 +3,7 @@ package org.doctrellis.vscode.application
 import scala.concurrent.duration.*
 
 import cats.effect.{Deferred, IO, Ref, Resource}
+import cats.effect.std.Queue
 import cats.syntax.all.*
 
 import munit.CatsEffectSuite
@@ -1581,6 +1582,517 @@ class PreviewServiceSuite extends CatsEffectSuite:
         Some(PreviewViewState.Ready(announced)),
       )
 
+  test("an announced site revision refreshes the ready session URL"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53117"))
+    val revision  = rightRevision(SiteRevision.parse(2L))
+    for
+      revisions <- Queue.unbounded[IO, SiteRevision]
+      refreshed <- Deferred[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(announced),
+              nextSiteRevision = revisions.take.map(Some(_)),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) =>
+          state match
+            case PreviewViewState.Refreshed(_, _) =>
+              refreshed.complete(state).void
+            case _ => IO.unit,
+        update = (_, state) =>
+          state match
+            case PreviewViewState.Refreshed(_, _) =>
+              refreshed.complete(state).void
+            case _ => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          service.start(workspace) *>
+            revisions.offer(revision) *>
+            refreshed.get.timeout(1.second)
+    yield assertEquals(
+      actual,
+      PreviewViewState.Refreshed(announced, revision),
+    )
+
+  test("a slow site refresh does not block stop and converges to stopped"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53126"))
+    val revision  = rightRevision(SiteRevision.parse(6L))
+    for
+      revisions       <- Queue.unbounded[IO, SiteRevision]
+      refreshEntered  <- Deferred[IO, Unit]
+      releaseRefresh  <- Deferred[IO, Unit]
+      processReleased <- Deferred[IO, Unit]
+      visible         <- Queue.unbounded[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            IO.pure(
+              RunningProcess.announced(
+                awaitExit = IO.never,
+                awaitUrl = IO.pure(announced),
+                nextSiteRevision = revisions.take.map(Some(_)),
+              ),
+            ),
+          )(_ => processReleased.complete(()).void),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, state) =>
+          state match
+            case PreviewViewState.Refreshed(_, _) =>
+              refreshEntered.complete(()).void *>
+                releaseRefresh.get *>
+                visible.offer(state)
+            case PreviewViewState.Stopped => visible.offer(state)
+            case _                        => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _        <- service.start(workspace)
+            _        <- revisions.offer(revision)
+            _        <- refreshEntered.get
+            stopping <- service.stop(workspace).start
+            stopped  <- (processReleased.get *>
+              stopping.joinWithNever *>
+              visible.take)
+              .timeout(1.second)
+              .guarantee(
+                releaseRefresh.complete(()).void,
+              )
+            stale     <- visible.take.timeout(1.second)
+            converged <- visible.take.timeout(1.second)
+          yield Vector(stopped, stale, converged)
+    yield assertEquals(
+      actual,
+      Vector(
+        PreviewViewState.Stopped,
+        PreviewViewState.Refreshed(announced, revision),
+        PreviewViewState.Stopped,
+      ),
+    )
+
+  test("open preserves the latest accepted site revision"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53124"))
+    val revision  = rightRevision(SiteRevision.parse(4L))
+    val expected  = PreviewViewState.Refreshed(announced, revision)
+    for
+      revisions <- Queue.unbounded[IO, SiteRevision]
+      refreshed <- Deferred[IO, PreviewViewState]
+      reopened  <- Deferred[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(announced),
+              nextSiteRevision = revisions.take.map(Some(_)),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) =>
+          state match
+            case refreshedState @ PreviewViewState.Refreshed(_, _) =>
+              reopened.complete(refreshedState).void
+            case _ => IO.unit,
+        update = (_, state) =>
+          state match
+            case refreshedState @ PreviewViewState.Refreshed(_, _) =>
+              refreshed.complete(refreshedState).void
+            case _ => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _      <- service.start(workspace)
+            _      <- revisions.offer(revision)
+            first  <- refreshed.get.timeout(1.second)
+            _      <- service.open(workspace)
+            second <- reopened.get.timeout(1.second)
+          yield first -> second
+    yield assertEquals(actual, expected -> expected)
+
+  test("open converges when a revision arrives during panel rendering"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53125"))
+    val revision  = rightRevision(SiteRevision.parse(5L))
+    val expected  = PreviewViewState.Refreshed(announced, revision)
+    for
+      revisions   <- Queue.unbounded[IO, SiteRevision]
+      showEntered <- Deferred[IO, Unit]
+      releaseShow <- Deferred[IO, Unit]
+      refreshed   <- Queue.unbounded[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(announced),
+              nextSiteRevision = revisions.take.map(Some(_)),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) =>
+          state match
+            case PreviewViewState.Ready(_) =>
+              showEntered.complete(()).void *> releaseShow.get
+            case _ => IO.unit,
+        update = (_, state) =>
+          state match
+            case refreshedState @ PreviewViewState.Refreshed(_, _) =>
+              refreshed.offer(refreshedState)
+            case _ => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _       <- service.start(workspace)
+            opening <- service.open(workspace).start
+            _       <- showEntered.get
+            _       <- revisions.offer(revision)
+            first   <- refreshed.take.timeout(1.second)
+            _       <- releaseShow.complete(())
+            second  <- refreshed.take.timeout(1.second)
+            _       <- opening.joinWithNever
+          yield first -> second
+    yield assertEquals(actual, expected -> expected)
+
+  test("a slow open convergence does not block stopAll"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53127"))
+    val revision  = rightRevision(SiteRevision.parse(10L))
+    val refreshed = PreviewViewState.Refreshed(announced, revision)
+    for
+      revisions         <- Queue.unbounded[IO, SiteRevision]
+      showEntered       <- Deferred[IO, Unit]
+      releaseShow       <- Deferred[IO, Unit]
+      firstRefresh      <- Deferred[IO, Unit]
+      correctionEntered <- Deferred[IO, Unit]
+      releaseCorrection <- Deferred[IO, Unit]
+      refreshedDisplays <- Ref.of[IO, Int](0)
+      processReleased   <- Deferred[IO, Unit]
+      visible           <- Queue.unbounded[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            IO.pure(
+              RunningProcess.announced(
+                awaitExit = IO.never,
+                awaitUrl = IO.pure(announced),
+                nextSiteRevision = revisions.take.map(Some(_)),
+              ),
+            ),
+          )(_ => processReleased.complete(()).void),
+        probe = _ => IO.pure(true),
+        show = (_, state) =>
+          state match
+            case PreviewViewState.Ready(_) =>
+              showEntered.complete(()).void *> releaseShow.get
+            case _ => IO.unit,
+        update = (_, state) =>
+          state match
+            case PreviewViewState.Refreshed(_, _) =>
+              refreshedDisplays
+                .modify(count => (count + 1) -> count)
+                .flatMap:
+                  case 0 => firstRefresh.complete(()).void
+                  case _ =>
+                    correctionEntered.complete(()).void *>
+                      releaseCorrection.get *>
+                      visible.offer(state)
+            case PreviewViewState.Stopped => visible.offer(state)
+            case _                        => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _        <- service.start(workspace)
+            opening  <- service.open(workspace).start
+            _        <- showEntered.get
+            _        <- revisions.offer(revision)
+            _        <- firstRefresh.get
+            _        <- releaseShow.complete(())
+            _        <- correctionEntered.get
+            stopping <- service.stopAll.start
+            stopped  <- (processReleased.get *>
+              stopping.joinWithNever *>
+              visible.take)
+              .timeout(1.second)
+              .guarantee(
+                releaseCorrection.complete(()).void,
+              )
+            stale     <- visible.take.timeout(1.second)
+            converged <- visible.take.timeout(1.second)
+            _         <- opening.joinWithNever.timeout(1.second)
+          yield Vector(stopped, stale, converged)
+    yield assertEquals(
+      actual,
+      Vector(PreviewViewState.Stopped, refreshed, PreviewViewState.Stopped),
+    )
+
+  test("a replaced session ignores a late site revision"):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    val first   = right(PreviewUrl.parse("http://127.0.0.1:53118"))
+    val second  = right(PreviewUrl.parse("http://127.0.0.1:53119"))
+    val stale   = rightRevision(SiteRevision.parse(7L))
+    for
+      launches              <- Ref.of[IO, Int](0)
+      firstRevisions        <- Queue.unbounded[IO, SiteRevision]
+      secondRevisions       <- Queue.unbounded[IO, SiteRevision]
+      firstSubscribed       <- Deferred[IO, Unit]
+      firstObserverStarted  <- Deferred[IO, Unit]
+      firstObserverFinished <- Deferred[IO, Unit]
+      states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.eval:
+            launches.modify: count =>
+              val (url, revisions) =
+                if count == 0 then first -> firstRevisions
+                else second              -> secondRevisions
+              val awaitExit =
+                if count == 0 then
+                  firstSubscribed.get *>
+                    firstObserverStarted.complete(()).void *>
+                    IO.never.onCancel(firstObserverFinished.complete(()).void)
+                else IO.never
+              val nextRevision =
+                (if count == 0 then
+                   firstSubscribed.complete(()).void *> revisions.take
+                 else revisions.take).map(Some(_))
+              count + 1 -> RunningProcess.announced(
+                awaitExit = awaitExit,
+                awaitUrl = IO.pure(url),
+                nextSiteRevision = nextRevision,
+              )
+        ,
+        probe = _ => IO.pure(true),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _      <- service.start(workspace)
+            _      <- (firstSubscribed.get, firstObserverStarted.get).parTupled
+            _      <- service.restart(workspace)
+            _      <- firstRevisions.offer(stale)
+            _      <- firstObserverFinished.get.timeout(1.second)
+            result <- states.get
+          yield result
+    yield
+      assertEquals(actual.lastOption, Some(PreviewViewState.Ready(second)))
+      assert(!actual.contains(PreviewViewState.Refreshed(first, stale)))
+
+  test("a stopped session ignores a late site revision"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53120"))
+    val stale     = rightRevision(SiteRevision.parse(8L))
+    for
+      revisions        <- Queue.unbounded[IO, SiteRevision]
+      subscribed       <- Deferred[IO, Unit]
+      observerStarted  <- Deferred[IO, Unit]
+      observerFinished <- Deferred[IO, Unit]
+      states           <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = subscribed.get *>
+                observerStarted.complete(()).void *>
+                IO.never.onCancel(observerFinished.complete(()).void),
+              awaitUrl = IO.pure(announced),
+              nextSiteRevision =
+                subscribed.complete(()).void *> revisions.take.map(Some(_)),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            _      <- service.start(workspace)
+            _      <- (subscribed.get, observerStarted.get).parTupled
+            _      <- service.stop(workspace)
+            _      <- revisions.offer(stale)
+            _      <- observerFinished.get.timeout(1.second)
+            result <- states.get
+          yield result
+    yield
+      assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
+      assert(!actual.contains(PreviewViewState.Refreshed(announced, stale)))
+
+  test("a normal site event end is reconciled with the process exit"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53123"))
+    val exit      = ProcessExit(code = Some(9), signal = None, error = None)
+    for
+      announcement <- Deferred[IO, PreviewUrl]
+      processExit  <- Deferred[IO, ProcessExit]
+      exitAttempts <- Queue.unbounded[IO, Unit]
+      siteEvents   <- Queue.unbounded[IO, Option[SiteRevision]]
+      terminal     <- Deferred[IO, PreviewViewState]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = exitAttempts.offer(()) *> processExit.get,
+              awaitUrl = announcement.get,
+              nextSiteRevision = siteEvents.take,
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) =>
+          state match
+            case PreviewViewState.Failed(_) | PreviewViewState.Exited(_) =>
+              terminal.complete(state).void
+            case _ => IO.unit,
+        update = (_, state) =>
+          state match
+            case PreviewViewState.Failed(_) | PreviewViewState.Exited(_) =>
+              terminal.complete(state).void
+            case _ => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          for
+            starting <- service.start(workspace).start
+            _        <- exitAttempts.take
+            _        <- announcement.complete(announced)
+            _        <- starting.joinWithNever
+            _        <- exitAttempts.take
+            closing  <- (siteEvents.offer(None) *>
+              exitAttempts.take *>
+              processExit.complete(exit).void).start
+            state <- terminal.get.timeout(1.second)
+            _     <- closing.joinWithNever
+          yield state
+    yield assertEquals(actual, PreviewViewState.Exited(exit))
+
+  test("a site event source failure terminates its ready session"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53121"))
+    val problem   = IllegalStateException("invalid site revision")
+    for
+      eventFailure <- Deferred[IO, Throwable]
+      failed       <- Deferred[IO, String]
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = eventFailure.get.flatMap(IO.raiseError),
+              awaitUrl = IO.pure(announced),
+              nextSiteRevision = eventFailure.get.flatMap(IO.raiseError),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, state) =>
+          state match
+            case PreviewViewState.Failed(reason) =>
+              failed.complete(reason).void
+            case _ => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      reason <- PreviewService
+        .resource(algebra)
+        .use: service =>
+          service.start(workspace) *>
+            eventFailure.complete(problem).void *>
+            failed.get.timeout(1.second)
+    yield assert(reason.contains(problem.getMessage))
+
+  test("an announced process without site events keeps ready behavior"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53122"))
+    for
+      states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      algebra = PreviewAlgebra[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(announced),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(algebra)
+        .use(service => service.start(workspace) *> states.get)
+    yield assertEquals(
+      actual.lastOption,
+      Some(PreviewViewState.Ready(announced)),
+    )
+
   test("dynamic startup rejects a process without an announcement channel"):
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
     for
@@ -1833,6 +2345,11 @@ class PreviewServiceSuite extends CatsEffectSuite:
     )
 
   private def right[A](value: Either[ConfigProblem, A]): A =
+    value.fold(problem => fail(problem.message), identity)
+
+  private def rightRevision(
+      value: Either[SiteRevisionProblem, SiteRevision],
+  ): SiteRevision =
     value.fold(problem => fail(problem.message), identity)
 
   private def urlOf(value: PreviewCommand): PreviewUrl =

@@ -115,6 +115,24 @@ object PreviewUrl:
 
   extension (value: PreviewUrl) def value: String = value
 
+enum SiteRevisionProblem:
+  case NonPositive(actual: Long)
+
+  def message: String = this match
+    case NonPositive(actual) =>
+      s"site revision must be positive, but was $actual"
+
+opaque type SiteRevision = Long
+
+object SiteRevision:
+  def parse(value: Long): Either[SiteRevisionProblem, SiteRevision] =
+    Either.cond(value > 0L, value, SiteRevisionProblem.NonPositive(value))
+
+  extension (value: SiteRevision)
+    def value: Long = value
+
+    def isAfter(previous: SiteRevision): Boolean = value > previous
+
 opaque type StartupTimeout = FiniteDuration
 
 object StartupTimeout:
@@ -205,6 +223,7 @@ final case class ProcessExit(
 enum PreviewViewState:
   case Starting
   case Ready(url: PreviewUrl)
+  case Refreshed(url: PreviewUrl, revision: SiteRevision)
   case Stopped
   case Failed(reason: String)
   case Exited(exit: ProcessExit)
@@ -219,5 +238,5 @@ enum PreviewTerminal:
 
 enum PreviewStatus:
   case Starting, Stopping
-  case Ready(url: PreviewUrl)
+  case Ready(url: PreviewUrl, revision: Option[SiteRevision])
   case Terminal(value: PreviewTerminal)

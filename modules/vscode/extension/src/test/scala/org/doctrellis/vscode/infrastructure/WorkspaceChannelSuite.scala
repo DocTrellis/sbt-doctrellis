@@ -1,10 +1,10 @@
 package org.doctrellis.vscode.infrastructure
 
+import scala.collection.mutable
 import scala.concurrent.duration.*
 import scala.scalajs.js
 
 import cats.effect.{Deferred, IO, Ref}
-import cats.effect.std.Dispatcher
 
 import munit.CatsEffectSuite
 
@@ -14,6 +14,13 @@ import org.doctrellis.vscode.infrastructure.facade.*
 class WorkspaceChannelSuite extends CatsEffectSuite:
   private val firstUrl  = right(PreviewUrl.parse("http://127.0.0.1:43123"))
   private val secondUrl = right(PreviewUrl.parse("http://127.0.0.1:43124"))
+
+  test("hello opts into site events with a numeric atomic field"):
+    assertEquals(
+      WorkspaceChannelProtocol.hello("token", "client", "request"),
+      """{"version":1,"type":"hello","siteEvents":1,"token":"token","clientId":"client","requestId":"request"}
+        |""".stripMargin,
+    )
 
   test("NDJSON framing handles every split and multiple LF or CRLF frames"):
     val frame    = readyFrame(firstUrl, requestId = "hello", pid = 42)
@@ -181,6 +188,60 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     assertEquals(valid, Right(WorkspaceChannelMessage.Pong))
     assert(unknown.isLeft)
 
+  test("site change messages parse a matching session and safe revision"):
+    val valid = WorkspaceChannelProtocol.decodeServer(
+      frame = siteChangedFrame("session", 2),
+      helloRequestId = "hello",
+      pingRequestId = None,
+      stopRequestId = None,
+      expectedSessionId = "session",
+      expectedPid = 42,
+      expectedLaunchId = "launch",
+    )
+    assertEquals(
+      valid,
+      Right(WorkspaceChannelMessage.SiteChanged(revision(2))),
+    )
+
+    val rejected = Vector(
+      siteChangedFrame("other", 2),
+      siteChangedFrame("session", 0),
+      siteChangedFrame("session", -1),
+      siteChangedFrame("session", 2)
+        .replace("\"revision\":2", "\"revision\":2.5"),
+      siteChangedFrame("session", 2).replace(
+        "\"revision\":2",
+        "\"revision\":9007199254740992",
+      ),
+    )
+    rejected.foreach: frame =>
+      assert(
+        WorkspaceChannelProtocol
+          .decodeServer(
+            frame = frame,
+            helloRequestId = "hello",
+            pingRequestId = None,
+            stopRequestId = None,
+            expectedSessionId = "session",
+            expectedPid = 42,
+            expectedLaunchId = "launch",
+          )
+          .isLeft,
+        clues(frame),
+      )
+
+  test("site revisions must increase within one connection"):
+    val second = revision(2)
+    val third  = revision(3)
+
+    assertEquals(SiteRevisionAcceptance.validate(None, second), Right(second))
+    assertEquals(
+      SiteRevisionAcceptance.validate(Some(second), third),
+      Right(third),
+    )
+    assert(SiteRevisionAcceptance.validate(Some(second), second).isLeft)
+    assert(SiteRevisionAcceptance.validate(Some(third), second).isLeft)
+
   test("ready state rejects duplicate and conflicting announcements"):
     assertEquals(ReadyAnnouncement.validate(None, firstUrl), Right(firstUrl))
     assert(
@@ -256,17 +317,13 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":9,"pid":42,"sessionId":"winner-session","launchId":"winner-launch","token":"${"0" * 64}"}"""
       for
         _      <- promise(TestNodeFsPromises.writeFile(metadataPath, metadata))
-        result <- Dispatcher
-          .parallel[IO]
-          .use: dispatcher =>
-            WorkspaceChannel
-              .connectReady(
-                dispatcher = dispatcher,
-                endpoint = endpoint,
-                verifyPing = true,
-                expectedLaunchId = Some("loser-launch"),
-              )
-              .attempt
+        result <- WorkspaceChannel
+          .connectReady(
+            endpoint = endpoint,
+            verifyPing = true,
+            expectedLaunchId = Some("loser-launch"),
+          )
+          .attempt
       yield assert(
         result.left.exists(_.getMessage.contains("different preview launch")),
       ),
@@ -279,104 +336,211 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       ),
     )
 
-  test("closing a connection settles pending ready and ping waits"):
-    Dispatcher
-      .parallel[IO]
-      .use: dispatcher =>
-        val metadata = WorkspaceChannelMetadata(
-          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
-          pid = 42,
-          sessionId = "session",
-          launchId = "launch",
-          token = "0" * 64,
-        )
+  test("closing a connection ends site events and settles pending waits"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    for
+      connection <- WorkspaceChannelConnection.create(
+        socket = inertSocket(),
+        metadata = metadata,
+      )
+      ready          <- connection.awaitUrl.attempt.start
+      pong           <- connection.ping.attempt.start
+      revision       <- connection.nextSiteRevision.attempt.start
+      _              <- IO.cede
+      _              <- connection.close *> connection.close
+      readyResult    <- ready.joinWithNever.timeout(1.second)
+      pongResult     <- pong.joinWithNever.timeout(1.second)
+      revisionResult <- revision.joinWithNever.timeout(1.second)
+    yield
+      assert(readyResult.isLeft)
+      assert(pongResult.isLeft)
+      assertEquals(revisionResult, Right(None))
+
+  test("initialization failure cleans the socket before returning"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, lifecycle) = failingInitializationSocket()
+    for
+      result <- WorkspaceChannelConnection
+        .create(socket = socket, metadata = metadata)
+        .attempt
+      events <- IO.delay(lifecycle())
+    yield
+      assert(result.left.exists(_.getMessage.contains("write failed")))
+      assert(events.contains("off:data"))
+      assert(events.contains("off:error"))
+      assert(events.contains("off:close"))
+      assert(!events.contains("emit:close"))
+      assert(events.indexOf("off:close") < events.indexOf("destroy"))
+
+  test("a connection preserves event order and rejects a duplicate revision"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
         for
-          connection <- WorkspaceChannelConnection.create(
-            dispatcher = dispatcher,
-            socket = inertSocket(),
-            metadata = metadata,
+          initialWrites <- IO.delay(writes())
+          _             <- IO.delay(
+            emitData(siteChangedFrame("session", 2) + "\n"),
           )
-          ready       <- connection.awaitUrl.attempt.start
-          pong        <- connection.ping.attempt.start
-          _           <- IO.cede
-          _           <- connection.close
-          readyResult <- ready.joinWithNever.timeout(1.second)
-          pongResult  <- pong.joinWithNever.timeout(1.second)
+          _ <- IO.delay(
+            emitData(siteChangedFrame("session", 3) + "\n"),
+          )
+          first  <- connection.nextSiteRevision.timeout(1.second)
+          second <- connection.nextSiteRevision.timeout(1.second)
+          _      <- IO.delay(
+            emitData(siteChangedFrame("session", 3) + "\n"),
+          )
+          failure <- connection.nextSiteRevision.attempt.timeout(1.second)
+          exit    <- connection.awaitExit.attempt.timeout(1.second)
         yield
-          assert(readyResult.isLeft)
-          assert(pongResult.isLeft)
+          assert(initialWrites.exists(_.contains("\"siteEvents\":1")))
+          assertEquals(
+            Vector(first.map(_.value), second.map(_.value)),
+            Vector(Some(2L), Some(3L)),
+          )
+          assert(failure.left.exists(_.getMessage.contains("must be greater")))
+          assert(exit.left.exists(_.getMessage.contains("must be greater"))),
+      )(_.close)
+
+  test("a transport error fails both site events and connection exit"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, _, emitError, emitClose, _) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          revision       <- connection.nextSiteRevision.attempt.start
+          exit           <- connection.awaitExit.attempt.start
+          _              <- IO.delay(emitError(new js.Error("transport lost")))
+          _              <- IO.delay(emitClose())
+          revisionResult <- revision.joinWithNever.timeout(1.second)
+          exitResult     <- exit.joinWithNever.timeout(1.second)
+        yield
+          assert(
+            revisionResult.left.exists(
+              _.getMessage.contains("transport lost"),
+            ),
+          )
+          assert(
+            exitResult.left.exists(_.getMessage.contains("transport lost")),
+          ),
+      )(_.close)
+
+  test("a normal transport end closes site events without a failure"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, _, _, emitClose, _) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          revision       <- connection.nextSiteRevision.attempt.start
+          exit           <- connection.awaitExit.attempt.start
+          _              <- IO.delay(emitClose())
+          revisionResult <- revision.joinWithNever.timeout(1.second)
+          exitResult     <- exit.joinWithNever.timeout(1.second)
+        yield
+          assertEquals(revisionResult, Right(None))
+          assert(
+            exitResult.exists(
+              _.error.contains("workspace IPC connection ended"),
+            ),
+          ),
+      )(_.close)
 
   test("reinstalling a shared connection does not close it"):
-    Dispatcher
-      .parallel[IO]
-      .use: dispatcher =>
-        val metadata = WorkspaceChannelMetadata(
-          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
-          pid = 42,
-          sessionId = "session",
-          launchId = "launch",
-          token = "0" * 64,
-        )
-        val (socket, destroyCount) = trackedInertSocket()
-        for
-          connection <- WorkspaceChannelConnection.create(
-            dispatcher = dispatcher,
-            socket = socket,
-            metadata = metadata,
-          )
-          state <- Ref.of[IO, DynamicPreviewConnection](
-            DynamicPreviewConnection.Pending,
-          )
-          first    <- DynamicPreviewRuntime.installConnection(state, connection)
-          second   <- DynamicPreviewRuntime.installConnection(state, connection)
-          destroys <- IO.delay(destroyCount())
-          _        <- connection.close
-        yield
-          assert(first.eq(connection))
-          assert(second.eq(connection))
-          assertEquals(destroys, 0)
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, destroyCount) = trackedInertSocket()
+    for
+      connection <- WorkspaceChannelConnection.create(
+        socket = socket,
+        metadata = metadata,
+      )
+      state <- Ref.of[IO, DynamicPreviewConnection](
+        DynamicPreviewConnection.Pending,
+      )
+      first    <- DynamicPreviewRuntime.installConnection(state, connection)
+      second   <- DynamicPreviewRuntime.installConnection(state, connection)
+      destroys <- IO.delay(destroyCount())
+      _        <- connection.close
+    yield
+      assert(first.eq(connection))
+      assert(second.eq(connection))
+      assertEquals(destroys, 0)
 
   test(
     "releasing a reused runtime closes a connection acquired at the stop boundary",
   ):
-    Dispatcher
-      .parallel[IO]
-      .use: dispatcher =>
-        val metadata = WorkspaceChannelMetadata(
-          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
-          pid = 42,
-          sessionId = "session",
-          launchId = "launch",
-          token = "0" * 64,
-        )
-        val (socket, destroyCount) = trackedInertSocket()
-        for
-          connection <- WorkspaceChannelConnection.create(
-            dispatcher = dispatcher,
-            socket = socket,
-            metadata = metadata,
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, destroyCount) = trackedInertSocket()
+    for
+      connection <- WorkspaceChannelConnection.create(
+        socket = socket,
+        metadata = metadata,
+      )
+      acquireEntered  <- Deferred[IO, Unit]
+      continueAcquire <- Deferred[IO, Unit]
+      runtime         <- DynamicPreviewRuntime.reused(
+        IO.uncancelable: _ =>
+          acquireEntered.complete(()).void *>
+            continueAcquire.get.as(connection),
+      )
+      awaitUrl <- runtime.running.announcedUrl match
+        case Some(wait) => wait.attempt.start
+        case None       =>
+          IO.raiseError(
+            IllegalStateException("expected a dynamic preview URL wait"),
           )
-          acquireEntered  <- Deferred[IO, Unit]
-          continueAcquire <- Deferred[IO, Unit]
-          runtime         <- DynamicPreviewRuntime.reused(
-            IO.uncancelable: _ =>
-              acquireEntered.complete(()).void *>
-                continueAcquire.get.as(connection),
-          )
-          awaitUrl <- runtime.running.announcedUrl match
-            case Some(wait) => wait.attempt.start
-            case None       =>
-              IO.raiseError(
-                IllegalStateException("expected a dynamic preview URL wait"),
-              )
-          _        <- acquireEntered.get
-          _        <- runtime.release
-          _        <- continueAcquire.complete(())
-          result   <- awaitUrl.joinWithNever.timeout(1.second)
-          destroys <- IO.delay(destroyCount())
-        yield
-          assert(result.isLeft)
-          assertEquals(destroys, 1)
+      _        <- acquireEntered.get
+      _        <- runtime.release
+      _        <- continueAcquire.complete(())
+      result   <- awaitUrl.joinWithNever.timeout(1.second)
+      destroys <- IO.delay(destroyCount())
+    yield
+      assert(result.isLeft)
+      assertEquals(destroys, 1)
 
   test("workspace endpoints are stable, distinct, short, and outside projects"):
     val root  = TestNodeRuntime.cwd()
@@ -500,6 +664,12 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
   ): String =
     s"""{"version":1,"type":"ready","requestId":"$requestId","sessionId":"session","launchId":"launch","pid":$pid,"url":"${url.value}"}"""
 
+  private def siteChangedFrame(sessionId: String, value: Long): String =
+    s"""{"version":1,"type":"siteChanged","sessionId":"$sessionId","revision":$value}"""
+
+  private def revision(value: Long): SiteRevision =
+    SiteRevision.parse(value).fold(problem => fail(problem.message), identity)
+
   private def promise[A](value: => js.Promise[A]): IO[A] =
     IO.fromPromise(IO.delay(value))
 
@@ -529,6 +699,106 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       (() => destroys += 1): js.Function0[Unit],
     )
     socket.asInstanceOf[NodeSocket] -> (() => destroys)
+
+  private def controlledSocket(): (
+      NodeSocket,
+      String => Unit,
+      js.Any => Unit,
+      () => Unit,
+      () => Vector[String],
+  ) =
+    val socket   = js.Dynamic.literal()
+    val writes   = mutable.ListBuffer.empty[String]
+    var data     = Option.empty[js.Function1[String, Unit]]
+    var error    = Option.empty[js.Function1[js.Any, Unit]]
+    var close    = Option.empty[js.Function0[Unit]]
+    val register =
+      (
+          (event: String, listener: js.Function) =>
+            event match
+              case "data" =>
+                data = Some(listener.asInstanceOf[js.Function1[String, Unit]])
+              case "error" =>
+                error = Some(listener.asInstanceOf[js.Function1[js.Any, Unit]])
+              case "close" =>
+                close = Some(listener.asInstanceOf[js.Function0[Unit]])
+              case _ => ()
+            socket,
+      ): js.Function2[String, js.Function, js.Dynamic]
+    socket.updateDynamic("on")(register)
+    socket.updateDynamic("once")(register)
+    socket.updateDynamic("off")(
+      ((_: String, _: js.Function) => socket): js.Function2[
+        String,
+        js.Function,
+        js.Dynamic,
+      ],
+    )
+    socket.updateDynamic("write")(
+      ((value: String) =>
+        writes += value
+        true,
+      ): js.Function1[String, Boolean],
+    )
+    socket.updateDynamic("setEncoding")(
+      ((_: String) => socket): js.Function1[String, js.Dynamic],
+    )
+    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
+    socket.updateDynamic("destroy")((() => ()): js.Function0[Unit])
+    (
+      socket.asInstanceOf[NodeSocket],
+      chunk => data.foreach(callback => callback(chunk)),
+      value => error.foreach(callback => callback(value)),
+      () => close.foreach(callback => callback()),
+      () => writes.toVector,
+    )
+
+  private def failingInitializationSocket()
+      : (NodeSocket, () => Vector[String]) =
+    val socket    = js.Dynamic.literal()
+    val events    = mutable.ListBuffer.empty[String]
+    val listeners = mutable.Map.empty[String, js.Function]
+    val register  =
+      (
+          (event: String, listener: js.Function) =>
+            events += s"on:$event"
+            listeners.update(event, listener)
+            socket,
+      ): js.Function2[String, js.Function, js.Dynamic]
+    socket.updateDynamic("on")(register)
+    socket.updateDynamic("once")(register)
+    socket.updateDynamic("off")(
+      (
+          (event: String, listener: js.Function) =>
+            events += s"off:$event"
+            listeners
+              .get(event)
+              .filter(_ == listener)
+              .foreach(_ => listeners.remove(event): Unit)
+            socket,
+      ): js.Function2[String, js.Function, js.Dynamic],
+    )
+    socket.updateDynamic("write")(
+      ((_: String) =>
+        events += "write"
+        throw IllegalStateException("write failed"),
+      ): js.Function1[String, Boolean],
+    )
+    socket.updateDynamic("setEncoding")(
+      ((_: String) => socket): js.Function1[String, js.Dynamic],
+    )
+    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
+    socket.updateDynamic("destroy")(
+      (() =>
+        events += "destroy"
+        listeners
+          .get("close")
+          .foreach: listener =>
+            events += "emit:close"
+            listener.asInstanceOf[js.Function0[Unit]](),
+      ): js.Function0[Unit],
+    )
+    socket.asInstanceOf[NodeSocket] -> (() => events.toVector)
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)

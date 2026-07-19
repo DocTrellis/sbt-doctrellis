@@ -7,12 +7,16 @@ workspace. When ready, the extension opens a `DocTrellis Preview` Webview tab
 containing the remote-aware preview URL. Repeated opens and restarts reuse the
 workspace's panel, while stop, startup failure, and unexpected process exit are
 shown as connection states in the same tab. Multi-root folders have independent
-panels.
+panels. With a version 2 IPC preview and the current plugin, successful
+documentation rebuilds refresh an existing panel automatically at the same
+stored URL. Events do not reveal the panel or recreate one that the user
+closed.
 
 Use **DocTrellis: Open in External Browser** when the preview should leave VS
 Code. Both the Webview iframe and external command apply VS Code's
 `asExternalUri` mapping for Remote SSH and Dev Container extension hosts. Logs
-are available through **DocTrellis: Show Output**.
+are available through **DocTrellis: Show Output**. External browsers receive
+the rebuilt site but require a manual page refresh.
 
 The extension is currently packaged for local installation only and is not published to the VS Code Marketplace.
 
@@ -28,13 +32,18 @@ deactivation use the same cleanup path. Existing version 1 argument vectors
 remain valid and are never rewritten.
 
 Version 1 remains the fixed-URL compatibility mode and continues to poll its
-configured URL. Version 2 has no duplicate `url` field. Unix hosts use a
+configured URL. It has no authenticated publication-event channel, so a
+version 1 Webview must be closed and reopened to load a rebuild. Version 2 has
+no duplicate `url` field. Unix hosts use a
 current-user-owned, non-symlinked runtime directory and a short session-unique
 domain socket; Windows uses a token-authenticated loopback channel. IPC remains
 on the extension host in Remote SSH and Dev Containers, while only HTTP goes
 through `asExternalUri`. A second window can observe and reuse a live workspace
 URL after correlated ready and ping responses, but holds a read-only lease and
-does not stop the process owned by the first window.
+does not stop the process owned by the first window. Owner and observer
+connections both receive successful-publication refresh events when the
+current plugin supports them; older plugins ignore the additive opt-in and
+remain compatible.
 A concurrent cold start also carries a random launch ID through the child
 environment, endpoint metadata, and ready response, so a losing window cannot
 adopt or stop the winning window's process.

@@ -218,21 +218,30 @@ private[infrastructure] final class PreviewPanelRegistry private (
   ): IO[String] =
     state match
       case PreviewViewState.Ready(url) =>
-        backend
-          .resolve(url)
-          .flatMap: resolved =>
-            IO.fromEither(
-              ResolvedPreviewUri
-                .parse(resolved)
-                .leftMap(detail =>
-                  IllegalArgumentException(
-                    s"VS Code asExternalUri returned an unusable URI: $detail",
-                  ),
-                ),
-            ).map(external =>
-              PreviewWebviewHtml.render(workspace, state, Some(external)),
-            )
+        renderReady(workspace, state, url)
+      case PreviewViewState.Refreshed(url, _) =>
+        renderReady(workspace, state, url)
       case _ => IO.pure(PreviewWebviewHtml.render(workspace, state, None))
+
+  private def renderReady(
+      workspace: Workspace,
+      state: PreviewViewState,
+      url: PreviewUrl,
+  ): IO[String] =
+    backend
+      .resolve(url)
+      .flatMap: resolved =>
+        IO.fromEither(
+          ResolvedPreviewUri
+            .parse(resolved)
+            .leftMap(detail =>
+              IllegalArgumentException(
+                s"VS Code asExternalUri returned an unusable URI: $detail",
+              ),
+            ),
+        ).map(external =>
+          PreviewWebviewHtml.render(workspace, state, Some(external)),
+        )
 
   private def message(error: Throwable): String =
     Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
@@ -294,8 +303,19 @@ private[infrastructure] object PreviewWebviewHtml:
         status("Starting preview", s"Starting the preview for $name…")
       case PreviewViewState.Ready(_) =>
         externalUrl match
-          case Some(url) if url.cspOrigin.nonEmpty => iframe(name, url)
+          case Some(url) if url.cspOrigin.nonEmpty => iframe(name, url, None)
           case Some(_)                             =>
+            status(
+              "Preview unavailable",
+              "VS Code returned a preview address that cannot be embedded under the preview panel security policy. Use Open in External Browser instead.",
+            )
+          case None =>
+            status("Preview unavailable", "The preview URL is unavailable.")
+      case PreviewViewState.Refreshed(_, revision) =>
+        externalUrl match
+          case Some(url) if url.cspOrigin.nonEmpty =>
+            iframe(name, url, Some(revision))
+          case Some(_) =>
             status(
               "Preview unavailable",
               "VS Code returned a preview address that cannot be embedded under the preview panel security policy. Use Open in External Browser instead.",
@@ -337,10 +357,14 @@ private[infrastructure] object PreviewWebviewHtml:
   private def iframe(
       workspaceName: String,
       url: ResolvedPreviewUri,
+      revision: Option[SiteRevision],
   ): String =
-    val safeUrl  = escape(url.value)
-    val safeName = escape(workspaceName)
-    s"""<iframe src="$safeUrl" title="DocTrellis Preview — $safeName" sandbox="" referrerpolicy="no-referrer"></iframe>"""
+    val safeUrl           = escape(url.value)
+    val safeName          = escape(workspaceName)
+    val revisionAttribute = revision
+      .map(value => s" data-doctrellis-revision=\"${value.value}\"")
+      .getOrElse("")
+    s"""<iframe src="$safeUrl" title="DocTrellis Preview — $safeName"$revisionAttribute sandbox="" referrerpolicy="no-referrer"></iframe>"""
 
   private def status(title: String, detail: String): String =
     s"<main><h1>${escape(title)}</h1><p>${escape(detail)}</p></main>"
