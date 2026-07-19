@@ -1,15 +1,16 @@
-# DocTrellis Coding Style Guide
+# DocTrellis Project Coding Guide
 
-This guide defines the coding conventions for DocTrellis. It applies to the
-sbt plugin, the Scala.js VS Code extension, tests, build definitions, and
-supporting scripts.
+DocTrellis follows the reusable
+[Scala 3 Functional Coding Style Guide](SCALA_CODING_STYLE.md). This document
+adds the architecture mapping, platform boundaries, tool configuration, test
+scope, and verification rules specific to this repository.
 
-The goal is not merely uniform formatting. Code should make invalid states
-hard to represent, keep effects and platform capabilities at explicit
-boundaries, and use the least powerful construct that solves the problem.
+The base guide applies unless this document gives a more specific DocTrellis
+rule. A more specific rule refines the base guide; an apparent contradiction
+must be resolved explicitly rather than worked around.
 
-The words **must**, **should**, and **may** indicate required, recommended, and
-optional practices respectively.
+This guide applies to the sbt plugin, the Scala.js VS Code extension, tests,
+build definitions, and supporting scripts.
 
 ## Sources of truth
 
@@ -19,155 +20,16 @@ optional practices respectively.
 - `.scalafix.conf` is the source of truth for import organization.
 - The accepted ADRs under `docs/adr/` are the source of truth for architectural
   decisions.
-- This guide covers design and review choices that formatters and linters
-  cannot enforce.
+- This guide and the base guide cover design and review choices that automated
+  tools cannot enforce.
 
 When these sources appear to disagree, do not work around an automated check.
 Clarify the rule or update the relevant decision explicitly.
 
-## Design priorities
+## Functional architecture in DocTrellis
 
-Use this order when two style rules compete:
-
-1. Correctness and resource safety
-2. Valid data at architectural boundaries
-3. Clear dependency direction
-4. The Principle of Least Power
-5. Readability and consistency
-6. Concision
-
-Significant indentation often makes Scala 3 code shorter, but reducing the
-line count must never hide lifecycle behavior, error handling, or ownership.
-
-## Principle of Least Power
-
-Choose the least expressive mechanism that fully represents the requirement:
-
-- Prefer immutable `val` bindings to mutable state.
-- Prefer a pure function to an effectful function.
-- Prefer an abstract `F[_]` with the smallest required capability constraint
-  to concrete `IO` in programs and algebras.
-- Prefer a small record of algebra operations to a deep trait hierarchy.
-- Prefer an opaque type and a smart constructor to a broadly constructible
-  wrapper.
-- Prefer an enum or a sealed error hierarchy to strings and booleans that
-  encode states indirectly.
-- Prefer direct process execution with an argument vector to shell command
-  construction.
-- Prefer a hand-written facade containing only used members to a generated
-  platform binding.
-- Prefer a local value or helper to a new public abstraction used only once.
-
-Treat every type class constraint as a capability grant. Add only the weakest
-constraint needed by the implementation, and do not require `Async` merely for
-convenience when `Functor`, `MonadThrow`, `MonadCancelThrow`, `Temporal`,
-`Concurrent`, or `Sync` is sufficient. Effect polymorphism is primarily a way
-to restrict what inner code can do; testability is a useful consequence.
-
-Macros, reflection, unchecked casts, and global registries grant much broader
-power and require a concrete justification at a platform boundary.
-
-## Parse, do not validate
-
-Untrusted values must be converted into domain values at the boundary. Do not
-check a raw value and continue passing the same raw type through the system.
-
-Parsing allows code inside the boundary to be composed from total functions.
-Prefer strengthening the input type to weakening the result type. When parsing
-can establish a guarantee, encode it in the domain value so an inner function
-can return an ordinary value instead of repeating the check or propagating an
-unnecessary `Option` or `Either`.
-
-Prefer:
-
-```scala
-def parse(value: String): Either[ConfigProblem, PreviewUrl]
-
-final case class PreviewAlgebra[F[_]](
-    probe: PreviewUrl => F[Boolean],
-)
-```
-
-Avoid:
-
-```scala
-def isValidUrl(value: String): Boolean
-
-final case class PreviewAlgebra(
-    probe: String => IO[Boolean],
-)
-```
-
-Apply these rules consistently:
-
-- Put smart constructors in the companion object of the parsed type.
-- Keep opaque type constructors inaccessible outside their defining scope.
-- Represent malformed boundary input with a structured error that identifies
-  the offending field or boundary; do not throw from a domain parser.
-- Parse configuration versions and reject unknown fields before starting any
-  effect.
-- Resolve and canonicalize filesystem paths before constructing a
-  `WorkingDirectory`.
-- Make application programs accept parsed domain values, not `js.Any`, JSON
-  objects, arbitrary strings, or unresolved paths.
-- Prefer `A => B` to `A => Option[B]` or `A => Either[E, B]` when the
-  guarantees encoded by `A` make `B` inevitable.
-- Use `Option`, `Either`, or a domain-specific result ADT inside the boundary
-  only when absence, rejection, or failure remains a legitimate outcome for an
-  already parsed domain input.
-- Do not invent fallback values or rely on "impossible" exceptions merely to
-  make a function appear total. Instead, refine the input type when it can rule
-  out the case.
-- Keep environmental and effect failures explicit in `F[_]`; they are distinct
-  from malformed boundary input and cannot be eliminated by parsing.
-- Do not add `require` calls to case classes when a parser can make the invalid
-  construction impossible.
-
-A multi-stage boundary is acceptable. For example, JSON parsing produces a
-`PreviewTemplate`; filesystem resolution then produces a `PreviewCommand`.
-Each stage must narrow the possible states.
-
-## Functional architecture: algebra, program, and interpreter
-
-The VS Code extension uses a tagless-final style while keeping dependencies
-pointed inward. Algebras describe capabilities in an abstract `F[_]`, programs
-compose those capabilities, and interpreters connect them to the platform. The
-outer composition root selects the concrete effect and wires the parts
-together.
-
-```text
-composition root
-  |-> program -> algebra -> domain
-  `-> interpreters
-        |-> algebra
-        |-> domain
-        `-> platform APIs
-```
-
-This vocabulary describes roles rather than requiring one package, trait, or
-type class per role:
-
-- **Domain** owns parsed values, state, and deterministic pure rules. It does
-  not mention `F[_]` or platform types.
-- **Algebra** describes the smallest capabilities a program requires in terms
-  of domain inputs and outputs. A small record of functions such as
-  `PreviewAlgebra[F]` is an algebra; do not introduce a trait or type class when
-  a record is sufficient.
-- **Program** implements use cases and lifecycle orchestration using only
-  domain values, algebras, and the weakest effect capabilities it needs. It
-  remains polymorphic in `F[_]` and must not select `IO` for itself.
-- **Interpreter** implements an algebra using Node, VS Code, or another
-  external system. It translates platform values at the boundary so they do
-  not escape into the program or domain.
-- **Composition root** acquires shared resources, selects the concrete effect,
-  constructs interpreters, and supplies them to programs. For the VS Code
-  extension, this is the only role that should normally wire programs to
-  `IO`.
-
-In this guide, an *interpreter* is a production or test implementation of an
-algebra; `IO` and `SyncIO` are concrete effect types, not interpreters.
-
-The module boundaries realize those roles as follows:
+The VS Code extension realizes the domain, algebra, program, interpreter, and
+composition-root roles from the base guide with these module boundaries:
 
 | Module | Architectural role | Owns | Must not depend on |
 | --- | --- | --- | --- |
@@ -176,60 +38,38 @@ The module boundaries realize those roles as follows:
 | `modules/vscode/extension` | Interpreter and composition root | Node/VS Code implementations, resource wiring, and exported entry points | Private inner-module implementation details |
 | `modules/sbt-doctrellis` | Separate JVM vertical | Documentation build and local HTTP preview | VS Code extension modules |
 
-Apply these dependency rules:
+Roles do not require one package, trait, or type class each. In particular,
+the application module intentionally owns both algebra definitions and the
+programs that consume them.
 
-- Programs may depend on algebras and the domain; interpreters may depend on
-  algebras, the domain, and their platform APIs.
-- Inner modules must not import outer-module packages.
-- Algebra operations must accept and return parsed domain values rather than
-  raw platform representations.
-- Keep each algebra no more powerful than the program that consumes it. Split
-  unrelated capabilities when doing so makes ownership or reuse clearer, but
-  do not split a cohesive record merely to create more abstractions.
-- Tests should supply controlled algebra functions or in-memory interpreters;
-  they should not require changes to program logic.
-- Domain code must remain deterministic and independently testable.
+Apply these project dependency rules:
+
+- The extension composition root selects `IO`, constructs the Node and VS Code
+  interpreters, and supplies them to application programs.
 - The sbt plugin remains a separate JVM vertical because sbt, mdoc, Laika, and
   the preview HTTP server are not VS Code domain concerns.
 - Cross-cutting changes to these dependency directions require an ADR.
 
-## Scala 3 syntax and formatting
+## DocTrellis boundary values
 
-Run Scalafmt instead of manually aligning code. Use Scala 3 syntax throughout.
+- `ConfigParser` must parse `.doctrellis.json` into a `PreviewTemplate`,
+  rejecting unsupported versions and fields disallowed by the selected schema
+  version before launching a preview process.
+- `NodeConfig.load` must resolve and canonicalize the configured path within its
+  workspace before constructing the `WorkingDirectory` used by
+  `PreviewCommand`.
+- `PreviewService` and `PreviewAlgebra` must receive translated domain values,
+  not `js.Any`, decoded JSON objects, or unresolved configuration paths.
+- Domain parsing failures should be structured values such as `ConfigProblem`.
 
-- Use significant indentation and `:` syntax whenever the construct supports
-  it clearly.
-- Use braces only where required by syntax, interpolation, imports, macros, or
-  platform interoperability, or where significant indentation would be
-  genuinely ambiguous.
-- Do not use semicolons.
-- Use `then`, `do`, `match`, and indentation-based lambdas consistently.
-- Use `as` for renamed imports and `*` for wildcard imports.
-- Keep wildcard imports limited to established DSLs such as sbt keys, Cats
-  syntax, or a deliberately small project package.
-- Include trailing commas in multiline argument and parameter lists.
-- Give public and protected definitions explicit result types.
-- Let private local values infer their types when the result is obvious.
-- Keep one primary top-level production definition per file unless tightly
-  coupled private definitions are clearer beside it.
+`NodeConfig.load` implements a two-stage boundary: JSON parsing produces a
+`PreviewTemplate`, then filesystem resolution produces a `PreviewCommand`.
 
-Prefer:
+The base naming conventions are illustrated here by domain nouns such as
+`PreviewCommand` and `PreviewStatus`, and by failures named after their
+condition, such as `PreviewTimedOut`.
 
-```scala
-final class PreviewService[F[_]: Concurrent](
-    sessions: Ref[F, Map[String, PreviewSession[F]]],
-    mutex: Mutex[F],
-):
-  def start(workspace: Workspace): F[Unit] =
-    mutex.lock.surround:
-      sessions.get.flatMap:
-        case sessions if sessions.contains(workspace.key) =>
-          Concurrent[F].unit
-        case _ => create(workspace)
-```
-
-Avoid adding braces around declarations and callbacks that have a direct
-indentation-based form.
+## Scala toolchain policy
 
 ### Compiler warnings
 
@@ -243,111 +83,29 @@ free.
 - For temporary local iteration without fatal warnings, run the
   `tpolecatDevMode` command or launch sbt with `SBT_TPOLECAT_DEV=1`; do not edit
   `build.sbt` to switch modes.
-- Scope exclusions as narrowly as possible and document why the excluded
-  warning cannot be fixed at its source.
-- Do not exclude a warning globally merely to accommodate one test, generated
-  source, REPL, or platform boundary.
+
+Production WartRemover rules also apply as review rules in test code, even
+when the test configuration does not enforce every wart mechanically.
 
 ### Import organization
 
-Imports must follow one deterministic layout. Group them in this order, with a
-blank line between non-empty groups:
+The final project-package import group described by the base guide is
+`org.doctrellis`. The `OrganizeImports` profile in `.scalafix.conf` enforces
+the complete import policy. Removing unused imports remains a separate compiler
+or lint concern.
 
-1. `java` and `javax` packages
-2. `scala` packages
-3. `cats` packages
-4. Other third-party packages
-5. `org.doctrellis` packages
+## Cats Effect runtime boundaries
 
-Merge imports that share a prefix and sort selectors by ASCII order. Sort
-import statements with `SymbolsFirst`: wildcard and grouped imports precede
-ordinary imports sharing the same prefix, while other path segments remain in
-lexicographic order. Do not turn a large selector list into a wildcard
-automatically; wildcard imports are still limited to the DSL cases described
-above. Removing unused imports is a separate compiler or lint concern.
-
-This policy is enforced by the `OrganizeImports` profile in `.scalafix.conf`.
-
-## Types, data, and naming
-
-- Use `final` for production classes and case classes unless inheritance is a
-  deliberate part of the model.
-- Use enums for closed state machines and alternatives that carry domain data.
-- Use sealed exception hierarchies when failures must also be `Throwable`.
-- Use case classes instead of public tuples when fields have domain meaning.
-- Use named arguments when a constructor has several parameters of the same
-  type or multiple function-valued fields, especially when assembling algebra
-  records.
-- Use opaque types for scalar values whose invariants are established during
-  parsing and that do not need product structure.
-- When scalar constraints must be reused or composed broadly enough that local
-  opaque types would duplicate parser and smart-constructor logic, consider a
-  refined-type library such as Iron. Do not add such a dependency for an
-  isolated invariant that an opaque type can express clearly.
-- Name opaque type constructors `parse` when they consume untrusted input.
-- Expose the underlying scalar with a narrowly scoped extension such as
-  `.value` or `.duration`, primarily for interpreters.
-- Name effects with verbs such as `start`, `stop`, `load`, `probe`, and
-  `render`.
-- Name domain values and states with nouns such as `PreviewCommand` and
-  `PreviewStatus`.
-- Name failures after the condition, for example `PreviewTimedOut`, rather
-  than after the place where they were detected.
-- Use `private` or `private[package]` aggressively. Public API is a maintenance
-  commitment.
-
-Do not use `null` in Scala code. At JavaScript boundaries, test `null` and
-`undefined` explicitly and translate them immediately into Scala values.
-
-Avoid partial operations, including `Option.get`, `Try.get`, unsafe either
-projections, unchecked casts in inner modules, and non-exhaustive matches.
-WartRemover enforces part of this rule; review must cover the rest.
-
-## Cats Effect and effect polymorphism
-
-Application programs, their algebras, and supporting resources should be
-parameterized by `F[_]`. The composition root selects `IO` as the concrete
-effect. Keep effects visible in signatures and follow these rules:
-
-- A data-only algebra such as `PreviewAlgebra[F]` should not impose a type class
-  constraint. Put constraints on the programs or interpreter implementations
-  that use or construct it.
-- Use `Functor` or `Monad` for pure effect composition, `MonadThrow` for raised
-  errors, and `MonadCancelThrow` for cancellation-aware resource scopes.
-- Add `Sync` only when suspending synchronous side effects, `Temporal` only
-  when time and sleeping are required, `Concurrent` only for concurrent state
-  and fibers, and `Async` only for asynchronous callback or promise bridges.
-- If one implementation needs a stronger constraint, keep that constraint on
-  the implementation rather than widening the algebra or every caller.
-- Wrap synchronous effects with `Sync[F].delay`; use `Sync[F].blocking` for
-  blocking JVM work.
-- Convert JavaScript promises and callbacks with `Async[F]` at the
-  infrastructure boundary.
-- Represent owned resources with `Resource[F, A]` and release them in reverse
-  acquisition order.
-- Make finalizers idempotent whenever more than one lifecycle path can reach
-  them.
-- Use `Ref[F, A]` for shared state, `Deferred[F, A]` for one-time signals,
-  `Mutex[F]` for serialized transitions, and `Supervisor[F]` for owned
-  background fibers.
-- Keep `uncancelable` regions as small as possible. Restore cancellation around
-  waits when atomic installation does not require masking them.
-- Specify the behavior for cancellation, startup failure, normal exit, and
-  shutdown timeout for every long-lived process.
-- Attempt all independent cleanup actions. Do not let one failed finalizer
-  silently prevent the remaining cleanup.
-- Preserve the primary failure when cleanup also fails, and report cleanup
-  failures with enough context to diagnose them.
-
-Concrete `IO`, `IORuntime`, `unsafeRunSync`, `unsafeToPromise`, and `Dispatcher`
-unsafe methods are allowed only at an outer runtime boundary:
+The extension composition root and the sbt task runtime select `IO` as the
+concrete effect. Concrete `IO`, `IORuntime`, `unsafeRunSync`, `unsafeToPromise`,
+and `Dispatcher` unsafe methods are allowed only at one of these outer runtime
+boundaries:
 
 - an sbt task that must return synchronously;
 - an exported VS Code activation or deactivation function; or
-- a Node/VS Code callback being transferred into the selected `IO` runtime.
+- a Node or VS Code callback being transferred into the selected `IO` runtime.
 
-Do not start raw threads or futures when a Cats Effect primitive expresses the
-same ownership and cancellation semantics.
+Keep these operations out of the domain and application modules.
 
 ## Scala.js and VS Code boundaries
 
@@ -396,110 +154,31 @@ points cannot express the grammar. Such preprocessing must preserve unaffected
 input and be covered by regression tests for line endings, indentation, code
 blocks, and nested structures.
 
-## Errors and logging
+## Errors and diagnostics
 
-- Domain parsing failures should be structured values such as `ConfigProblem`.
-- Infrastructure and lifecycle failures may be exceptions inside `F[_]`.
 - Use `sys.error` only at an sbt task boundary that must fail the build.
 - Error messages must state the operation and relevant field, workspace, path,
   or URL.
-- Preserve the original exception as the cause when adding context.
-- Catch `NonFatal` on the JVM unless the boundary requires a narrower type.
-- Never catch `Throwable` merely to keep execution moving.
-- Do not discard errors unless an operation is explicitly best-effort, such as
-  secondary logging or cleanup after the primary outcome is already known.
 - Send user-facing process diagnostics to the DocTrellis output channel or the
   sbt logger, not to arbitrary standard output.
 
-## Tests
+## Project test scope
 
-Every behavior change must have a test at the narrowest scope that can prove it.
+Apply the base testing principles with these DocTrellis-specific scopes:
 
-- Test opaque parsers with accepted boundary values and representative invalid
-  values.
+- Test DocTrellis opaque parsers, including `WorkingDirectory`, `PreviewUrl`,
+  and timing values, with accepted and representative invalid inputs.
 - Test application programs with controlled algebra values or in-memory
   interpreters; do not load Node or VS Code to test lifecycle decisions.
-- Test concurrent start, stop during startup, cancellation, process exit, and
-  cleanup failure explicitly.
-- Prefer `Deferred`, controlled probes, and deterministic fakes to arbitrary
-  sleeps.
-- Use bounded timeouts only where the real clock or operating system is part of
-  the behavior.
-- Test interpreters for malformed platform values and resource cleanup.
+- Test `PreviewService` for concurrent start, stop during startup,
+  cancellation, process exit, and cleanup failure explicitly.
 - Use scripted tests for behavior visible to an external sbt build.
 - Use temporary directories and ephemeral ports where possible, and release
   them even when assertions fail.
-- Give tests behavior-oriented names that explain the expected outcome.
 
-A bug fix should include a regression test that fails for the original bug.
-Production WartRemover rules also apply as review rules in test code, even when
-the test configuration does not enforce every wart mechanically.
+## Documentation and public contracts
 
-### Property-based testing
-
-Use property-based tests when behavior can be expressed as a law over a broad
-input space. They complement example-based tests; retain focused examples for
-boundary cases, regressions, and executable documentation.
-
-Prefer `scala-hedgehog` when introducing property-based tests. Its integrated
-shrinking keeps generated values and their shrunk counterexamples within the
-same construction rules, and its state-machine support fits lifecycle and
-resource-management testing. Use another property-testing library only when a
-concrete platform or integration constraint outweighs those benefits, and
-record the reason near the build dependency.
-
-Integrate Hedgehog through `hedgehog-munit` so property-based and example-based
-suites use the MUnit test framework. Do not add the separate Hedgehog sbt test
-framework unless a concrete integration constraint requires it.
-
-- State the property in domain terms before choosing generators.
-- Prefer round trips for encoders, decoders, and reversible transformations.
-- Compare stateful services with a small, pure reference model by generating
-  sequences of commands and checking their postconditions.
-- Check invariants preserved by transformations, including content, size,
-  containment, ordering, and resource ownership where applicable.
-- Check idempotence for normalization, stopping, cleanup, and other operations
-  whose contract says repeated application has no additional effect.
-- Check that distinct paths which the contract says are equivalent reach the
-  same result. Test commutativity, associativity, and type class laws only when
-  each law is part of the public contract.
-- Use structural properties for recursive data and black-box oracles when
-  producing a result is difficult but independently checking it is simple.
-- Generate valid domain values by construction. Generate malformed raw values
-  separately when testing parsers and other boundaries.
-- Keep generators and reference models simpler than the production
-  implementation; duplicating its algorithm proves little.
-- Choose explicit Hedgehog ranges and classifications that cover empty,
-  boundary, ordinary, and large cases relevant to the property. Avoid relying
-  on filtering when a generator can construct the intended domain directly.
-- Turn the smallest counterexample reported by Hedgehog into a focused
-  regression test. Record the seed reported in the failure output and reproduce
-  the generated run by setting that value through the `HEDGEHOG_SEED`
-  environment variable.
-- For effectful or concurrent code, generate operation sequences against a
-  deterministic model.
-
-### Concrete effects in example-based tests
-
-Use MUnit for example-based tests. When an example-based test must execute
-effects or manage a `Resource`, prefer MUnit Cats Effect and let the test return
-its effect directly; do not call `unsafeRunSync`.
-
-- Choose the least powerful concrete test effect that can exercise the
-  behavior. When an effect-polymorphic implementation requires only synchronous
-  effects, instantiate it with `SyncIO`. This verifies that the implementation
-  and its algebra dependencies are not accidentally coupled to `IO`.
-- Use `IO` when the behavior involves concurrency, fibers, cancellation,
-  scheduling, time, asynchronous callbacks, or runtime-specific blocking
-  semantics. A `SyncIO` test can verify ordinary and failed resource release,
-  but it cannot prove cancellation or concurrent lifecycle behavior.
-- Do not repeat the same test with both `SyncIO` and `IO` unless
-  concrete-effect-specific behavior is part of the contract.
-
-## Documentation and contracts
-
-When a public contract changes, update all affected representations in the same
-change:
+For DocTrellis, the base guide's public-contract synchronization rule covers:
 
 - the Scala domain model and parser;
 - `.doctrellis.json` schema;
@@ -508,9 +187,9 @@ change:
 - README usage instructions; and
 - tests.
 
-Add or supersede an ADR for changes to module boundaries, process ownership,
-configuration compatibility, toolchain strategy, or publishing policy. Keep
-examples executable; documentation snippets are part of the product contract.
+Add or supersede a DocTrellis ADR when one of those changes affects module
+boundaries, process ownership, configuration compatibility, toolchain strategy,
+or publishing policy.
 
 Do not edit or commit generated directories and packages such as `target/`,
 `.bloop/`, `node_modules/`, `dist/`, or `*.vsix`.
@@ -550,37 +229,20 @@ npm run vsix
 npm run vsix:list
 ```
 
-Commits should be focused, use an English imperative subject, and include a
-body that explains material architectural or behavioral changes. Commit only
-from a state in which the relevant tests pass.
+## Project review checklist
 
-## Review checklist
+Complete the base guide's review checklist, then confirm that:
 
-Before requesting review, confirm that:
+- the module-to-role mapping and inward dependency direction remain intact;
+- Scala.js, Node, VS Code, and mutable lifecycle code stay in the extension
+  boundary;
+- the Scala model, schema, manifest, examples, and documentation agree;
+- sbt plugin behavior visible to consuming builds has scripted coverage; and
+- Scalafmt, Scalafix, compiler warnings, WartRemover, tests, and relevant
+  packaging checks pass.
 
-- raw input is parsed once into a type that represents its guarantees, and
-  inner functions do not reintroduce the uncertainty eliminated by parsing;
-- dependencies still point inward;
-- new capabilities are no broader than the use case needs;
-- acquisition, cancellation, failure, and release paths are all explicit;
-- platform-specific and mutable code stays at the outer boundary;
-- significant indentation is used wherever it improves clarity;
-- public contracts, schema, examples, and documentation agree;
-- regression and lifecycle tests cover the meaningful failure modes; and
-- formatting, compiler warnings, WartRemover, tests, and relevant packaging
-  checks pass.
+## Project-specific references
 
-## References
-
-- [Strategic Scala Style: Principle of Least Power](https://www.lihaoyi.com/post/StrategicScalaStylePrincipleofLeastPower.html)
-- [Parse, don't validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)
-- [Iron: refined types for Scala](https://github.com/Iltotore/iron)
-- [Cats Effect documentation](https://typelevel.org/cats-effect/docs/getting-started)
-- [MUnit Cats Effect](https://github.com/typelevel/munit-cats-effect)
-- [Hedgehog for Scala](https://hedgehogqa.github.io/scala-hedgehog/)
-- [Hedgehog integration with MUnit](https://hedgehogqa.github.io/scala-hedgehog/docs/integration-munit/)
 - [sbt-tpolecat](https://github.com/typelevel/sbt-tpolecat)
-- [스칼라에서 속성 기반 테스트로 블록체인 개발하기](https://github.com/sungkmi/liftio-2022-slides/blob/main/liftio-2022-slides.md)
 - [Scalafix `OrganizeImports`](https://scalacenter.github.io/scalafix/docs/rules/OrganizeImports.html)
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
-- [sigilaris/sigilaris](https://github.com/sigilaris/sigilaris)
