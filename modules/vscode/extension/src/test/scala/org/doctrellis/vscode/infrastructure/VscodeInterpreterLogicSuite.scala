@@ -3,11 +3,25 @@ package org.doctrellis.vscode.infrastructure
 import scala.concurrent.duration.*
 import scala.scalajs.js
 
-import munit.FunSuite
+import cats.effect.{Deferred, IO}
+
+import munit.CatsEffectSuite
 
 import org.doctrellis.vscode.domain.*
 
-class VscodeInterpreterLogicSuite extends FunSuite:
+class VscodeInterpreterLogicSuite extends CatsEffectSuite:
+  test("cancels owned background tasks when their resource closes"):
+    for
+      started  <- Deferred[IO, Unit]
+      canceled <- Deferred[IO, Unit]
+      _        <- BackgroundTasks.resource.use: tasks =>
+        tasks.submit(
+          (started.complete(()) *> IO.never[Unit])
+            .onCancel(canceled.complete(()).void),
+        ) *> started.get
+      _ <- canceled.get.timeout(1.second)
+    yield ()
+
   test("multi-root selection keeps labels and workspaces independent"):
     val first  = workspace("/work/first", "file:///work/first")
     val second = workspace("/work/second", "file:///work/second")

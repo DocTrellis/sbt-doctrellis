@@ -4,7 +4,7 @@ import scala.scalajs.js
 import scala.scalajs.js.JSConverters.*
 
 import cats.effect.{IO, Resource}
-import cats.effect.std.Dispatcher
+import cats.effect.std.{Dispatcher, Supervisor}
 import cats.syntax.all.*
 
 import org.doctrellis.vscode.application.PreviewService
@@ -13,15 +13,18 @@ import org.doctrellis.vscode.infrastructure.facade.*
 
 private[infrastructure] final class VscodeOutput private (
     channel: OutputChannel,
+    backgroundTasks: BackgroundTasks,
 ):
   def append(value: String): IO[Unit] = IO.delay(channel.append(value))
 
   def info(message: String): IO[Unit] =
     append(s"$message\n") *>
-      IO.fromPromise(IO.delay(VSWindow.showInformationMessage(message)))
-        .attempt
-        .start
-        .void
+      backgroundTasks
+        .submit(
+          IO.fromPromise(IO.delay(VSWindow.showInformationMessage(message)))
+            .attempt
+            .void,
+        )
 
   def report(message: String): IO[Unit] =
     append(s"ERROR: $message\n") *>
@@ -34,11 +37,21 @@ private[infrastructure] final class VscodeOutput private (
 
 private[infrastructure] object VscodeOutput:
   def resource: Resource[IO, VscodeOutput] =
-    Resource
-      .make(IO.delay(VSWindow.createOutputChannel("DocTrellis")))(channel =>
-        IO.delay(channel.dispose()),
-      )
-      .map(VscodeOutput(_))
+    for
+      channel <- Resource.make(
+        IO.delay(VSWindow.createOutputChannel("DocTrellis")),
+      )(channel => IO.delay(channel.dispose()))
+      backgroundTasks <- BackgroundTasks.resource
+    yield VscodeOutput(channel, backgroundTasks)
+
+private[infrastructure] final class BackgroundTasks private (
+    supervisor: Supervisor[IO],
+):
+  def submit(task: IO[Unit]): IO[Unit] = supervisor.supervise(task).void
+
+private[infrastructure] object BackgroundTasks:
+  def resource: Resource[IO, BackgroundTasks] =
+    Supervisor[IO](await = false).map(BackgroundTasks(_))
 
 private[infrastructure] object VscodePreferences:
   def load(workspace: Workspace): IO[PreviewPolicy] =

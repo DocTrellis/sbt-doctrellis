@@ -216,7 +216,7 @@ private[sbtplugin] object PreviewControlMetadata:
                   "metadata TCP host is not loopback",
                 )
                 _ <- check(
-                  port >= 0 && port <= 65535,
+                  port > 0 && port <= 65535,
                   "metadata TCP port is invalid",
                 )
               yield PreviewControlTransport.Tcp(host, port)

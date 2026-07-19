@@ -207,6 +207,21 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         clues(address.toVector.map(_.toInt)),
       )
 
+  test("metadata parsing accepts only connectable TCP ports"):
+    def metadata(port: Int): String =
+      PreviewControlMetadata(
+        transport = PreviewControlTransport.Tcp("127.0.0.1", port),
+        pid = ProcessHandle.current().pid(),
+        sessionId = "metadata-session",
+        launchId = "metadata-launch",
+        token = "0" * 64,
+      ).json
+
+    assert(PreviewControlMetadata.parse(metadata(1)).isRight)
+    assert(PreviewControlMetadata.parse(metadata(65535)).isRight)
+    assert(PreviewControlMetadata.parse(metadata(0)).isLeft)
+    assert(PreviewControlMetadata.parse(metadata(65536)).isLeft)
+
   test("an endpoint lease serializes simultaneous stale cleanup"):
     val runtime      = shortTempDirectory("dtc-race-")
     val hash         = "3123456789abcdef01234567"

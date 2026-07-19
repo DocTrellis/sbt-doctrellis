@@ -121,7 +121,10 @@ object DocTrellisPlugin extends AutoPlugin:
           .unsafeRunSync()
       catch
         case NonFatal(error) =>
-          sys.error(s"DocTrellis Laika rendering failed: ${error.getMessage}")
+          throw IllegalStateException(
+            s"DocTrellis Laika rendering failed: ${error.getMessage}",
+            error,
+          )
 
       log.info(
         s"DocTrellis: Laika rendered ${rendered.allDocuments.map(_.path).mkString(", ")}",
@@ -160,12 +163,14 @@ object DocTrellisPlugin extends AutoPlugin:
         )
       catch
         case error: BindException =>
-          sys.error(
+          throw IllegalStateException(
             s"DocTrellis preview could not bind to $host:$port; the port may already be in use: ${error.getMessage}",
+            error,
           )
         case error: IOException =>
-          sys.error(
+          throw IllegalStateException(
             s"DocTrellis preview server failed at http://$host:$port: ${error.getMessage}",
+            error,
           )
     },
   )
