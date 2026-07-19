@@ -30,9 +30,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      ports = healthyPorts(launches, releases)
+      algebra = healthyAlgebra(launches, releases)
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *> service.start(workspace) *> launches.get
             .map(assertEquals(_, 1))
@@ -43,9 +43,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      ports = healthyPorts(launches, releases)
+      algebra = healthyAlgebra(launches, releases)
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           List.fill(8)(service.start(workspace)).parSequence_ *> launches.get
             .map(assertEquals(_, 1))
@@ -63,7 +63,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       firstEntered  <- Deferred[IO, Unit]
       continueFirst <- Deferred[IO, Unit]
       secondEntered <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (current, _) =>
@@ -81,7 +81,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             first  <- service.start(workspace).start
@@ -98,7 +98,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("stop all cancels and waits for an in-flight launch"):
     for
       launchEntered <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -113,7 +113,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).attempt.start
@@ -129,7 +129,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launchEntered <- Deferred[IO, Unit]
       states        <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -144,7 +144,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).attempt.start
@@ -165,7 +165,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       launchEntered   <- Deferred[IO, Unit]
       continueAcquire <- Deferred[IO, Unit]
       released        <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -182,7 +182,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).attempt.start
@@ -202,7 +202,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("cancelling a registered launch does not strand shutdown"):
     for
       loadEntered <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => loadEntered.complete(()).void *> IO.never,
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
@@ -214,7 +214,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).start
@@ -225,8 +225,8 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield ()
 
   test("reports an exit that happens before readiness"):
-    val exit  = ProcessExit(Some(1), None, None)
-    val ports = PreviewPorts[IO](
+    val exit    = ProcessExit(Some(1), None, None)
+    val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(command),
       policy = _ => IO.pure(policy),
       launch = (_, _) => Resource.pure(RunningProcess(IO.pure(exit))),
@@ -238,7 +238,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       error = _ => IO.unit,
     )
     PreviewService
-      .resource(ports)
+      .resource(algebra)
       .use: service =>
         service
           .start(workspace)
@@ -252,9 +252,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      ports = healthyPorts(launches, releases)
+      algebra = healthyAlgebra(launches, releases)
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *> service.stop(workspace)
       released <- releases.get
@@ -264,9 +264,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      ports = healthyPorts(launches, releases)
+      algebra = healthyAlgebra(launches, releases)
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *>
             service.stop(workspace) *>
@@ -279,7 +279,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       closeEntered  <- Deferred[IO, Unit]
       continueClose <- Deferred[IO, Unit]
       releases      <- Ref.of[IO, Int](0)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -296,7 +296,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       count <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _      <- service.start(workspace)
@@ -315,7 +315,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -336,7 +336,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _         <- service.start(workspace)
@@ -357,7 +357,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       closeEntered  <- Deferred[IO, Unit]
       continueClose <- Deferred[IO, Unit]
       ordering      <- Ref.of[IO, Vector[String]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -382,7 +382,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _       <- service.start(workspace)
@@ -406,7 +406,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       replacementSeen  <- Deferred[IO, Unit]
       replacementReady <- Deferred[IO, Unit]
       states           <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -438,7 +438,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _       <- service.start(workspace)
@@ -464,7 +464,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       releases <- Ref.of[IO, Vector[String]](Vector.empty)
       launches <- Ref.of[IO, Map[String, Int]](Map.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (current, _) =>
@@ -486,7 +486,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *>
             service.start(second) *>
@@ -504,10 +504,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
       views    <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(update = (_, state) => views.update(_ :+ state))
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(update = (_, state) => views.update(_ :+ state))
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *> service.stop(workspace)
       states <- views.get
@@ -519,7 +519,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       exited <- Deferred[IO, ProcessExit]
       shown  <- Deferred[IO, Unit]
       views  <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(exited.get)),
@@ -535,7 +535,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *>
             exited.complete(exit) *>
@@ -552,7 +552,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       reportEntered  <- Deferred[IO, Unit]
       continueReport <- Deferred[IO, Unit]
       shown          <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -572,7 +572,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => reportEntered.complete(()).void *> continueReport.get,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _          <- service.start(workspace)
@@ -600,12 +600,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
       shown <- Ref.of[IO, Vector[(Workspace, PreviewViewState)]](Vector.empty)
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(show =
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(show =
         (current, state) => shown.update(_ :+ (current -> state)),
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *> service.open(workspace)
       actual <- shown.get
@@ -625,15 +625,15 @@ class PreviewServiceSuite extends CatsEffectSuite:
       releases <- Ref.of[IO, Int](0)
       loads    <- Ref.of[IO, Int](0)
       opened   <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(
         load = _ =>
           loads.modify: count =>
             (count + 1) -> (if count == 0 then command else configured),
         openExternal = url => opened.update(_ :+ url),
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *>
             service.openExternal(workspace) *>
@@ -649,14 +649,14 @@ class PreviewServiceSuite extends CatsEffectSuite:
       launches      <- Ref.of[IO, Int](0)
       releases      <- Ref.of[IO, Int](0)
       opened        <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(
         probe =
           _ => probeEntered.complete(()).void *> continueProbe.get.as(true),
         openExternal = url => opened.update(_ :+ url),
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).start
@@ -672,7 +672,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
     for
       launched <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -694,7 +694,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             starting <- service.start(workspace).attempt.start
@@ -737,7 +737,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       releaseEntered  <- Deferred[IO, Unit]
       continueRelease <- Deferred[IO, Unit]
       opened          <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -757,7 +757,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _        <- service.start(workspace)
@@ -785,7 +785,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       releaseEntered  <- Deferred[IO, Unit]
       continueRelease <- Deferred[IO, Unit]
       opened          <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -805,7 +805,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       result <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _        <- service.start(workspace)
@@ -827,7 +827,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       shown  <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
       probes <- Ref.of[IO, Int](0)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
@@ -838,7 +838,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         info = _ => IO.unit,
         error = _ => IO.unit,
       )
-      _      <- PreviewService.resource(ports).use(_.open(workspace))
+      _      <- PreviewService.resource(algebra).use(_.open(workspace))
       count  <- probes.get
       states <- shown.get
     yield
@@ -849,7 +849,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launched <- Deferred[IO, Unit]
       shown    <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -864,7 +864,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             start  <- service.start(workspace).attempt.start
@@ -884,7 +884,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueClose <- Deferred[IO, Unit]
       exited        <- Deferred[IO, ProcessExit]
       shown         <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -901,7 +901,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _    <- service.start(workspace)
@@ -922,8 +922,8 @@ class PreviewServiceSuite extends CatsEffectSuite:
       states       <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
       launches     <- Ref.of[IO, Int](0)
       releases     <- Ref.of[IO, Int](0)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(
         show = (_, state) =>
           state match
             case PreviewViewState.Ready(_) =>
@@ -935,7 +935,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         update = (_, state) => states.update(_ :+ state),
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _    <- service.start(workspace)
@@ -958,7 +958,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueUpdate <- Deferred[IO, Unit]
       readyUpdates   <- Ref.of[IO, Int](0)
       states         <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -988,7 +988,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             start <- service.start(workspace).start
@@ -1020,7 +1020,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueShow     <- Deferred[IO, Unit]
       replacementReady <- Deferred[IO, Unit]
       states           <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ =>
           loads.modify: count =>
             (count + 1) -> (if count == 0 then command else replacement),
@@ -1044,7 +1044,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _       <- service.start(workspace)
@@ -1067,12 +1067,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
       shown <- Ref.of[IO, Vector[(Workspace, PreviewViewState)]](Vector.empty)
       launches <- Ref.of[IO, Int](0)
       releases <- Ref.of[IO, Int](0)
-      base  = healthyPorts(launches, releases)
-      ports = base.copy(
+      base    = healthyAlgebra(launches, releases)
+      algebra = base.copy(
         policy = _ => IO.pure(policy.copy(openWhenReady = true)),
         show = (current, state) => shown.update(_ :+ (current -> state)),
       )
-      _      <- PreviewService.resource(ports).use(_.start(workspace))
+      _      <- PreviewService.resource(algebra).use(_.start(workspace))
       actual <- shown.get
     yield assertEquals(
       actual.lastOption,
@@ -1083,7 +1083,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     val failure = IllegalArgumentException("broken config <value>")
     for
       states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.raiseError(failure),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
@@ -1094,7 +1094,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         info = _ => IO.unit,
         error = _ => IO.unit,
       )
-      result <- PreviewService.resource(ports).use(_.start(workspace).attempt)
+      result <- PreviewService.resource(algebra).use(_.start(workspace).attempt)
       actual <- states.get
     yield
       assertEquals(result, Left(failure))
@@ -1108,7 +1108,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       launched <- Deferred[IO, Unit]
       released <- Ref.of[IO, Int](0)
       states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1123,7 +1123,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             start  <- service.start(workspace).attempt.start
@@ -1145,7 +1145,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueInfo <- Deferred[IO, Unit]
       exited       <- Deferred[IO, ProcessExit]
       states       <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy.copy(openWhenReady = true)),
         launch = (_, _) =>
@@ -1160,7 +1160,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             start  <- service.start(workspace).attempt.start
@@ -1185,7 +1185,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueInfo     <- Deferred[IO, Unit]
       replacementReady <- Deferred[IO, Unit]
       states           <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ =>
           loads.modify: count =>
             (count + 1) -> (if count == 0 then command else replacement),
@@ -1209,7 +1209,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             firstStart <- service.start(workspace).attempt.start
@@ -1233,7 +1233,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       failureEntered  <- Deferred[IO, Unit]
       continueFailure <- Deferred[IO, Unit]
       states          <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
@@ -1251,7 +1251,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             start <- service.start(workspace).attempt.start
@@ -1271,7 +1271,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       exitViewEntered <- Deferred[IO, Unit]
       continueExit    <- Deferred[IO, Unit]
       states          <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(exited.get)),
@@ -1289,7 +1289,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _    <- service.start(workspace)
@@ -1311,7 +1311,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       continueExit    <- Deferred[IO, Unit]
       ordering        <- Ref.of[IO, Vector[String]](Vector.empty)
       states          <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1340,7 +1340,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actualStates <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _       <- service.start(workspace)
@@ -1365,7 +1365,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       failExit <- Deferred[IO, Unit]
       states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1380,7 +1380,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *> service.stop(workspace)
       actual <- states.get
@@ -1392,7 +1392,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("propagates an await-exit failure during startup"):
     val failure = IllegalStateException("child process observation failed")
-    val ports   = PreviewPorts[IO](
+    val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(command),
       policy = _ => IO.pure(policy),
       launch = (_, _) => Resource.pure(RunningProcess(IO.raiseError(failure))),
@@ -1404,7 +1404,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       error = _ => IO.unit,
     )
     PreviewService
-      .resource(ports)
+      .resource(algebra)
       .use(_.start(workspace).attempt)
       .map(assertEquals(_, Left(failure)))
 
@@ -1425,7 +1425,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       closeEntered   <- Deferred[IO, Unit]
       continueClose  <- Deferred[IO, Unit]
       secondLaunched <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = current =>
           IO.pure(if current.key == workspace.key then command
           else secondCommand),
@@ -1450,7 +1450,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             firstStart  <- service.start(workspace).attempt.start
@@ -1472,7 +1472,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     )
     for
       releases <- Ref.of[IO, Int](0)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (current, _) =>
@@ -1490,7 +1490,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.start(workspace) *>
             service.start(second) *>
@@ -1509,7 +1509,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       firstEntered  <- Deferred[IO, Unit]
       secondEntered <- Deferred[IO, Unit]
       continueClose <- Deferred[IO, Unit]
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
         launch = (current, _) =>
@@ -1526,7 +1526,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           for
             _        <- service.start(workspace)
@@ -1546,7 +1546,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       probes <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
       states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
       opened <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1564,7 +1564,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actualStates <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use(service =>
           service.start(workspace) *>
             service.open(workspace) *>
@@ -1585,7 +1585,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
     for
       releases <- Ref.of[IO, Int](0)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1599,7 +1599,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         info = _ => IO.unit,
         error = _ => IO.unit,
       )
-      result   <- PreviewService.resource(ports).use(_.start(workspace).attempt)
+      result <- PreviewService.resource(algebra).use(_.start(workspace).attempt)
       released <- releases.get
     yield
       result match
@@ -1612,7 +1612,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("dynamic startup reports process exit before ready announcement"):
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
     val exit    = ProcessExit(code = Some(2), signal = None, error = None)
-    val ports   = PreviewPorts[IO](
+    val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(dynamic),
       policy = _ => IO.pure(policy),
       launch = (_, _) =>
@@ -1630,7 +1630,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       error = _ => IO.unit,
     )
     PreviewService
-      .resource(ports)
+      .resource(algebra)
       .use(_.start(workspace).attempt)
       .map: result =>
         assert(result.swap.exists:
@@ -1643,7 +1643,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
     val announced = right(PreviewUrl.parse("http://127.0.0.1:53112"))
     val exit      = ProcessExit(code = Some(3), signal = None, error = None)
-    val ports     = PreviewPorts[IO](
+    val algebra   = PreviewAlgebra[IO](
       load = _ => IO.pure(dynamic),
       policy = _ => IO.pure(policy),
       launch = (_, _) =>
@@ -1661,7 +1661,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       error = _ => IO.unit,
     )
     PreviewService
-      .resource(ports)
+      .resource(algebra)
       .use(_.start(workspace).attempt)
       .map: result =>
         assert(result.swap.exists:
@@ -1674,7 +1674,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       endpoint = PreviewEndpoint.Announced,
       startupTimeout = timeout,
     )
-    val ports = PreviewPorts[IO](
+    val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(dynamic),
       policy = _ => IO.pure(policy),
       launch = (_, _) =>
@@ -1692,7 +1692,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       error = _ => IO.unit,
     )
     PreviewService
-      .resource(ports)
+      .resource(algebra)
       .use(_.start(workspace).attempt)
       .map: result =>
         assert(result.swap.exists:
@@ -1706,7 +1706,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       launches <- Ref.of[IO, Int](0)
       states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) =>
@@ -1726,7 +1726,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       actual <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use(service =>
           service.start(workspace) *> service.restart(workspace) *> states.get,
         )
@@ -1746,7 +1746,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     val secondUrl = right(PreviewUrl.parse("http://127.0.0.1:53116"))
     for
       states <- Ref.of[IO, Vector[(Workspace, PreviewViewState)]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (current, _) =>
@@ -1766,7 +1766,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       _ <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           (
             service.start(workspace),
@@ -1786,7 +1786,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     for
       states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
       messages <- Ref.of[IO, Vector[String]](Vector.empty)
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
         launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
@@ -1798,7 +1798,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         error = _ => IO.unit,
       )
       external <- PreviewService
-        .resource(ports)
+        .resource(algebra)
         .use: service =>
           service.open(workspace) *> service.openExternal(workspace).attempt
       actualStates   <- states.get
@@ -1813,11 +1813,11 @@ class PreviewServiceSuite extends CatsEffectSuite:
           assertEquals(actual, workspace.name)
         case other => fail(s"expected DynamicPreviewNotStarted, got $other")
 
-  private def healthyPorts(
+  private def healthyAlgebra(
       launches: Ref[IO, Int],
       releases: Ref[IO, Int],
-  ): PreviewPorts[IO] =
-    PreviewPorts[IO](
+  ): PreviewAlgebra[IO] =
+    PreviewAlgebra[IO](
       load = _ => IO.pure(command),
       policy = _ => IO.pure(policy),
       launch = (_, _) =>

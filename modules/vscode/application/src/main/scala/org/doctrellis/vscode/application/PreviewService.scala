@@ -38,7 +38,7 @@ private[application] enum RunningReadiness[F[_]]:
   case ConfiguredEndpoint()
   case Announced(awaitUrl: F[PreviewUrl])
 
-final case class PreviewPorts[F[_]](
+final case class PreviewAlgebra[F[_]](
     load: Workspace => F[PreviewCommand],
     policy: Workspace => F[PreviewPolicy],
     launch: (Workspace, PreviewCommand) => Resource[F, RunningProcess[F]],
@@ -92,7 +92,7 @@ private final case class PreviewServiceClosed()
     extends IllegalStateException("The preview service is shutting down.")
 
 final class PreviewService[F[_]] private (
-    ports: PreviewPorts[F],
+    algebra: PreviewAlgebra[F],
     sessions: Ref[F, Map[String, PreviewSession[F]]],
     workspaceMutexes: WorkspaceMutexes[F],
     lifecycle: Mutex[F],
@@ -125,7 +125,7 @@ final class PreviewService[F[_]] private (
           case StopLookup.ActivityObserved() =>
             updateView(workspace, PreviewViewState.Stopped)
           case StopLookup.Inactive() if reportMissing =>
-            ports.info(
+            algebra.info(
               s"No DocTrellis preview is running for ${workspace.name}.",
             )
           case StopLookup.Inactive() => F.unit
@@ -141,12 +141,12 @@ final class PreviewService[F[_]] private (
             showView(workspace, session.view(initial)) *>
               convergeOpen(workspace, session, initial)
         case None =>
-          ports
+          algebra
             .load(workspace)
             .flatMap: command =>
               command.endpoint match
                 case PreviewEndpoint.Fixed(url) =>
-                  ports
+                  algebra
                     .probe(url)
                     .flatMap: ready =>
                       val state =
@@ -158,30 +158,30 @@ final class PreviewService[F[_]] private (
                   showView(
                     workspace,
                     PreviewViewState.Failed(failure.getMessage),
-                  ) *> ports.info(failure.getMessage)
+                  ) *> algebra.info(failure.getMessage)
 
   def openExternal(workspace: Workspace): F[Unit] =
     sessions.get.flatMap:
       _.get(workspace.key) match
         case Some(session) =>
           session.status.get.flatMap:
-            case PreviewStatus.Ready(url) => ports.openExternal(url)
+            case PreviewStatus.Ready(url) => algebra.openExternal(url)
             case PreviewStatus.Starting   =>
               session.readiness match
-                case PreviewReadiness.Fixed(url)   => ports.openExternal(url)
+                case PreviewReadiness.Fixed(url)   => algebra.openExternal(url)
                 case PreviewReadiness.Announced(_) =>
                   F.raiseError(DynamicPreviewStarting(workspace.name))
             case PreviewStatus.Stopping | PreviewStatus.Terminal(_) =>
               session.readiness match
-                case PreviewReadiness.Fixed(url)   => ports.openExternal(url)
+                case PreviewReadiness.Fixed(url)   => algebra.openExternal(url)
                 case PreviewReadiness.Announced(_) =>
                   F.raiseError(DynamicPreviewNotStarted(workspace.name))
         case None =>
-          ports
+          algebra
             .load(workspace)
             .flatMap:
               _.endpoint match
-                case PreviewEndpoint.Fixed(url) => ports.openExternal(url)
+                case PreviewEndpoint.Fixed(url) => algebra.openExternal(url)
                 case PreviewEndpoint.Announced  =>
                   F.raiseError(DynamicPreviewNotStarted(workspace.name))
 
@@ -215,7 +215,7 @@ final class PreviewService[F[_]] private (
               case Some(session) =>
                 session.status.get.flatMap:
                   case PreviewStatus.Starting | PreviewStatus.Ready(_) =>
-                    ports
+                    algebra
                       .info(
                         s"DocTrellis preview is already active for ${workspace.name}.",
                       )
@@ -255,8 +255,8 @@ final class PreviewService[F[_]] private (
       val unregister = lifecycle.lock.surround:
         launches.update(_ - pending) *> completed.complete(()).void
       val allocate = for
-        command <- ports.load(workspace)
-        policy  <- ports.policy(workspace)
+        command <- algebra.load(workspace)
+        policy  <- algebra.policy(workspace)
         session <- installSession(workspace, command, policy)
       yield session
       val run = allocate
@@ -322,7 +322,7 @@ final class PreviewService[F[_]] private (
       policy: PreviewPolicy,
   ): F[PreviewSession[F]] =
     F.uncancelable: poll =>
-      poll(ports.launch(workspace, command).allocated).flatMap:
+      poll(algebra.launch(workspace, command).allocated).flatMap:
         case (running, release) =>
           val capture = for
             readiness <- PreviewReadiness
@@ -380,7 +380,7 @@ final class PreviewService[F[_]] private (
       .flatMap:
         case ReadyAcceptance.Rejected => F.unit
         case ReadyAcceptance.Accepted =>
-          ports
+          algebra
             .info(s"DocTrellis preview is ready for ${workspace.name}.")
             .attempt
             .void *>
@@ -492,7 +492,7 @@ final class PreviewService[F[_]] private (
 
   private def awaitReady(session: PreviewSession[F]): F[PreviewUrl] =
     def loop(url: PreviewUrl): F[PreviewUrl] =
-      ports
+      algebra
         .probe(url)
         .flatMap:
           case true  => F.pure(url)
@@ -659,13 +659,13 @@ final class PreviewService[F[_]] private (
           case _ => F.unit
 
   private def report(message: String): F[Unit] =
-    ports.error(message).handleError(_ => ())
+    algebra.error(message).handleError(_ => ())
 
   private def showView(
       workspace: Workspace,
       state: PreviewViewState,
   ): F[Unit] =
-    ports
+    algebra
       .show(workspace, state)
       .handleErrorWith(error => report(message(error)))
 
@@ -677,7 +677,7 @@ final class PreviewService[F[_]] private (
       workspace: Workspace,
       state: PreviewViewState,
   ): F[Unit] =
-    ports
+    algebra
       .update(workspace, state)
       .handleErrorWith(error => report(message(error)))
 
@@ -885,7 +885,7 @@ private object WorkspaceMutexes:
 
 object PreviewService:
   def resource[F[_]](
-      ports: PreviewPorts[F],
+      algebra: PreviewAlgebra[F],
   )(using F: Temporal[F]): Resource[F, PreviewService[F]] =
     Supervisor[F](await = false).flatMap: supervisor =>
       for
@@ -903,7 +903,7 @@ object PreviewService:
           Ref.of[F, Deferred[F, Unit]](initialLaunchChange),
         )
         service = PreviewService(
-          ports = ports,
+          algebra = algebra,
           sessions = sessions,
           workspaceMutexes = workspaceMutexes,
           lifecycle = lifecycle,

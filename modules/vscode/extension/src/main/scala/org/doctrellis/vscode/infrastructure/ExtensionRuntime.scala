@@ -3,7 +3,7 @@ package org.doctrellis.vscode.infrastructure
 import cats.effect.{IO, Resource}
 import cats.effect.std.Dispatcher
 
-import org.doctrellis.vscode.application.{PreviewPorts, PreviewService}
+import org.doctrellis.vscode.application.{PreviewAlgebra, PreviewService}
 import org.doctrellis.vscode.infrastructure.facade.ExtensionContext
 
 private[vscode] object ExtensionRuntime:
@@ -14,7 +14,7 @@ private[vscode] object ExtensionRuntime:
       panels     <- PreviewPanelRegistry.resource(
         VscodePreviewPanelBackend(dispatcher),
       )
-      ports = PreviewPorts[IO](
+      algebra = PreviewAlgebra[IO](
         load = NodeConfig.load,
         policy = VscodePreferences.load,
         launch = WorkspacePreview.launch(dispatcher, output.append),
@@ -25,7 +25,7 @@ private[vscode] object ExtensionRuntime:
         info = output.info,
         error = output.report,
       )
-      service <- PreviewService.resource(ports)
+      service <- PreviewService.resource(algebra)
       _       <- CommandBindings.resource(context, dispatcher, service, output)
       _       <- Resource.eval(
         output.append(
