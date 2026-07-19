@@ -1,12 +1,14 @@
 import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle}
+import org.typelevel.sbt.tpolecat.CiMode
 import sbt.AutoPlugin
 
 val hedgehogVersion = "0.13.1"
 
-ThisBuild / organization      := "org.doctrellis"
-ThisBuild / version           := "0.1.0-SNAPSHOT"
-ThisBuild / homepage          := Some(uri("https://doctrellis.org"))
-ThisBuild / semanticdbEnabled := true
+ThisBuild / organization               := "org.doctrellis"
+ThisBuild / version                    := "0.1.0-SNAPSHOT"
+ThisBuild / homepage                   := Some(uri("https://doctrellis.org"))
+ThisBuild / semanticdbEnabled          := true
+ThisBuild / tpolecatDefaultOptionsMode := CiMode
 
 private def selfHostedDocTrellisPlugin: Seq[AutoPlugin] =
   if (sys.props.get("doctrellis.selfHost").contains("true")) {
