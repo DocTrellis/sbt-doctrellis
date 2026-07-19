@@ -286,7 +286,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             sessionId = "symlink-session",
             token = "1" * 64,
           ),
-        )
+        ): Unit
         intercept[IllegalStateException](
           PreviewControlEndpoint.prepare(
             config = PreviewControlConfig(
@@ -299,7 +299,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             sessionId = "owner-session",
             token = "1" * 64,
           ),
-        )
+        ): Unit
       finally deleteTree(parent)
 
   test("malformed ownership metadata is protected instead of unlinked"):
@@ -319,7 +319,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           sessionId = "new-session",
           token = "1" * 64,
         ),
-      )
+      ): Unit
       assertEquals(Files.readString(metadataPath), "not-json")
     finally deleteTree(runtime)
     assertEquals(
@@ -400,7 +400,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             onStop = () => (),
             log = LogExchange.logger("preview-control-conflict-test"),
           ),
-        )
+        ): Unit
         assertEquals(
           right(
             PreviewControlMetadata.parse(Files.readString(metadataPath)),
@@ -525,7 +525,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
 
   private def write(channel: SocketChannel, value: String): Unit =
     val bytes = ByteBuffer.wrap(value.getBytes(StandardCharsets.UTF_8))
-    while bytes.hasRemaining do channel.write(bytes)
+    while bytes.hasRemaining do channel.write(bytes): Unit
 
   private def read(channel: SocketChannel): String =
     val result = StringBuilder()
@@ -552,7 +552,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       .statusCode()
 
   private def assertHttpStopped(url: String): Unit =
-    intercept[java.io.IOException](status(url))
+    intercept[java.io.IOException](status(url)): Unit
 
   private def assertPortReusable(port: Int): Unit =
     Using.resource(new ServerSocket()): socket =>
