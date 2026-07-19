@@ -1,9 +1,10 @@
 import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle}
 import sbt.AutoPlugin
 
-ThisBuild / organization := "org.doctrellis"
-ThisBuild / version      := "0.1.0-SNAPSHOT"
-ThisBuild / homepage     := Some(uri("https://doctrellis.org"))
+ThisBuild / organization      := "org.doctrellis"
+ThisBuild / version           := "0.1.0-SNAPSHOT"
+ThisBuild / homepage          := Some(uri("https://doctrellis.org"))
+ThisBuild / semanticdbEnabled := true
 
 private def selfHostedDocTrellisPlugin: Seq[AutoPlugin] =
   if (sys.props.get("doctrellis.selfHost").contains("true")) {

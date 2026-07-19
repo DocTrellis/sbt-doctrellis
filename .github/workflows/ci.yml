@@ -33,8 +33,10 @@ jobs:
           cache: npm
           cache-dependency-path: modules/vscode/package-lock.json
 
-      - name: Check formatting
-        run: sbt --batch 'scalafmtCheckAll; scalafmtSbtCheck'
+      - name: Check formatting and imports
+        run: |
+          sbt --batch 'scalafixAll; scalafmtAll; scalafmtSbt'
+          git diff --exit-code
 
       - name: Run Scala unit tests
         run: sbt --batch testFull
