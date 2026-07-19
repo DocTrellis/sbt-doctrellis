@@ -355,26 +355,50 @@ private[infrastructure] final class NdjsonFrameDecoder(maxFrameBytes: Int):
   private var pending = ""
 
   def offer(chunk: String): Either[String, Vector[String]] =
-    pending = pending + chunk
-    val pieces = pending.split("\n", -1).toVector
-    pending = pieces.lastOption.getOrElse("")
-    val complete = pieces
-      .dropRight(1)
-      .map: raw =>
-        if raw.endsWith("\r") then raw.dropRight(1) else raw
-    if complete.exists(_.isEmpty) then Left("IPC frame must not be empty")
-    else if complete.exists(utf8Bytes(_) > maxFrameBytes) then
-      Left(s"IPC frame exceeds $maxFrameBytes bytes")
-    else if
-      val pendingBytes = utf8Bytes(pending)
-      pendingBytes > maxFrameBytes && !(
-        pendingBytes == maxFrameBytes + 1 && pending.endsWith("\r")
-      )
-    then Left(s"IPC frame exceeds $maxFrameBytes bytes")
-    else Right(complete)
+    val complete   = Vector.newBuilder[String]
+    var frameStart = 0
+    var problem    = Option.empty[String]
+    var newline    = chunk.indexOf('\n', frameStart)
+    while newline >= 0 && problem.isEmpty do
+      appendBounded(chunk, frameStart, newline) match
+        case Left(error) => problem = Some(error)
+        case Right(raw)  =>
+          pending = ""
+          val frame = if raw.endsWith("\r") then raw.dropRight(1) else raw
+          if frame.isEmpty then problem = Some("IPC frame must not be empty")
+          else complete += frame
+      frameStart = newline + 1
+      newline = chunk.indexOf('\n', frameStart)
+
+    if problem.isEmpty then
+      appendBounded(chunk, frameStart, chunk.length) match
+        case Left(error)      => problem = Some(error)
+        case Right(remainder) => pending = remainder
+
+    problem.toLeft(complete.result())
 
   private def utf8Bytes(value: String): Int =
     NodeBuffer.Buffer.byteLength(value, "utf8")
+
+  private def appendBounded(
+      chunk: String,
+      start: Int,
+      end: Int,
+  ): Either[String, String] =
+    val combinedCharacters = pending.length + end - start
+    if combinedCharacters > maxFrameBytes + 1 then frameTooLarge
+    else
+      val candidate      = pending + chunk.substring(start, end)
+      val candidateBytes = utf8Bytes(candidate)
+      Either.cond(
+        candidateBytes <= maxFrameBytes || candidateBytes == maxFrameBytes + 1 &&
+          candidate.endsWith("\r"),
+        candidate,
+        s"IPC frame exceeds $maxFrameBytes bytes",
+      )
+
+  private def frameTooLarge: Left[String, Nothing] =
+    Left(s"IPC frame exceeds $maxFrameBytes bytes")
 
 private[infrastructure] enum WorkspaceChannelMessage:
   case Ready(url: PreviewUrl)

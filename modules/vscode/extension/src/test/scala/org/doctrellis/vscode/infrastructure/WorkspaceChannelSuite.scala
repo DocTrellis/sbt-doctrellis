@@ -33,14 +33,36 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
   test("NDJSON framing accepts an exact maximum CRLF frame across chunks"):
     val payload = "x" * WorkspaceChannel.MaxFrameBytes
     val decoder = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
-    assertEquals(decoder.offer(payload + "\r"), Right(Vector.empty))
+    assertEquals(decoder.offer(payload), Right(Vector.empty))
+    assertEquals(decoder.offer("\r"), Right(Vector.empty))
     assertEquals(decoder.offer("\n"), Right(Vector(payload)))
+
+  test("NDJSON framing handles many short frames in one chunk"):
+    val count   = 4096
+    val decoder = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+
+    assertEquals(
+      decoder.offer(Vector.fill(count)("x").mkString("", "\n", "\n")),
+      Right(Vector.fill(count)("x")),
+    )
 
   test("NDJSON framing rejects empty and oversized frames"):
     val empty = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
     assert(empty.offer("\n").isLeft)
     val oversized = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
     assert(oversized.offer("x" * (WorkspaceChannel.MaxFrameBytes + 1)).isLeft)
+
+  test("NDJSON framing rejects an incrementally oversized pending frame"):
+    val decoder = NdjsonFrameDecoder(4)
+    assertEquals(decoder.offer("éé"), Right(Vector.empty))
+    assertEquals(decoder.offer("x"), Left("IPC frame exceeds 4 bytes"))
+
+    val afterCarriageReturn = NdjsonFrameDecoder(4)
+    assertEquals(afterCarriageReturn.offer("xxxx\r"), Right(Vector.empty))
+    assertEquals(
+      afterCarriageReturn.offer("x"),
+      Left("IPC frame exceeds 4 bytes"),
+    )
 
   test("server protocol rejects malformed, unknown, and conflicting identity"):
     val valid = WorkspaceChannelProtocol.decodeServer(

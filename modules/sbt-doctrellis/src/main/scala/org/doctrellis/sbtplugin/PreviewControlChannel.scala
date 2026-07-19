@@ -22,6 +22,7 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{
   Files,
+  InvalidPathException,
   LinkOption,
   Path,
   StandardCopyOption,
@@ -204,7 +205,8 @@ private[sbtplugin] object PreviewControlMetadata:
           transport <- kind match
             case "unix" =>
               string(fields, "address")
-                .map(address => PreviewControlTransport.Unix(Path.of(address)))
+                .flatMap(unixAddress)
+                .map(PreviewControlTransport.Unix(_))
             case "tcp" =>
               for
                 host <- string(fields, "host")
@@ -245,6 +247,20 @@ private[sbtplugin] object PreviewControlMetadata:
         value.toInt,
         s"metadata field '$name' is outside the integer range",
       )
+
+  private def unixAddress(value: String): Either[String, Path] =
+    try
+      val path = Path.of(value)
+      Either.cond(
+        value.nonEmpty && path.isAbsolute && path.normalize() == path,
+        path,
+        "metadata field 'address' must be a non-empty absolute normalized path",
+      )
+    catch
+      case error: InvalidPathException =>
+        Left(
+          s"metadata field 'address' is not a valid path: ${error.getReason}",
+        )
 
   private def long(
       fields: Map[String, PreviewControlJson.Atom],
@@ -844,27 +860,31 @@ private[sbtplugin] final class PreviewFrameDecoder(maxFrameBytes: Int):
   private val pending = ByteArrayOutputStream()
 
   def offer(bytes: Array[Byte], count: Int): Either[String, Vector[String]] =
-    val frames = Vector.newBuilder[String]
-    var index  = 0
-    var error  = Option.empty[String]
-    while index < count && error.isEmpty do
-      val byte = bytes(index)
-      if byte == '\n'.toByte then
-        val raw = pending.toByteArray
-        pending.reset()
-        val length = if raw.lastOption.contains('\r'.toByte) then raw.length - 1
-        else raw.length
-        if length == 0 then error = Some("IPC frame must not be empty")
-        else frames += String(raw, 0, length, StandardCharsets.UTF_8)
-      else
-        pending.write(byte.toInt)
-        val pendingBytes                  = pending.size()
-        val allowedTrailingCarriageReturn =
-          pendingBytes == maxFrameBytes + 1 && byte == '\r'.toByte
-        if pendingBytes > maxFrameBytes && !allowedTrailingCarriageReturn then
-          error = Some(s"IPC frame exceeds $maxFrameBytes bytes")
-      index += 1
-    error.toLeft(frames.result())
+    if count < 0 || count > bytes.length then
+      Left(s"IPC byte count $count is outside the input array bounds")
+    else
+      val frames = Vector.newBuilder[String]
+      var index  = 0
+      var error  = Option.empty[String]
+      while index < count && error.isEmpty do
+        val byte = bytes(index)
+        if byte == '\n'.toByte then
+          val raw = pending.toByteArray
+          pending.reset()
+          val length = if raw.lastOption.contains('\r'.toByte) then
+            raw.length - 1
+          else raw.length
+          if length == 0 then error = Some("IPC frame must not be empty")
+          else frames += String(raw, 0, length, StandardCharsets.UTF_8)
+        else
+          pending.write(byte.toInt)
+          val pendingBytes                  = pending.size()
+          val allowedTrailingCarriageReturn =
+            pendingBytes == maxFrameBytes + 1 && byte == '\r'.toByte
+          if pendingBytes > maxFrameBytes && !allowedTrailingCarriageReturn then
+            error = Some(s"IPC frame exceeds $maxFrameBytes bytes")
+        index += 1
+      error.toLeft(frames.result())
 
 private[sbtplugin] enum PreviewControlRequest:
   def token: String

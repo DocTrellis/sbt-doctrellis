@@ -56,6 +56,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         .decodeClient(hello.replace("\"version\":1", "\"version\":2"))
         .isLeft,
     )
+
     assert(
       PreviewControlProtocol
         .decodeClient(hello.replace("\"hello\"", "\"unknown\""))
@@ -68,6 +69,14 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         )
         .isLeft,
     )
+
+  test("NDJSON framing rejects byte counts outside the input array"):
+    val decoder = PreviewFrameDecoder(PreviewControlProtocol.MaxFrameBytes)
+    val bytes   = (hello + "\n").getBytes(StandardCharsets.UTF_8)
+
+    assert(decoder.offer(bytes, -1).isLeft)
+    assert(decoder.offer(bytes, bytes.length + 1).isLeft)
+    assertEquals(decoder.offer(bytes, bytes.length), Right(Vector(hello)))
 
   test("stale endpoint policy removes only unreachable dead owners"):
     assertEquals(
@@ -180,6 +189,22 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       )
       prepared.lease.close()
     finally deleteTree(runtime)
+
+  test("metadata parsing rejects invalid Unix paths without throwing"):
+    val absolute = Path
+      .of(System.getProperty("java.io.tmpdir"))
+      .toAbsolutePath
+      .normalize()
+      .resolve("doctrellis-metadata.sock")
+
+    assert(
+      PreviewControlMetadata.parse(unixMetadataJson(absolute.toString)).isRight,
+    )
+    Vector("", "relative.sock", "\u0000").foreach: address =>
+      assert(
+        PreviewControlMetadata.parse(unixMetadataJson(address)).isLeft,
+        clues(address.toVector.map(_.toInt)),
+      )
 
   test("an endpoint lease serializes simultaneous stale cleanup"):
     val runtime      = shortTempDirectory("dtc-race-")
@@ -475,6 +500,20 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         "requestId" -> PreviewControlJson.quoted(requestId),
       ),
     ) + "\n"
+
+  private def unixMetadataJson(address: String): String =
+    PreviewControlJson.objectValue(
+      Vector(
+        "version"   -> "1",
+        "protocol"  -> PreviewControlJson.quoted(PreviewControlConfig.Protocol),
+        "pid"       -> ProcessHandle.current().pid().toString,
+        "sessionId" -> PreviewControlJson.quoted("metadata-session"),
+        "launchId"  -> PreviewControlJson.quoted("metadata-launch"),
+        "token"     -> PreviewControlJson.quoted("0" * 64),
+        "transport" -> PreviewControlJson.quoted("unix"),
+        "address"   -> PreviewControlJson.quoted(address),
+      ),
+    )
 
   private def connect(metadata: PreviewControlMetadata): SocketChannel =
     metadata.transport match
