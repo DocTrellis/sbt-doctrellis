@@ -1,7 +1,8 @@
-# ADR 0001: Repository and onion architecture
+# ADR 0001: Repository and functional architecture
 
 - Status: Accepted
 - Date: 2026-07-19
+- Updated: 2026-07-20
 
 ## Context
 
@@ -22,18 +23,23 @@ Use one repository with independently named modules:
 
 - `modules/sbt-doctrellis` is a JVM sbt plugin.
 - `modules/vscode/domain` contains parsed values and platform-independent data.
-- `modules/vscode/application` contains Cats Effect lifecycle orchestration and
-  declares its required operations as ports.
-- `modules/vscode/extension` contains outer adapters for Node and VS Code and
-  the exported extension entry points.
+- `modules/vscode/application` defines the preview algebra in an abstract
+  `F[_]` and composes it into the lifecycle program.
+- `modules/vscode/extension` contains Node and VS Code interpreters, the
+  composition root, and the exported extension entry points.
 
-The dependency direction for the extension is:
+The extension uses a tagless-final style: the algebra describes the smallest
+capabilities required by the program, interpreters implement those capabilities
+using platform APIs, and the composition root selects `IO` and wires the parts
+together. The module dependency direction remains inward:
 
 ```text
-extension adapters -> application -> domain
+extension (interpreters and composition root)
+  -> application (algebra and program)
+  -> domain
 ```
 
-No inner layer imports a Node or VS Code facade. The plugin remains a separate
+No inner module imports a Node or VS Code facade. The plugin remains a separate
 vertical module because sbt tasks and Laika are JVM concerns, not extension
 domain concerns.
 
@@ -43,7 +49,7 @@ prefer immutable values, and keep mutation at the extension entry point where
 VS Code's lifecycle requires it.
 
 Apply “Parse, don't validate” to configuration: convert untyped JSON into
-opaque, constrained domain values once. Application services receive a
+opaque, constrained domain values once. Application programs receive a
 `PreviewCommand` whose executable, working directory, URL, and timeout have
 already been parsed.
 

@@ -29,8 +29,8 @@ VS Code command
 ```text
 modules/sbt-doctrellis/       sbt 2 AutoPlugin and scripted tests
 modules/vscode/domain/       parsed domain values and lifecycle model
-modules/vscode/application/  Cats Effect preview orchestration
-modules/vscode/extension/    Node and VS Code adapters plus Scala.js exports
+modules/vscode/application/  Preview algebra and effect-polymorphic program
+modules/vscode/extension/    Interpreters, composition root, and Scala.js exports
 modules/vscode/schema/       packaged .doctrellis.json schema
 examples/basic/              minimal plugin and extension example
 docs/adr/                    architecture decisions and compatibility record
@@ -38,9 +38,10 @@ docs/adr/                    architecture decisions and compatibility record
 
 The single repository keeps the plugin/config/extension contract testable as
 one change while preserving independent module and package boundaries. The VS
-Code implementation follows an onion architecture: the domain has no platform
-dependencies, the application layer defines effects at its boundary, and the
-outer layer adapts Node and VS Code APIs.
+Code implementation uses a tagless-final style with inward dependencies: the
+domain owns platform-independent values and rules, the application defines an
+algebra and composes it into a program, and the extension supplies Node/VS Code
+interpreters and the composition root.
 
 ## Requirements
 

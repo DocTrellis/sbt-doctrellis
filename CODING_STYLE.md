@@ -46,8 +46,8 @@ Choose the least expressive mechanism that fully represents the requirement:
 - Prefer immutable `val` bindings to mutable state.
 - Prefer a pure function to an effectful function.
 - Prefer an abstract `F[_]` with the smallest required capability constraint
-  to concrete `IO` in inner layers.
-- Prefer a small record of port functions to a deep trait hierarchy.
+  to concrete `IO` in programs and algebras.
+- Prefer a small record of algebra operations to a deep trait hierarchy.
 - Prefer an opaque type and a smart constructor to a broadly constructible
   wrapper.
 - Prefer an enum or a sealed error hierarchy to strings and booleans that
@@ -83,7 +83,7 @@ Prefer:
 ```scala
 def parse(value: String): Either[ConfigProblem, PreviewUrl]
 
-final case class PreviewPorts[F[_]](
+final case class PreviewAlgebra[F[_]](
     probe: PreviewUrl => F[Boolean],
 )
 ```
@@ -93,7 +93,7 @@ Avoid:
 ```scala
 def isValidUrl(value: String): Boolean
 
-final case class PreviewPorts(
+final case class PreviewAlgebra(
     probe: String => IO[Boolean],
 )
 ```
@@ -108,7 +108,7 @@ Apply these rules consistently:
   effect.
 - Resolve and canonicalize filesystem paths before constructing a
   `WorkingDirectory`.
-- Make application services accept parsed domain values, not `js.Any`, JSON
+- Make application programs accept parsed domain values, not `js.Any`, JSON
   objects, arbitrary strings, or unresolved paths.
 - Prefer `A => B` to `A => Option[B]` or `A => Either[E, B]` when the
   guarantees encoded by `A` make `B` inevitable.
@@ -127,31 +127,71 @@ A multi-stage boundary is acceptable. For example, JSON parsing produces a
 `PreviewTemplate`; filesystem resolution then produces a `PreviewCommand`.
 Each stage must narrow the possible states.
 
-## Onion architecture
+## Functional architecture: algebra, program, and interpreter
 
-Dependencies point inward:
+The VS Code extension uses a tagless-final style while keeping dependencies
+pointed inward. Algebras describe capabilities in an abstract `F[_]`, programs
+compose those capabilities, and interpreters connect them to the platform. The
+outer composition root selects the concrete effect and wires the parts
+together.
 
 ```text
-extension adapters -> application -> domain
+composition root
+  |-> program -> algebra -> domain
+  `-> interpreters
+        |-> algebra
+        |-> domain
+        `-> platform APIs
 ```
 
-The sbt plugin is a separate JVM vertical module because sbt, mdoc, Laika, and
-the preview HTTP server are not VS Code domain concerns.
+This vocabulary describes roles rather than requiring one package, trait, or
+type class per role:
 
-| Layer | Owns | Must not depend on |
-| --- | --- | --- |
-| `modules/vscode/domain` | Parsed values, state, and pure rules | Cats Effect, Node, VS Code, sbt |
-| `modules/vscode/application` | Use cases, lifecycle orchestration, and ports | Node and VS Code facades |
-| `modules/vscode/extension` | Node/VS Code adapters and exported entry points | Inner-layer implementation details |
-| `modules/sbt-doctrellis` | Documentation build and local HTTP preview | VS Code extension modules |
+- **Domain** owns parsed values, state, and deterministic pure rules. It does
+  not mention `F[_]` or platform types.
+- **Algebra** describes the smallest capabilities a program requires in terms
+  of domain inputs and outputs. A small record of functions such as
+  `PreviewAlgebra[F]` is an algebra; do not introduce a trait or type class when
+  a record is sufficient.
+- **Program** implements use cases and lifecycle orchestration using only
+  domain values, algebras, and the weakest effect capabilities it needs. It
+  remains polymorphic in `F[_]` and must not select `IO` for itself.
+- **Interpreter** implements an algebra using Node, VS Code, or another
+  external system. It translates platform values at the boundary so they do
+  not escape into the program or domain.
+- **Composition root** acquires shared resources, selects the concrete effect,
+  constructs interpreters, and supplies them to programs. For the VS Code
+  extension, this is the only role that should normally wire programs to
+  `IO`.
 
-Additional rules:
+In this guide, an *interpreter* is a production or test implementation of an
+algebra; `IO` and `SyncIO` are concrete effect types, not interpreters.
 
-- Inner layers must not import outer-layer packages.
-- Platform types must be translated at the adapter boundary.
-- A port should describe the smallest capability required by a use case.
+The module boundaries realize those roles as follows:
+
+| Module | Architectural role | Owns | Must not depend on |
+| --- | --- | --- | --- |
+| `modules/vscode/domain` | Domain | Parsed values, state, and pure rules | Cats Effect, Node, VS Code, sbt |
+| `modules/vscode/application` | Algebra and program | Capability definitions, use cases, and lifecycle orchestration | Node and VS Code facades |
+| `modules/vscode/extension` | Interpreter and composition root | Node/VS Code implementations, resource wiring, and exported entry points | Private inner-module implementation details |
+| `modules/sbt-doctrellis` | Separate JVM vertical | Documentation build and local HTTP preview | VS Code extension modules |
+
+Apply these dependency rules:
+
+- Programs may depend on algebras and the domain; interpreters may depend on
+  algebras, the domain, and their platform APIs.
+- Inner modules must not import outer-module packages.
+- Algebra operations must accept and return parsed domain values rather than
+  raw platform representations.
+- Keep each algebra no more powerful than the program that consumes it. Split
+  unrelated capabilities when doing so makes ownership or reuse clearer, but
+  do not split a cohesive record merely to create more abstractions.
+- Tests should supply controlled algebra functions or in-memory interpreters;
+  they should not require changes to program logic.
 - Domain code must remain deterministic and independently testable.
-- Cross-cutting changes to this dependency direction require an ADR.
+- The sbt plugin remains a separate JVM vertical because sbt, mdoc, Laika, and
+  the preview HTTP server are not VS Code domain concerns.
+- Cross-cutting changes to these dependency directions require an ADR.
 
 ## Scala 3 syntax and formatting
 
@@ -236,7 +276,8 @@ This policy is enforced by the `OrganizeImports` profile in `.scalafix.conf`.
 - Use sealed exception hierarchies when failures must also be `Throwable`.
 - Use case classes instead of public tuples when fields have domain meaning.
 - Use named arguments when a constructor has several parameters of the same
-  type or multiple function-valued fields, especially when assembling ports.
+  type or multiple function-valued fields, especially when assembling algebra
+  records.
 - Use opaque types for scalar values whose invariants are established during
   parsing and that do not need product structure.
 - When scalar constraints must be reused or composed broadly enough that local
@@ -245,7 +286,7 @@ This policy is enforced by the `OrganizeImports` profile in `.scalafix.conf`.
   isolated invariant that an opaque type can express clearly.
 - Name opaque type constructors `parse` when they consume untrusted input.
 - Expose the underlying scalar with a narrowly scoped extension such as
-  `.value` or `.duration`, primarily for adapters.
+  `.value` or `.duration`, primarily for interpreters.
 - Name effects with verbs such as `start`, `stop`, `load`, `probe`, and
   `render`.
 - Name domain values and states with nouns such as `PreviewCommand` and
@@ -259,18 +300,18 @@ Do not use `null` in Scala code. At JavaScript boundaries, test `null` and
 `undefined` explicitly and translate them immediately into Scala values.
 
 Avoid partial operations, including `Option.get`, `Try.get`, unsafe either
-projections, unchecked casts in inner layers, and non-exhaustive matches.
+projections, unchecked casts in inner modules, and non-exhaustive matches.
 WartRemover enforces part of this rule; review must cover the rest.
 
 ## Cats Effect and effect polymorphism
 
-Application services, ports, and their supporting resources should be
-parameterized by `F[_]`. The outer runtime selects `IO` as the interpreter.
-Keep effects visible in signatures and follow these rules:
+Application programs, their algebras, and supporting resources should be
+parameterized by `F[_]`. The composition root selects `IO` as the concrete
+effect. Keep effects visible in signatures and follow these rules:
 
-- A data-only algebra such as `PreviewPorts[F]` should not impose a type class
-  constraint. Put constraints on the code that interprets or combines its
-  operations.
+- A data-only algebra such as `PreviewAlgebra[F]` should not impose a type class
+  constraint. Put constraints on the programs or interpreter implementations
+  that use or construct it.
 - Use `Functor` or `Monad` for pure effect composition, `MonadThrow` for raised
   errors, and `MonadCancelThrow` for cancellation-aware resource scopes.
 - Add `Sync` only when suspending synchronous side effects, `Temporal` only
@@ -313,18 +354,19 @@ same ownership and cancellation semantics.
 - Keep facades in `modules/vscode/extension/.../facade`.
 - Declare only the JavaScript members that production code calls.
 - Keep `js.Dynamic`, `js.Any`, casts, `null`, and `undefined` inside the
-  infrastructure layer.
+  infrastructure boundary (`org.doctrellis.vscode.infrastructure`).
 - A facade declaration contains no business logic.
 - Keep the `vscode` module external; the VS Code extension host provides it.
 - Export only the required CommonJS entry points.
-- Interpret generic application effects as `IO` at extension assembly, then
-  transfer host callbacks through the owned `Dispatcher[IO]`.
+- Instantiate effect-polymorphic application code with `IO` at extension
+  assembly, then transfer host callbacks through the owned `Dispatcher[IO]`.
 - Restrict mutable lifecycle handles to the extension entry point or a tightly
-  scoped adapter when the host API requires mutation.
+  scoped interpreter when the host API requires mutation.
 - Resolve remote preview URLs through the supported VS Code URI APIs before
   displaying them.
 - Treat workspace configuration as executable authority. Process-starting
-  commands must require Workspace Trust at both manifest and runtime layers.
+  commands must require Workspace Trust at both manifest and runtime
+  boundaries.
 
 Spawn child processes directly with `shell = false`. Keep the executable and
 argument vector separate, log the resolved working directory, and define a
@@ -371,19 +413,19 @@ blocks, and nested structures.
 
 ## Tests
 
-Every behavior change must have a test at the lowest layer that can prove it.
+Every behavior change must have a test at the narrowest scope that can prove it.
 
 - Test opaque parsers with accepted boundary values and representative invalid
   values.
-- Test application services through fake ports; do not load Node or VS Code to
-  test lifecycle decisions.
+- Test application programs with controlled algebra values or in-memory
+  interpreters; do not load Node or VS Code to test lifecycle decisions.
 - Test concurrent start, stop during startup, cancellation, process exit, and
   cleanup failure explicitly.
 - Prefer `Deferred`, controlled probes, and deterministic fakes to arbitrary
   sleeps.
 - Use bounded timeouts only where the real clock or operating system is part of
   the behavior.
-- Test adapters for malformed platform values and resource cleanup.
+- Test interpreters for malformed platform values and resource cleanup.
 - Use scripted tests for behavior visible to an external sbt build.
 - Use temporary directories and ephemeral ports where possible, and release
   them even when assertions fail.
@@ -437,22 +479,22 @@ framework unless a concrete integration constraint requires it.
 - For effectful or concurrent code, generate operation sequences against a
   deterministic model.
 
-### Effect interpreters in example-based tests
+### Concrete effects in example-based tests
 
 Use MUnit for example-based tests. When an example-based test must execute
 effects or manage a `Resource`, prefer MUnit Cats Effect and let the test return
 its effect directly; do not call `unsafeRunSync`.
 
-- Choose the least powerful test interpreter that can exercise the behavior.
-  When an effect-polymorphic implementation requires only synchronous effects,
-  instantiate it with `SyncIO`. This verifies that the implementation and its
-  ports are not accidentally coupled to `IO`.
+- Choose the least powerful concrete test effect that can exercise the
+  behavior. When an effect-polymorphic implementation requires only synchronous
+  effects, instantiate it with `SyncIO`. This verifies that the implementation
+  and its algebra dependencies are not accidentally coupled to `IO`.
 - Use `IO` when the behavior involves concurrency, fibers, cancellation,
   scheduling, time, asynchronous callbacks, or runtime-specific blocking
   semantics. A `SyncIO` test can verify ordinary and failed resource release,
   but it cannot prove cancellation or concurrent lifecycle behavior.
 - Do not repeat the same test with both `SyncIO` and `IO` unless
-  interpreter-specific behavior is part of the contract.
+  concrete-effect-specific behavior is part of the contract.
 
 ## Documentation and contracts
 
