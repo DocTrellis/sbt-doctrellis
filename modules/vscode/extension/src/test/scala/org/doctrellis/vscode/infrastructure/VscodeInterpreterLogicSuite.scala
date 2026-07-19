@@ -7,7 +7,7 @@ import munit.FunSuite
 
 import org.doctrellis.vscode.domain.*
 
-class VscodeAdapterLogicSuite extends FunSuite:
+class VscodeInterpreterLogicSuite extends FunSuite:
   test("multi-root selection keeps labels and workspaces independent"):
     val first  = workspace("/work/first", "file:///work/first")
     val second = workspace("/work/second", "file:///work/second")

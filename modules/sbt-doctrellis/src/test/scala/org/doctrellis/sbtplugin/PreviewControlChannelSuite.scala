@@ -248,7 +248,9 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       val results = attempts.map(_.get(5L, TimeUnit.SECONDS))
       val winners = results.collect { case Right(paths) => paths }
       assertEquals(winners.size, 1)
-      val winner   = winners.head
+      val winner = winners match
+        case Seq(only) => only
+        case other     => fail(s"expected one endpoint winner, got $other")
       val metadata = right(
         PreviewControlMetadata.parse(Files.readString(metadataPath)),
       )
@@ -572,10 +574,10 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         paths.iterator().asScala.toVector.reverse.foreach(Files.deleteIfExists)
 
   private def runtimeOwner(path: Path): Long =
-    Files
-      .getAttribute(path, "unix:uid")
-      .asInstanceOf[Number]
-      .longValue()
+    Files.getAttribute(path, "unix:uid") match
+      case number: Number => number.longValue()
+      case other          =>
+        fail(s"expected unix:uid to be numeric, got ${String.valueOf(other)}")
 
   private def shortTempDirectory(prefix: String): Path =
     if isWindows then Files.createTempDirectory(prefix)

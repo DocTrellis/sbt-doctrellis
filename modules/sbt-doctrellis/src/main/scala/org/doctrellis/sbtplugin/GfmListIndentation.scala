@@ -114,7 +114,8 @@ private[sbtplugin] object GfmListIndentation:
               if containingItem(originalIndent).nonEmpty then
                 editContinuation(line, index)
               else endList()
-              fence = Some(Fence(marker.head, marker.length))
+              val markerCharacter = if marker.startsWith("`") then '`' else '~'
+              fence = Some(Fence(markerCharacter, marker.length))
 
             case _ if line.content.trim.isEmpty => ()
             case _                              =>

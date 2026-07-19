@@ -17,6 +17,12 @@ class WebviewPreviewSuite extends CatsEffectSuite:
   private val second =
     Workspace("second", "Second docs", "/second", "file:///second")
 
+  private def at[A](values: scala.collection.Seq[A], index: Int): A =
+    values
+      .lift(index)
+      .getOrElse:
+        fail(s"expected element $index in $values")
+
   test("reuses one panel per workspace and updates a restarted URL"):
     val backend = FakeBackend()
     PreviewPanelRegistry
@@ -28,9 +34,9 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           _ <- registry.show(second, PreviewViewState.Ready(url(6262)))
         yield
           assertEquals(backend.created.size, 2)
-          assertEquals(backend.created.head.reveals, 2)
-          assert(backend.created.head.html.contains("forwarded.example:5252"))
-          assert(backend.created(1).html.contains("forwarded.example:6262"))
+          assertEquals(at(backend.created, 0).reveals, 2)
+          assert(at(backend.created, 0).html.contains("forwarded.example:5252"))
+          assert(at(backend.created, 1).html.contains("forwarded.example:6262"))
 
   test("creates a new panel after the existing panel is disposed"):
     val backend = FakeBackend()
@@ -39,11 +45,11 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .use: registry =>
         for
           _ <- registry.show(first, PreviewViewState.Starting)
-          _ <- backend.created.head.disposeFromUser
+          _ <- at(backend.created, 0).disposeFromUser
           _ <- registry.show(first, PreviewViewState.Stopped)
         yield
           assertEquals(backend.created.size, 2)
-          assert(backend.created(1).html.contains("Preview stopped"))
+          assert(at(backend.created, 1).html.contains("Preview stopped"))
 
   test("recreates a synchronously disposed panel before async removal"):
     val backend = FakeBackend()
@@ -52,14 +58,14 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .use: registry =>
         for
           _ <- registry.show(first, PreviewViewState.Starting)
-          old = backend.created.head
+          old = at(backend.created, 0)
           _ <- old.markDisposed
           _ <- registry.show(first, PreviewViewState.Stopped)
           _ <- old.notifyDisposed
           _ <- registry.show(first, PreviewViewState.Starting)
         yield
           assertEquals(backend.created.size, 2)
-          assertEquals(backend.created(1).reveals, 2)
+          assertEquals(at(backend.created, 1).reveals, 2)
 
   test("disposes every registered panel when the registry is released"):
     val backend = FakeBackend()
@@ -68,7 +74,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .use(_.show(first, PreviewViewState.Starting))
       .map: _ =>
         assertEquals(backend.created.size, 1)
-        assert(backend.created.head.disposed)
+        assert(at(backend.created, 0).disposed)
 
   test("uses the externally resolved URI in the iframe"):
     val backend = FakeBackend()
@@ -80,7 +86,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           .map: _ =>
             assertEquals(backend.resolved.toList, List("http://127.0.0.1:4242"))
             assert(
-              backend.created.head.html.contains(
+              at(backend.created, 0).html.contains(
                 "src=\"https://forwarded.example:4242/preview?remote=1&amp;view=full\"",
               ),
             )
@@ -248,12 +254,12 @@ class WebviewPreviewSuite extends CatsEffectSuite:
               .attempt
             _ <- IO.delay(assert(failed.isLeft))
             _ <- IO.delay:
-              assert(backend.created.head.html.contains("Preview failed"))
-              assert(backend.created.head.html.contains("resolution failed"))
+              assert(at(backend.created, 0).html.contains("Preview failed"))
+              assert(at(backend.created, 0).html.contains("resolution failed"))
             _ <- continue.complete(())
             _ <- stale.joinWithNever
           yield assert(
-            backend.created.head.html.contains("resolution failed"),
+            at(backend.created, 0).html.contains("resolution failed"),
           )
     yield ()
 
@@ -295,8 +301,8 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             _ <- continue.complete(())
             _ <- open.joinWithNever
           yield
-            assertEquals(backend.created.head.reveals, 2)
-            assert(backend.created.head.html.contains("Preview disconnected"))
+            assertEquals(at(backend.created, 0).reveals, 2)
+            assert(at(backend.created, 0).html.contains("Preview disconnected"))
     yield ()
 
   test("a user disposal after a pending open wins over that open"):
@@ -312,7 +318,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         .use: registry =>
           for
             _ <- registry.show(first, PreviewViewState.Starting)
-            old = backend.created.head
+            old = at(backend.created, 0)
             open <- registry
               .show(first, PreviewViewState.Ready(url(4242)))
               .start
@@ -342,13 +348,13 @@ class WebviewPreviewSuite extends CatsEffectSuite:
               .start
             _ <- resolving.get
             _ <- registry.show(first, PreviewViewState.Starting)
-            _ <- backend.created.head.disposeFromUser
+            _ <- at(backend.created, 0).disposeFromUser
             _ <- registry.show(first, PreviewViewState.Stopped)
             _ <- continue.complete(())
             _ <- stale.joinWithNever
           yield
             assertEquals(backend.created.size, 2)
-            assert(backend.created(1).html.contains("Preview stopped"))
+            assert(at(backend.created, 1).html.contains("Preview stopped"))
     yield ()
 
   test("abandons a failed URI resolution before a later show"):
@@ -368,7 +374,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         yield
           assert(failed.isLeft)
           assertEquals(backend.created.size, 1)
-          assert(backend.created.head.html.contains("Preview stopped"))
+          assert(at(backend.created, 0).html.contains("Preview stopped"))
 
   test("disposes and removes a panel whose initial HTML write fails"):
     val created = mutable.ListBuffer.empty[FakePanel]
@@ -396,8 +402,8 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         yield
           assert(failed.isLeft)
           assertEquals(created.size, 2)
-          assert(created.head.disposed)
-          assert(created(1).html.contains("Preview stopped"))
+          assert(at(created, 0).disposed)
+          assert(at(created, 1).html.contains("Preview stopped"))
 
   test("attempts every panel disposal before propagating a cleanup failure"):
     val created = mutable.ListBuffer.empty[FakePanel]
@@ -497,7 +503,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       _ <- registry.show(first, PreviewViewState.Stopped)
     yield
       assertEquals(backend.created.size, 1)
-      assert(backend.created.head.disposed)
+      assert(at(backend.created, 0).disposed)
 
   test("disables scripts, command URIs, and local resource roots"):
     val options = PreviewWebviewOptions.value.asInstanceOf[js.Dynamic]
@@ -562,7 +568,11 @@ private class FakeBackend extends PreviewPanelBackend:
   def resolve(url: PreviewUrl): IO[String] =
     IO.delay:
       resolved += url.value
-      val port = url.value.split(':').last
+      val prefix = "http://127.0.0.1:"
+      val port   =
+        if url.value.startsWith(prefix) then url.value.drop(prefix.length)
+        else
+          throw IllegalArgumentException(s"unexpected test URL: ${url.value}")
       s"https://forwarded.example:$port/preview?remote=1&view=full"
 
   def create(

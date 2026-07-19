@@ -529,8 +529,13 @@ private[sbtplugin] object PreviewControlServer:
       val transport = paths.transport match
         case unix @ PreviewControlTransport.Unix(_) => unix
         case PreviewControlTransport.Tcp(host, _)   =>
-          val address = bound.getLocalAddress.asInstanceOf[InetSocketAddress]
-          PreviewControlTransport.Tcp(host, address.getPort)
+          bound.getLocalAddress match
+            case address: InetSocketAddress =>
+              PreviewControlTransport.Tcp(host, address.getPort)
+            case address =>
+              throw IllegalStateException(
+                s"DocTrellis TCP control channel received an unexpected local address: $address",
+              )
       val metadata = PreviewControlMetadata(
         transport = transport,
         pid = pid,
@@ -752,14 +757,17 @@ private[sbtplugin] object PreviewControlEndpoint:
         "The DocTrellis IPC runtime path is not a real directory.",
       )
     config.runtimeOwner.foreach: expected =>
-      val actual = Files
-        .getAttribute(
-          config.runtimeDirectory,
-          "unix:uid",
-          LinkOption.NOFOLLOW_LINKS,
-        )
-        .asInstanceOf[Number]
-        .longValue()
+      val attribute = Files.getAttribute(
+        config.runtimeDirectory,
+        "unix:uid",
+        LinkOption.NOFOLLOW_LINKS,
+      )
+      val actual = attribute match
+        case number: Number => number.longValue()
+        case other          =>
+          throw IllegalStateException(
+            s"DocTrellis IPC runtime path returned a non-numeric unix:uid attribute: ${String.valueOf(other)}",
+          )
       if actual != expected then
         throw IllegalStateException(
           "The DocTrellis IPC runtime directory is not owned by the current user.",

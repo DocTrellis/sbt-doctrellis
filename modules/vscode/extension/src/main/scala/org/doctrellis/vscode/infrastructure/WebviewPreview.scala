@@ -409,13 +409,13 @@ private[infrastructure] object PreviewWebviewOptions:
     )
 
 private[infrastructure] object VscodeExternalPreview:
-  private val adapter = ExternalPreview[Uri](
+  private val externalPreview = ExternalPreview[Uri](
     url =>
       IO.fromPromise(IO.delay(VSEnv.asExternalUri(VSUri.parse(url.value)))),
     value => IO.fromPromise(IO.delay(VSEnv.openExternal(value))),
   )
 
-  def open(url: PreviewUrl): IO[Unit] = adapter.open(url)
+  def open(url: PreviewUrl): IO[Unit] = externalPreview.open(url)
 
 private[infrastructure] final class ExternalPreview[A](
     resolve: PreviewUrl => IO[A],
