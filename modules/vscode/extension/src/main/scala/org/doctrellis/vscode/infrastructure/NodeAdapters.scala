@@ -18,7 +18,7 @@ private[infrastructure] object NodeProcess:
   )(
       workspace: Workspace,
       command: PreviewCommand,
-  ): Resource[IO, RunningProcess] =
+  ): Resource[IO, RunningProcess[IO]] =
     val announce = append(
       s"\n[${workspace.name}] Starting ${command.executable.value} ${command.arguments.map(_.value).mkString(" ")}\n" +
         s"[${workspace.name}] Working directory: ${command.workingDirectory.value}\n",

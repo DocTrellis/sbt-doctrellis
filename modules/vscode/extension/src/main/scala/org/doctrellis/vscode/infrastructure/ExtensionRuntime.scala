@@ -10,14 +10,19 @@ private[vscode] object ExtensionRuntime:
     for
       output     <- VscodeOutput.resource
       dispatcher <- Dispatcher.parallel[IO](await = false)
-      ports = PreviewPorts(
-        NodeConfig.load,
-        VscodePreferences.load,
-        NodeProcess.launch(dispatcher, output.append),
-        NodeHttpProbe.ready,
-        VscodePreview.open,
-        output.info,
-        output.report,
+      panels     <- PreviewPanelRegistry.resource(
+        VscodePreviewPanelBackend(dispatcher),
+      )
+      ports = PreviewPorts[IO](
+        load = NodeConfig.load,
+        policy = VscodePreferences.load,
+        launch = NodeProcess.launch(dispatcher, output.append),
+        probe = NodeHttpProbe.ready,
+        show = panels.show,
+        update = panels.update,
+        openExternal = VscodeExternalPreview.open,
+        info = output.info,
+        error = output.report,
       )
       service <- PreviewService.resource(ports)
       _       <- CommandBindings.resource(context, dispatcher, service, output)

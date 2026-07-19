@@ -25,6 +25,7 @@
     "onCommand:doctrellis.stopPreview",
     "onCommand:doctrellis.restartPreview",
     "onCommand:doctrellis.openPreview",
+    "onCommand:doctrellis.openExternalPreview",
     "onCommand:doctrellis.showOutput"
   ],
   "capabilities": {
@@ -52,6 +53,11 @@
       {
         "command": "doctrellis.openPreview",
         "title": "DocTrellis: Open Preview",
+        "enablement": "isWorkspaceTrusted"
+      },
+      {
+        "command": "doctrellis.openExternalPreview",
+        "title": "DocTrellis: Open in External Browser",
         "enablement": "isWorkspaceTrusted"
       },
       {
@@ -86,7 +92,7 @@
   "scripts": {
     "build:fast": "node ./scripts/build.mjs fast",
     "build:full": "node ./scripts/build.mjs full",
-    "test": "node ./scripts/build.mjs test",
+    "test": "node ./scripts/build.mjs test && node ./scripts/test-manifest.mjs",
     "vscode:prepublish": "npm run build:full",
     "vsix": "vsce package --no-dependencies --skip-license --out doctrellis-0.1.0.vsix",
     "vsix:list": "vsce ls --no-dependencies"

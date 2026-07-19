@@ -30,4 +30,6 @@ server builds once at startup; restart it after editing the documentation.
 To exercise the extension, open this directory as a trusted VS Code workspace
 with the local DocTrellis VSIX installed. Run **DocTrellis: Start Preview**. The
 extension reads this example's `.doctrellis.json`, starts the same sbt task,
-waits for the URL, and opens it.
+waits for the URL, and opens it in a reusable `DocTrellis Preview` Webview tab.
+Run **DocTrellis: Open in External Browser** to open the resolved preview URL in
+the system browser instead.

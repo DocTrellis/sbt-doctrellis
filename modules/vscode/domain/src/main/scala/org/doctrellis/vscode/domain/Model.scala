@@ -187,5 +187,21 @@ final case class ProcessExit(
       .orElse(signal.map(value => s"signal $value"))
       .getOrElse("an unknown status")
 
+enum PreviewViewState:
+  case Starting
+  case Ready(url: PreviewUrl)
+  case Stopped
+  case Failed(reason: String)
+  case Exited(exit: ProcessExit)
+
+enum PreviewTerminal:
+  case Failed(reason: String)
+  case Exited(exit: ProcessExit)
+
+  def viewState: PreviewViewState = this match
+    case Failed(reason) => PreviewViewState.Failed(reason)
+    case Exited(exit)   => PreviewViewState.Exited(exit)
+
 enum PreviewStatus:
   case Starting, Ready, Stopping
+  case Terminal(value: PreviewTerminal)

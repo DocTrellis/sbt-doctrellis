@@ -17,6 +17,19 @@ trait OutputChannel extends Disposable:
   def show(preserveFocus: Boolean = false): Unit = js.native
 
 @js.native
+trait Webview extends js.Object:
+  var html: String = js.native
+
+@js.native
+trait WebviewPanel extends Disposable:
+  val webview: Webview = js.native
+  def reveal(
+      viewColumn: js.UndefOr[Int] = js.undefined,
+      preserveFocus: Boolean = false,
+  ): Unit                                                    = js.native
+  def onDidDispose(listener: js.Function0[Unit]): Disposable = js.native
+
+@js.native
 trait Uri extends js.Object:
   val fsPath: String              = js.native
   override def toString(): String = js.native
@@ -53,6 +66,12 @@ trait WorkspaceApi extends js.Object:
 @js.native
 trait Window extends js.Object:
   def createOutputChannel(name: String): OutputChannel = js.native
+  def createWebviewPanel(
+      viewType: String,
+      title: String,
+      showOptions: js.Any,
+      options: js.Object,
+  ): WebviewPanel = js.native
   def showErrorMessage(message: String): js.Promise[js.UndefOr[String]] =
     js.native
   def showInformationMessage(message: String): js.Promise[js.UndefOr[String]] =
@@ -68,8 +87,6 @@ trait Commands extends js.Object:
       command: String,
       callback: js.Function0[js.Any],
   ): Disposable = js.native
-  def executeCommand[T](command: String, args: js.Any*): js.Promise[T] =
-    js.native
 
 @js.native
 trait Env extends js.Object:

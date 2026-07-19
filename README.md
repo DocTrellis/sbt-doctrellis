@@ -170,12 +170,18 @@ In a trusted workspace, use these Command Palette commands:
 - **DocTrellis: Stop Preview**
 - **DocTrellis: Restart Preview**
 - **DocTrellis: Open Preview**
+- **DocTrellis: Open in External Browser**
 - **DocTrellis: Show Output**
 
 For a multi-root workspace, DocTrellis asks which folder to use. It manages at
 most one child process per folder, sends output to the `DocTrellis` Output
 Channel, and stops children when their folder closes or the extension
-deactivates. It does not start commands automatically.
+deactivates. It does not start commands automatically. The default open action
+uses one `DocTrellis Preview` Webview panel per workspace folder, reuses that
+panel across repeated opens and restarts, and shows stopped, startup-failure,
+or unexpected-exit status without closing the tab. Preview HTTP URLs pass
+through VS Code's remote URI resolver before they enter either the Webview
+iframe or the explicit external-browser command.
 
 ## Develop and verify
 
@@ -235,8 +241,9 @@ The build tasks are also available through **Tasks: Run Task**.
   files; stop and restart it after documentation changes.
 - Preview binds to localhost and is intended for development only. There is no
   GitHub Pages, website deployment, or other remote publishing feature.
-- The extension first uses VS Code's supported URI-opening command and falls
-  back to the system browser when the workbench cannot display the URL.
+- The Webview uses a script-free wrapper, restrictive content security policy,
+  and sandboxed iframe. A rendered documentation site that requires iframe
+  script permissions is not supported by the initial preview panel.
 - GUI Extension Development Host behavior is a manual smoke test; CI verifies
   compilation, linking, package contents, and the headless preview contract.
 - Neither the sbt plugin nor the extension is published to Maven Central or the

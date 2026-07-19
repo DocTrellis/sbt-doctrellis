@@ -35,8 +35,18 @@ marked `UNLICENSED`, and provides only a local VSIX command—no Marketplace
 publish command.
 
 Workspace Trust is enforced in both `package.json` command enablement and at
-runtime. Opening preview first uses the supported `vscode.open` command after
-`env.asExternalUri`; `env.openExternal` is the fallback.
+runtime. Default preview display uses a `window.createWebviewPanel` registry
+keyed by the canonical workspace URI. Before rendering an iframe, resolve its
+HTTP URL with `env.asExternalUri` so the same behavior works from a remote
+extension host. Reuse and reveal an existing panel for the same workspace;
+keep other workspace panels independent and unregister panels on disposal.
+
+The wrapper Webview disables scripts and command URIs, declares no local
+resource roots, applies a default-deny CSP with only the resolved iframe origin,
+and gives the iframe an empty sandbox. Lifecycle states replace the iframe with
+escaped status content after a stop, startup failure, or unexpected exit. A
+separate **Open in External Browser** command also resolves the URI and then
+uses `env.openExternal`.
 
 ## Consequences
 

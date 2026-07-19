@@ -51,31 +51,6 @@ private[infrastructure] object VscodePreferences:
         .leftMap(problem => IllegalArgumentException(problem.message))
     .flatMap(IO.fromEither)
 
-private[infrastructure] object VscodePreview:
-  def open(url: PreviewUrl): IO[Unit] =
-    val original = VSUri.parse(url.value)
-    IO.fromPromise(IO.delay(VSEnv.asExternalUri(original)))
-      .attempt
-      .flatMap:
-        case Right(resolved) =>
-          openInsideVscode(resolved)
-            .handleErrorWith(_ => openExternal(resolved))
-        case Left(_) => openExternal(original)
-
-  private def openInsideVscode(uri: Uri): IO[Unit] =
-    IO.fromPromise(
-      IO.delay(VSCommands.executeCommand[js.Any]("vscode.open", uri)),
-    ).void
-
-  private def openExternal(uri: Uri): IO[Unit] =
-    IO.fromPromise(IO.delay(VSEnv.openExternal(uri)))
-      .flatMap: opened =>
-        IO.raiseUnless(opened)(
-          IllegalStateException(
-            "VS Code could not open the DocTrellis preview.",
-          ),
-        )
-
 private[infrastructure] object WorkspaceSelection:
   def choose: IO[Option[Workspace]] =
     IO.delay(
@@ -92,19 +67,19 @@ private[infrastructure] object WorkspaceSelection:
         ).as(None)
       case Vector(folder) => IO.pure(Some(fromFolder(folder)))
       case folders        =>
-        val labels =
-          folders.map(folder => s"${folder.name} — ${folder.uri.fsPath}")
-        val options = js.Dynamic.literal(
+        val candidates       = WorkspaceOptions.from(folders.map(fromFolder))
+        val labels           = candidates.map(_._1)
+        val quickPickOptions = js.Dynamic.literal(
           placeHolder = "Select the workspace folder for DocTrellis preview",
           title = "DocTrellis",
         )
         IO.fromPromise(
-          IO.delay(VSWindow.showQuickPick(labels.toJSArray, options)),
+          IO.delay(VSWindow.showQuickPick(labels.toJSArray, quickPickOptions)),
         ).map: selected =>
           selected.toOption.flatMap: label =>
-            labels.indexOf(label) match
+            candidates.indexWhere(_._1 == label) match
               case -1    => None
-              case index => Some(fromFolder(folders(index)))
+              case index => Some(candidates(index)._2)
 
   def fromFolder(folder: WorkspaceFolder): Workspace =
     val uri = folder.uri.toString()
@@ -114,7 +89,7 @@ private[infrastructure] object CommandBindings:
   def resource(
       context: ExtensionContext,
       dispatcher: Dispatcher[IO],
-      service: PreviewService,
+      service: PreviewService[IO],
       output: VscodeOutput,
   ): Resource[IO, Unit] =
     List(
@@ -146,6 +121,13 @@ private[infrastructure] object CommandBindings:
         "doctrellis.openPreview",
         requireTrust = true,
       )(service.open),
+      workspaceCommand(
+        context,
+        dispatcher,
+        output,
+        "doctrellis.openExternalPreview",
+        requireTrust = true,
+      )(service.openExternal),
       simpleCommand(context, dispatcher, output, "doctrellis.showOutput")(
         output.show,
       ),
@@ -184,7 +166,7 @@ private[infrastructure] object CommandBindings:
   private def workspaceListener(
       context: ExtensionContext,
       dispatcher: Dispatcher[IO],
-      service: PreviewService,
+      service: PreviewService[IO],
       output: VscodeOutput,
   ): Resource[IO, Unit] =
     val listener: js.Function1[WorkspaceFoldersChangeEvent, Unit] = event =>
@@ -201,12 +183,9 @@ private[infrastructure] object CommandBindings:
 
   private def trusted(required: Boolean): IO[Unit] =
     IO.delay(VSWorkspace.isTrusted)
-      .flatMap: trusted =>
-        IO.raiseUnless(!required || trusted)(
-          IllegalStateException(
-            "DocTrellis cannot run preview commands in an untrusted workspace.",
-          ),
-        )
+      .flatMap(trusted =>
+        IO.fromEither(WorkspaceTrust.validate(required, trusted)),
+      )
 
   private def disposable(
       context: ExtensionContext,
