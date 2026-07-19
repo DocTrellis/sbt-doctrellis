@@ -70,6 +70,12 @@ power and require a concrete justification at a platform boundary.
 Untrusted values must be converted into domain values at the boundary. Do not
 check a raw value and continue passing the same raw type through the system.
 
+Parsing allows code inside the boundary to be composed from total functions.
+Prefer strengthening the input type to weakening the result type. When parsing
+can establish a guarantee, encode it in the domain value so an inner function
+can return an ordinary value instead of repeating the check or propagating an
+unnecessary `Option` or `Either`.
+
 Prefer:
 
 ```scala
@@ -94,13 +100,24 @@ Apply these rules consistently:
 
 - Put smart constructors in the companion object of the parsed type.
 - Keep opaque type constructors inaccessible outside their defining scope.
-- Return a structured error that identifies the offending field or boundary.
+- Represent malformed boundary input with a structured error that identifies
+  the offending field or boundary; do not throw from a domain parser.
 - Parse configuration versions and reject unknown fields before starting any
   effect.
 - Resolve and canonicalize filesystem paths before constructing a
   `WorkingDirectory`.
 - Make application services accept parsed domain values, not `js.Any`, JSON
   objects, arbitrary strings, or unresolved paths.
+- Prefer `A => B` to `A => Option[B]` or `A => Either[E, B]` when the
+  guarantees encoded by `A` make `B` inevitable.
+- Use `Option`, `Either`, or a domain-specific result ADT inside the boundary
+  only when absence, rejection, or failure remains a legitimate outcome for an
+  already parsed domain input.
+- Do not invent fallback values or rely on "impossible" exceptions merely to
+  make a function appear total. Instead, refine the input type when it can rule
+  out the case.
+- Keep environmental and effect failures explicit in `F[_]`; they are distinct
+  from malformed boundary input and cannot be eliminated by parsing.
 - Do not add `require` calls to case classes when a parser can make the invalid
   construction impossible.
 
@@ -181,8 +198,12 @@ indentation-based form.
 - Use case classes instead of public tuples when fields have domain meaning.
 - Use named arguments when a constructor has several parameters of the same
   type or multiple function-valued fields, especially when assembling ports.
-- Use opaque types for validated scalar values that do not need product
-  structure.
+- Use opaque types for scalar values whose invariants are established during
+  parsing and that do not need product structure.
+- When scalar constraints must be reused or composed broadly enough that local
+  opaque types would duplicate parser and smart-constructor logic, consider a
+  refined-type library such as Iron. Do not add such a dependency for an
+  isolated invariant that an opaque type can express clearly.
 - Name opaque type constructors `parse` when they consume untrusted input.
 - Expose the underlying scalar with a narrowly scoped extension such as
   `.value` or `.duration`, primarily for adapters.
@@ -391,7 +412,8 @@ from a state in which the relevant tests pass.
 
 Before requesting review, confirm that:
 
-- raw input is parsed once into a type that represents its guarantees;
+- raw input is parsed once into a type that represents its guarantees, and
+  inner functions do not reintroduce the uncertainty eliminated by parsing;
 - dependencies still point inward;
 - new capabilities are no broader than the use case needs;
 - acquisition, cancellation, failure, and release paths are all explicit;
@@ -405,6 +427,7 @@ Before requesting review, confirm that:
 
 - [Strategic Scala Style: Principle of Least Power](https://www.lihaoyi.com/post/StrategicScalaStylePrincipleofLeastPower.html)
 - [Parse, don't validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)
+- [Iron: refined types for Scala](https://github.com/Iltotore/iron)
 - [Cats Effect documentation](https://typelevel.org/cats-effect/docs/getting-started)
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [sigilaris/sigilaris](https://github.com/sigilaris/sigilaris)
