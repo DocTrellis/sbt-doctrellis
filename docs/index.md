@@ -2,6 +2,11 @@
 
 This site documents the architecture and operating contracts of DocTrellis.
 
+## Development guides
+
+- [DocTrellis project coding guide](coding-style.md)
+- [Scala 3 functional coding style guide](scala-coding-style.md)
+
 ## Architecture decision records
 
 - [Repository and functional architecture](adr/0001-repository-architecture.md)

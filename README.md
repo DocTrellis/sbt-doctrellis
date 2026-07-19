@@ -43,6 +43,11 @@ domain owns platform-independent values and rules, the application defines an
 algebra and composes it into a program, and the extension supplies Node/VS Code
 interpreters and the composition root.
 
+## Development guides
+
+- [DocTrellis project coding guide](docs/coding-style.md)
+- [Reusable Scala 3 functional coding style guide](docs/scala-coding-style.md)
+
 ## Requirements
 
 - JDK 25 (the LTS used in CI; sbt 2 requires JDK 17 or newer)

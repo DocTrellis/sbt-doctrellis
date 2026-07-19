@@ -1,7 +1,7 @@
 # DocTrellis Project Coding Guide
 
 DocTrellis follows the reusable
-[Scala 3 Functional Coding Style Guide](SCALA_CODING_STYLE.md). This document
+[Scala 3 Functional Coding Style Guide](scala-coding-style.md). This document
 adds the architecture mapping, platform boundaries, tool configuration, test
 scope, and verification rules specific to this repository.
 
