@@ -2,7 +2,7 @@ package org.doctrellis.sbtplugin
 
 import java.net.{URL, URLClassLoader}
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, StandardCopyOption}
+import java.nio.file.{Files, LinkOption, Path, StandardCopyOption}
 import java.util.ServiceLoader
 
 import scala.jdk.CollectionConverters.*
@@ -12,7 +12,9 @@ import mdoc.interfaces.{DiagnosticSeverity, Mdoc}
 
 private[sbtplugin] object MdocProcessor:
   def process(
-      layout: DocTrellisLayout,
+      workspaceDirectory: Path,
+      sourceDirectory: Path,
+      outputDirectory: Path,
       classpath: Seq[Path],
       scalacOptions: Seq[String],
       settings: Seq[String],
@@ -20,50 +22,87 @@ private[sbtplugin] object MdocProcessor:
       info: String => Unit,
       warn: String => Unit,
   ): Unit =
-    val source = layout.sourceDirectory
-    val output = layout.mdocDirectory
+    val source = sourceDirectory
+    val output = outputDirectory
 
-    val loader = IsolatedMdocClassLoader(
-      classpath.map(_.toUri.toURL).toArray,
-      classOf[Mdoc].getClassLoader,
-    )
-    val engine = load(loader)
-      .withWorkingDirectory(layout.workspaceDirectory)
-      .withClasspath(classpath.asJava)
-      .withScalacOptions(scalacOptions.asJava)
-      .withSettings(settings.asJava)
-
-    try
-      val paths = list(source)
-      paths.foreach: input =>
-        val target = output.resolve(source.relativize(input))
-        if Files.isDirectory(input) then Files.createDirectories(target): Unit
-        else if Files.isRegularFile(input) then
-          Files.createDirectories(target.getParent): Unit
-          if isMarkdown(input) then
+    MdocResource.use(
+      IsolatedMdocClassLoader(
+        classpath.map(_.toUri.toURL).toArray,
+        classOf[Mdoc].getClassLoader,
+      ),
+    )(_.close()): loader =>
+      MdocResource.use(
+        configure(
+          engine = load(loader),
+          workspaceDirectory = workspaceDirectory,
+          classpath = classpath,
+          scalacOptions = scalacOptions,
+          settings = settings,
+        ),
+      )(_.shutdown()): configured =>
+        val markdownCount = processSourceTree(source, output):
+          (relative, input, target) =>
             evaluate(
-              engine,
-              source.relativize(input),
+              configured,
+              relative,
               input,
               target,
               variables,
               info,
               warn,
             )
-          else
-            Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING): Unit
-      info(
-        s"DocTrellis: mdoc processed ${paths.count(isMarkdown)} Markdown file(s)",
-      )
-    finally
-      engine.shutdown()
-      loader.close()
+        info(
+          s"DocTrellis: mdoc processed $markdownCount Markdown file(s)",
+        )
+
+  private[sbtplugin] def processSourceTree(
+      source: Path,
+      output: Path,
+  )(
+      processMarkdown: (Path, Path, Path) => Unit,
+  ): Int =
+    val paths = list(source)
+    paths.foreach: input =>
+      val relative = source.relativize(input)
+      val target   = output.resolve(relative)
+      if Files.isDirectory(input, LinkOption.NOFOLLOW_LINKS) then
+        Files.createDirectories(target): Unit
+      else if Files.isRegularFile(input) then
+        Files.createDirectories(target.getParent): Unit
+        if isMarkdown(input) then processMarkdown(relative, input, target)
+        else
+          Files.copy(
+            input,
+            target,
+            StandardCopyOption.REPLACE_EXISTING,
+          ): Unit
+    paths.count(isMarkdown)
+
+  private def configure(
+      engine: Mdoc,
+      workspaceDirectory: Path,
+      classpath: Seq[Path],
+      scalacOptions: Seq[String],
+      settings: Seq[String],
+  ): Mdoc =
+    var current = engine
+    try
+      current = current.withWorkingDirectory(workspaceDirectory)
+      current = current.withClasspath(classpath.asJava)
+      current = current.withScalacOptions(scalacOptions.asJava)
+      current = current.withSettings(settings.asJava)
+      current
+    catch
+      case error: Throwable =>
+        try current.shutdown()
+        catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        throw error
 
   private def load(loader: ClassLoader): Mdoc =
     val providers = ServiceLoader.load(classOf[Mdoc], loader).iterator()
     if providers.hasNext then providers.next()
     else
-      sys.error(
+      throw IllegalStateException(
         "DocTrellis could not load the mdoc programmatic implementation",
       )
 
@@ -108,9 +147,28 @@ private[sbtplugin] object MdocProcessor:
           val position = diagnostic.position()
           s"$relative:${position.startLine() + 1}:${position.startColumn() + 1}: ${diagnostic.message()}"
         .mkString("\n")
-      sys.error(s"DocTrellis mdoc processing failed:\n$rendered")
+      throw IllegalStateException(
+        s"DocTrellis mdoc processing failed:\n$rendered",
+      )
 
     Files.writeString(output, result.content(), StandardCharsets.UTF_8): Unit
+
+private[sbtplugin] object MdocResource:
+  def use[A, B](resource: => A)(release: A => Unit)(operation: A => B): B =
+    val acquired = resource
+    var primary  = Option.empty[Throwable]
+    try operation(acquired)
+    catch
+      case error: Throwable =>
+        primary = Some(error)
+        throw error
+    finally
+      try release(acquired)
+      catch
+        case cleanupError: Throwable =>
+          primary match
+            case Some(error) => error.addSuppressed(cleanupError)
+            case None        => throw cleanupError
 
 private final class IsolatedMdocClassLoader(
     urls: Array[URL],

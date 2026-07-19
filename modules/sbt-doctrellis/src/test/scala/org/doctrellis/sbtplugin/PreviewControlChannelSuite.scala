@@ -1,12 +1,25 @@
 package org.doctrellis.sbtplugin
 
+import java.io.{ByteArrayOutputStream, IOException, OutputStream}
 import java.net.{InetSocketAddress, ServerSocket, URI, UnixDomainSocketAddress}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
-import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.{
+  Callable,
+  CountDownLatch,
+  Executor,
+  Executors,
+  RejectedExecutionException,
+  TimeUnit,
+}
+import java.util.concurrent.atomic.{
+  AtomicBoolean,
+  AtomicInteger,
+  AtomicReference,
+}
 
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
@@ -78,6 +91,347 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     assert(decoder.offer(bytes, -1).isLeft)
     assert(decoder.offer(bytes, bytes.length + 1).isLeft)
     assertEquals(decoder.offer(bytes, bytes.length), Right(Vector(hello)))
+
+  test("hello opts into site events only with numeric version one"):
+    val optedIn = hello.replace(
+      "\"token\":",
+      "\"siteEvents\":1,\"token\":",
+    )
+
+    assertEquals(
+      PreviewControlProtocol.decodeClient(hello),
+      Right(
+        PreviewControlRequest.Hello(
+          token = "token",
+          clientId = "client",
+          requestId = "request",
+          siteEvents = false,
+        ),
+      ),
+    )
+    assertEquals(
+      PreviewControlProtocol.decodeClient(optedIn),
+      Right(
+        PreviewControlRequest.Hello(
+          token = "token",
+          clientId = "client",
+          requestId = "request",
+          siteEvents = true,
+        ),
+      ),
+    )
+    Vector("0", "2", "\"1\"").foreach: value =>
+      assertEquals(
+        PreviewControlProtocol.decodeClient(
+          optedIn.replace("\"siteEvents\":1", s"\"siteEvents\":$value"),
+        ),
+        PreviewControlProtocol.decodeClient(hello),
+        clues(value),
+      )
+    assertEquals(
+      PreviewControlProtocol.decodeClient(
+        hello.replace("\"token\":", "\"futureField\":\"value\",\"token\":"),
+      ),
+      PreviewControlProtocol.decodeClient(hello),
+    )
+
+  test("site event activation orders ready before a concurrent publication"):
+    val readyEntered       = CountDownLatch(1)
+    val releaseReady       = CountDownLatch(1)
+    val publicationStarted = CountDownLatch(1)
+    val sent   = java.util.concurrent.ConcurrentLinkedQueue[String]()
+    val pool   = Executors.newFixedThreadPool(2)
+    val events = PreviewConnectionEvents: message =>
+      if message == "ready" then
+        readyEntered.countDown()
+        releaseReady.await()
+      sent.add(message)
+
+    try
+      val acceptance = pool.submit(
+        new Callable[Boolean]:
+          override def call(): Boolean =
+            events.acceptHello("ready", siteEvents = true),
+      )
+      assert(readyEntered.await(1L, TimeUnit.SECONDS))
+      val publication = pool.submit(
+        new Callable[Unit]:
+          override def call(): Unit =
+            publicationStarted.countDown()
+            events.siteChanged("siteChanged"),
+      )
+      assert(publicationStarted.await(1L, TimeUnit.SECONDS))
+      releaseReady.countDown()
+      assert(acceptance.get(1L, TimeUnit.SECONDS))
+      publication.get(1L, TimeUnit.SECONDS)
+      assertEquals(
+        sent.iterator().asScala.toVector,
+        Vector("ready", "siteChanged"),
+      )
+    finally
+      releaseReady.countDown()
+      pool.shutdownNow(): Unit
+
+  test("a writer failure closes its queue and rejects later frames"):
+    val failure  = AtomicReference[Throwable]()
+    val failed   = CountDownLatch(1)
+    val executor = Executors.newSingleThreadExecutor()
+    val output   = new OutputStream:
+      override def write(value: Int): Unit =
+        throw IOException(s"failed byte $value")
+    val writer = PreviewFrameWriter(
+      output = output,
+      executor = executor,
+      onFailure = error =>
+        failure.set(error)
+        failed.countDown()
+      ,
+      onTerminated = () => (),
+    )
+
+    try
+      writer.start()
+      assert(writer.send("first\n"))
+      assert(failed.await(1L, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assertEquals(failure.get().getClass, classOf[IOException])
+      assert(!writer.send("second\n"))
+    finally
+      writer.abort()
+      executor.shutdownNow(): Unit
+
+  test("an accepted finish runs once after an earlier frame write fails"):
+    val writeEntered         = CountDownLatch(1)
+    val releaseWrite         = CountDownLatch(1)
+    val writeExited          = AtomicBoolean(false)
+    val callbackRan          = CountDownLatch(1)
+    val callbackCount        = AtomicInteger(0)
+    val callbackSawWriteExit = AtomicBoolean(false)
+    val failure              = AtomicReference[Throwable]()
+    val failed               = CountDownLatch(1)
+    val executor             = Executors.newSingleThreadExecutor()
+    val output               = new OutputStream:
+      override def write(value: Int): Unit = ()
+
+      override def write(
+          bytes: Array[Byte],
+          offset: Int,
+          length: Int,
+      ): Unit =
+        writeEntered.countDown()
+        if !releaseWrite.await(1L, TimeUnit.SECONDS) then
+          throw IOException("controlled write was not released")
+        writeExited.set(true)
+        throw IOException("controlled write failure")
+
+    val writer = PreviewFrameWriter(
+      output = output,
+      executor = executor,
+      onFailure = error =>
+        failure.set(error)
+        failed.countDown()
+      ,
+      onTerminated = () => (),
+    )
+
+    try
+      writer.start()
+      assert(writer.send("frame\n"))
+      assert(writeEntered.await(1L, TimeUnit.SECONDS))
+      assert(
+        writer.finish(() =>
+          callbackSawWriteExit.set(writeExited.get())
+          callbackCount.incrementAndGet(): Unit
+          callbackRan.countDown(),
+        ),
+      )
+      releaseWrite.countDown()
+
+      assert(failed.await(1L, TimeUnit.SECONDS))
+      assert(callbackRan.await(1L, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assertEquals(failure.get().getMessage, "controlled write failure")
+      assert(callbackSawWriteExit.get())
+      assertEquals(callbackCount.get(), 1)
+
+      writer.abort()
+      assertEquals(callbackCount.get(), 1)
+    finally
+      releaseWrite.countDown()
+      writer.abort()
+      executor.shutdownNow(): Unit
+
+  test("abort preserves an accepted finish while clearing queued frames"):
+    val writeEntered         = CountDownLatch(1)
+    val releaseWrite         = CountDownLatch(1)
+    val writeExited          = AtomicBoolean(false)
+    val callbackRan          = CountDownLatch(1)
+    val callbackCount        = AtomicInteger(0)
+    val callbackSawWriteExit = AtomicBoolean(false)
+    val executor             = Executors.newSingleThreadExecutor()
+    val output               = new OutputStream:
+      override def write(value: Int): Unit = ()
+
+      override def write(
+          bytes: Array[Byte],
+          offset: Int,
+          length: Int,
+      ): Unit =
+        writeEntered.countDown()
+        if !releaseWrite.await(1L, TimeUnit.SECONDS) then
+          throw IOException("controlled write was not released")
+        writeExited.set(true)
+
+    val writer = PreviewFrameWriter(
+      output = output,
+      executor = executor,
+      onFailure = error => throw error,
+      onTerminated = () => (),
+    )
+
+    try
+      writer.start()
+      assert(writer.send("frame\n"))
+      assert(writeEntered.await(1L, TimeUnit.SECONDS))
+      assert(
+        writer.finish(() =>
+          callbackSawWriteExit.set(writeExited.get())
+          callbackCount.incrementAndGet(): Unit
+          callbackRan.countDown(),
+        ),
+      )
+
+      writer.abort()
+      assertEquals(callbackCount.get(), 0)
+      releaseWrite.countDown()
+
+      assert(callbackRan.await(1L, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(callbackSawWriteExit.get())
+      assertEquals(callbackCount.get(), 1)
+
+      writer.abort()
+      assertEquals(callbackCount.get(), 1)
+    finally
+      releaseWrite.countDown()
+      writer.abort()
+      executor.shutdownNow(): Unit
+
+  test("normal finish invokes its callback after every accepted frame"):
+    val output        = ByteArrayOutputStream()
+    val callbackRan   = CountDownLatch(1)
+    val callbackCount = AtomicInteger(0)
+    val observed      = AtomicReference[String]()
+    val executor      = Executors.newSingleThreadExecutor()
+    val writer        = PreviewFrameWriter(
+      output = output,
+      executor = executor,
+      onFailure = error => throw error,
+      onTerminated = () => (),
+    )
+
+    try
+      writer.start()
+      assert(writer.send("first\n"))
+      assert(writer.send("second\n"))
+      assert(
+        writer.finish(() =>
+          observed.set(String(output.toByteArray, StandardCharsets.UTF_8))
+          callbackCount.incrementAndGet(): Unit
+          callbackRan.countDown(),
+        ),
+      )
+
+      assert(callbackRan.await(1L, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assertEquals(observed.get(), "first\nsecond\n")
+      assertEquals(callbackCount.get(), 1)
+      assert(!writer.finish(() => callbackCount.incrementAndGet(): Unit))
+      assertEquals(callbackCount.get(), 1)
+    finally
+      writer.abort()
+      executor.shutdownNow(): Unit
+
+  test("a finish callback failure still completes the writer exactly once"):
+    val callbackCount = AtomicInteger(0)
+    val failure       = AtomicReference[Throwable]()
+    val failed        = CountDownLatch(1)
+    val terminated    = CountDownLatch(1)
+    val executor      = Executors.newSingleThreadExecutor()
+    val writer        = PreviewFrameWriter(
+      output = OutputStream.nullOutputStream(),
+      executor = executor,
+      onFailure = error =>
+        failure.set(error)
+        failed.countDown()
+      ,
+      onTerminated = () => terminated.countDown(),
+    )
+
+    try
+      writer.start()
+      assert(
+        writer.finish(() =>
+          callbackCount.incrementAndGet(): Unit
+          throw IOException("controlled callback failure"),
+        ),
+      )
+
+      assert(failed.await(1L, TimeUnit.SECONDS))
+      assert(terminated.await(1L, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assertEquals(failure.get().getMessage, "controlled callback failure")
+      assertEquals(callbackCount.get(), 1)
+      writer.abort()
+      assertEquals(callbackCount.get(), 1)
+    finally
+      writer.abort()
+      executor.shutdownNow(): Unit
+
+  test("an accepted finish completes when the executor rejects start"):
+    val callbackCount = AtomicInteger(0)
+    val terminated    = CountDownLatch(1)
+    val executor      = new Executor:
+      override def execute(command: Runnable): Unit =
+        throw RejectedExecutionException("controlled rejection")
+    val writer = PreviewFrameWriter(
+      output = OutputStream.nullOutputStream(),
+      executor = executor,
+      onFailure = _ => (),
+      onTerminated = () => terminated.countDown(),
+    )
+
+    assert(writer.finish(() => callbackCount.incrementAndGet(): Unit))
+    val failure = intercept[RejectedExecutionException](writer.start())
+
+    assertEquals(failure.getMessage, "controlled rejection")
+    assert(terminated.await(1L, TimeUnit.SECONDS))
+    assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+    assertEquals(callbackCount.get(), 1)
+    writer.abort()
+    assertEquals(callbackCount.get(), 1)
+
+  test("abort before start completes an accepted finish exactly once"):
+    val callbackCount = AtomicInteger(0)
+    val terminated    = CountDownLatch(1)
+    val neverRun      = new Executor:
+      override def execute(command: Runnable): Unit =
+        fail("the writer must not be started")
+    val writer = PreviewFrameWriter(
+      output = OutputStream.nullOutputStream(),
+      executor = neverRun,
+      onFailure = error => throw error,
+      onTerminated = () => terminated.countDown(),
+    )
+
+    assert(writer.finish(() => callbackCount.incrementAndGet(): Unit))
+    writer.abort()
+
+    assert(terminated.await(1L, TimeUnit.SECONDS))
+    assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+    assertEquals(callbackCount.get(), 1)
+    writer.abort()
+    assertEquals(callbackCount.get(), 1)
 
   test("stale endpoint policy removes only unreachable dead owners"):
     assertEquals(
@@ -221,6 +575,91 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     assert(PreviewControlMetadata.parse(metadata(65535)).isRight)
     assert(PreviewControlMetadata.parse(metadata(0)).isLeft)
     assert(PreviewControlMetadata.parse(metadata(65536)).isLeft)
+
+  test("Windows binding metadata recovers after a crash and open failure"):
+    val runtime = shortTempDirectory("dtc-windows-provisional-")
+    val hash    = "8123456789abcdef01234567"
+    val config  = PreviewControlConfig(
+      runtimeDirectory = runtime,
+      workspaceHash = hash,
+      launchId = launchId,
+    )
+    var crashed     = Option.empty[PreviewControlPaths]
+    var replacement = Option.empty[PreviewControlPaths]
+    try
+      crashed = Some(
+        PreviewControlEndpoint.prepare(
+          config = config,
+          pid = Long.MaxValue,
+          sessionId = "crashed-windows-session",
+          token = "0" * 64,
+          windows = true,
+        ),
+      )
+      val metadataPath = runtime.resolve(s"$hash.json")
+      val provisional  = Files.readString(metadataPath)
+      assert(PreviewControlMetadata.parse(provisional).isLeft)
+      assertEquals(
+        right(PreviewControlMetadata.parseProvisional(provisional)).transport,
+        PreviewControlTransport.Tcp("127.0.0.1", 0),
+      )
+
+      crashed.foreach(_.lease.close())
+      replacement = Some(
+        PreviewControlEndpoint.prepare(
+          config = config,
+          pid = ProcessHandle.current().pid(),
+          sessionId = "replacement-windows-session",
+          token = "1" * 64,
+          windows = true,
+        ),
+      )
+
+      PreviewControlEndpoint.cleanupOwned(
+        metadataPath = metadataPath,
+        socketPath = None,
+        sessionId = "different-windows-session",
+      )
+      assert(Files.exists(metadataPath))
+      PreviewControlEndpoint.cleanupOwned(
+        metadataPath = metadataPath,
+        socketPath = None,
+        sessionId = "replacement-windows-session",
+      )
+      assert(Files.notExists(metadataPath))
+    finally
+      crashed.foreach(_.lease.close())
+      replacement.foreach(_.lease.close())
+      deleteTree(runtime)
+
+  test("unmarked port-zero metadata remains protected"):
+    val runtime      = shortTempDirectory("dtc-windows-protect-")
+    val hash         = "9123456789abcdef01234567"
+    val metadataPath = runtime.resolve(s"$hash.json")
+    val unmarked     = PreviewControlMetadata(
+      transport = PreviewControlTransport.Tcp("127.0.0.1", 0),
+      pid = Long.MaxValue,
+      sessionId = "unmarked-session",
+      launchId = "unmarked-launch",
+      token = "0" * 64,
+    ).json
+    try
+      Files.writeString(metadataPath, unmarked)
+      intercept[IllegalStateException](
+        PreviewControlEndpoint.prepare(
+          config = PreviewControlConfig(
+            runtimeDirectory = runtime,
+            workspaceHash = hash,
+            launchId = launchId,
+          ),
+          pid = ProcessHandle.current().pid(),
+          sessionId = "replacement-session",
+          token = "1" * 64,
+          windows = true,
+        ),
+      ): Unit
+      assertEquals(Files.readString(metadataPath), unmarked)
+    finally deleteTree(runtime)
 
   test("an endpoint lease serializes simultaneous stale cleanup"):
     val runtime      = shortTempDirectory("dtc-race-")
@@ -379,6 +818,169 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         binding.stopExecutor()
       assertPortReusable(configured)
 
+  test("site changes reach every opted-in connection and skip legacy clients"):
+    val runtime = shortTempDirectory("dtc-events-")
+    val hash    = "6123456789abcdef01234567"
+    val control = PreviewControlServer.open(
+      config = PreviewControlConfig(
+        runtimeDirectory = runtime,
+        workspaceHash = hash,
+        launchId = launchId,
+      ),
+      readyUrl = "http://127.0.0.1:4242",
+      onStop = () => (),
+      log = LogExchange.logger("preview-control-events-test"),
+    )
+    val metadata = right(
+      PreviewControlMetadata.parse(
+        Files.readString(runtime.resolve(s"$hash.json")),
+      ),
+    )
+    val owner    = connect(metadata)
+    val observer = connect(metadata)
+    val legacy   = connect(metadata)
+
+    try
+      Vector(
+        (owner, "owner", true),
+        (observer, "observer", true),
+        (legacy, "legacy", false),
+      ).foreach: (client, clientId, siteEvents) =>
+        write(
+          client,
+          request(
+            kind = "hello",
+            token = metadata.token,
+            requestId = s"hello-$clientId",
+            clientId = clientId,
+            siteEvents = siteEvents,
+          ),
+        )
+        assert(read(client).contains("\"type\":\"ready\""))
+
+      control.siteChanged(2L)
+      assertSiteChanged(read(owner), metadata.sessionId, 2L)
+      assertSiteChanged(read(observer), metadata.sessionId, 2L)
+
+      write(
+        legacy,
+        request(
+          kind = "ping",
+          token = metadata.token,
+          requestId = "legacy-ping",
+          clientId = "legacy",
+        ),
+      )
+      assertEquals(
+        right(PreviewControlJson.parse(read(legacy))).get("type"),
+        Some(PreviewControlJson.Atom.Text("pong")),
+      )
+
+      observer.close()
+      control.siteChanged(3L)
+      assertSiteChanged(read(owner), metadata.sessionId, 3L)
+
+      control.close()
+      assert(Files.notExists(runtime.resolve(s"$hash.json")))
+      metadata.transport match
+        case PreviewControlTransport.Unix(address) =>
+          assert(Files.notExists(address))
+        case PreviewControlTransport.Tcp(_, _) => ()
+      assertChannelClosed(owner)
+      assertChannelClosed(legacy)
+      control.siteChanged(4L)
+    finally
+      owner.close()
+      observer.close()
+      legacy.close()
+      control.close()
+      deleteTree(runtime)
+
+  test("concurrent responses and site events preserve complete NDJSON frames"):
+    val runtime    = shortTempDirectory("dtc-framing-")
+    val hash       = "7123456789abcdef01234567"
+    val frameCount = 64
+    val control    = PreviewControlServer.open(
+      config = PreviewControlConfig(
+        runtimeDirectory = runtime,
+        workspaceHash = hash,
+        launchId = launchId,
+      ),
+      readyUrl = "http://127.0.0.1:4242",
+      onStop = () => (),
+      log = LogExchange.logger("preview-control-framing-test"),
+    )
+    val metadata = right(
+      PreviewControlMetadata.parse(
+        Files.readString(runtime.resolve(s"$hash.json")),
+      ),
+    )
+    val client = connect(metadata)
+    val start  = CountDownLatch(1)
+    val pool   = Executors.newFixedThreadPool(2)
+
+    try
+      write(
+        client,
+        request(
+          kind = "hello",
+          token = metadata.token,
+          requestId = "hello-framing",
+          clientId = "framing-client",
+          siteEvents = true,
+        ),
+      )
+      assert(read(client).contains("\"type\":\"ready\""))
+
+      val pings = pool.submit(
+        new Callable[Unit]:
+          override def call(): Unit =
+            start.await()
+            (1 to frameCount).foreach: index =>
+              write(
+                client,
+                request(
+                  kind = "ping",
+                  token = metadata.token,
+                  requestId = s"ping-$index",
+                  clientId = "framing-client",
+                ),
+              ),
+      )
+      val events = pool.submit(
+        new Callable[Unit]:
+          override def call(): Unit =
+            start.await()
+            (1 to frameCount).foreach(index => control.siteChanged(index + 1L)),
+      )
+      start.countDown()
+      pings.get(2L, TimeUnit.SECONDS)
+      events.get(2L, TimeUnit.SECONDS)
+
+      val frames = Vector.fill(frameCount * 2)(
+        right(PreviewControlJson.parse(read(client))),
+      )
+      val kinds = frames.flatMap(_.get("type"))
+      assertEquals(
+        kinds.count(_ == PreviewControlJson.Atom.Text("pong")),
+        frameCount,
+      )
+      assertEquals(
+        kinds.count(_ == PreviewControlJson.Atom.Text("siteChanged")),
+        frameCount,
+      )
+      val revisions = frames.flatMap: fields =>
+        fields
+          .get("revision")
+          .collect:
+            case PreviewControlJson.Atom.Number(value) => value
+      assertEquals(revisions, (2L to (frameCount + 1L)).toVector)
+    finally
+      client.close()
+      control.close()
+      pool.shutdownNow()
+      deleteTree(runtime)
+
   test("control channel authenticates, announces actual URL, and stops HTTP"):
     withSite: site =>
       val runtime  = shortTempDirectory("dtc-")
@@ -508,16 +1110,51 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         control.close()
         deleteTree(runtime)
 
-  private def request(kind: String, token: String, requestId: String): String =
+  private def request(
+      kind: String,
+      token: String,
+      requestId: String,
+      clientId: String = "suite-client",
+      siteEvents: Boolean = false,
+  ): String =
     PreviewControlJson.objectValue(
       Vector(
         "version"   -> "1",
         "type"      -> PreviewControlJson.quoted(kind),
         "token"     -> PreviewControlJson.quoted(token),
-        "clientId"  -> PreviewControlJson.quoted("suite-client"),
+        "clientId"  -> PreviewControlJson.quoted(clientId),
         "requestId" -> PreviewControlJson.quoted(requestId),
-      ),
+      ) ++ Option
+        .when(kind == "hello" && siteEvents)("siteEvents" -> "1")
+        .toVector,
     ) + "\n"
+
+  private def assertSiteChanged(
+      frame: String,
+      sessionId: String,
+      revision: Long,
+  ): Unit =
+    assertEquals(
+      PreviewControlJson.parse(frame),
+      Right(
+        Map(
+          "version"   -> PreviewControlJson.Atom.Number(1L),
+          "type"      -> PreviewControlJson.Atom.Text("siteChanged"),
+          "sessionId" -> PreviewControlJson.Atom.Text(sessionId),
+          "revision"  -> PreviewControlJson.Atom.Number(revision),
+        ),
+      ),
+    )
+
+  private def assertChannelClosed(channel: SocketChannel): Unit =
+    val executor = Executors.newSingleThreadExecutor()
+    try
+      val result = executor.submit(
+        new Callable[Int]:
+          override def call(): Int = channel.read(ByteBuffer.allocate(1)),
+      )
+      assertEquals(result.get(1L, TimeUnit.SECONDS), -1)
+    finally executor.shutdownNow(): Unit
 
   private def unixMetadataJson(address: String): String =
     PreviewControlJson.objectValue(

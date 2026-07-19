@@ -22,3 +22,5 @@ $ exec grep -Fq Scripted docs/index.md
 $ copy-file fixtures/broken-link.md docs/broken-link.md
 -> doctrellisBuild
 $ delete docs/broken-link.md
+> writeScriptedPluginVersion
+$ exec sh live-preview-test.sh scripted-plugin.version

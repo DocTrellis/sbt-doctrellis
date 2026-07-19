@@ -27,7 +27,13 @@ import java.nio.file.{
 import java.nio.file.attribute.{BasicFileAttributes, PosixFilePermissions}
 import java.security.{MessageDigest, SecureRandom}
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.{
+  CountDownLatch,
+  Executor,
+  Executors,
+  LinkedBlockingQueue,
+  TimeUnit,
+}
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.annotation.tailrec
@@ -157,16 +163,66 @@ private[sbtplugin] final case class PreviewControlMetadata(
     launchId: String,
     token: String,
 ):
-  def json: String =
+  def json: String = PreviewControlMetadata.json(this, Vector.empty)
+
+private[sbtplugin] object PreviewControlMetadata:
+  private val ProvisionalState  = "binding"
+  private val ProvisionalFields = Set(
+    "version",
+    "protocol",
+    "pid",
+    "sessionId",
+    "launchId",
+    "token",
+    "transport",
+    "host",
+    "port",
+    "state",
+  )
+
+  def parse(value: String): Either[String, PreviewControlMetadata] =
+    PreviewControlJson
+      .parse(value)
+      .flatMap(fields => parseFields(fields, port => port > 0 && port <= 65535))
+
+  def provisionalJson(metadata: PreviewControlMetadata): String =
+    json(
+      metadata,
+      Vector("state" -> PreviewControlJson.quoted(ProvisionalState)),
+    )
+
+  def parseProvisional(
+      value: String,
+  ): Either[String, PreviewControlMetadata] =
+    PreviewControlJson
+      .parse(value)
+      .flatMap: fields =>
+        for
+          _ <- check(
+            fields.keySet == ProvisionalFields,
+            "metadata is not a DocTrellis TCP binding record",
+          )
+          state <- string(fields, "state")
+          _     <- check(
+            state == ProvisionalState,
+            "metadata is not a DocTrellis TCP binding record",
+          )
+          metadata <- parseFields(fields, _ == 0)
+        yield metadata
+
+  private def json(
+      metadata: PreviewControlMetadata,
+      extraFields: Vector[(String, String)],
+  ): String =
     val common = Vector(
       "version"   -> "1",
       "protocol"  -> PreviewControlJson.quoted(PreviewControlConfig.Protocol),
-      "pid"       -> pid.toString,
-      "sessionId" -> PreviewControlJson.quoted(sessionId),
-      "launchId"  -> PreviewControlJson.quoted(launchId),
-      "token"     -> PreviewControlJson.quoted(token),
+      "pid"       -> metadata.pid.toString,
+      "sessionId" -> PreviewControlJson.quoted(metadata.sessionId),
+      "launchId"  -> PreviewControlJson.quoted(metadata.launchId),
+      "token"     -> PreviewControlJson.quoted(metadata.token),
     )
-    val transportFields = transport match
+    val transportFields = metadata.transport match
       case PreviewControlTransport.Unix(address) =>
         Vector(
           "transport" -> PreviewControlJson.quoted("unix"),
@@ -178,56 +234,55 @@ private[sbtplugin] final case class PreviewControlMetadata(
           "host"      -> PreviewControlJson.quoted(host),
           "port"      -> port.toString,
         )
-    PreviewControlJson.objectValue(common ++ transportFields)
+    PreviewControlJson.objectValue(common ++ transportFields ++ extraFields)
 
-private[sbtplugin] object PreviewControlMetadata:
-  def parse(value: String): Either[String, PreviewControlMetadata] =
-    PreviewControlJson
-      .parse(value)
-      .flatMap: fields =>
-        for
-          version <- integer(fields, "version")
-          _ <- check(version == 1, s"unsupported metadata version $version")
-          protocol <- string(fields, "protocol")
-          _        <- check(
-            protocol == PreviewControlConfig.Protocol,
-            s"unsupported metadata protocol '$protocol'",
-          )
-          pid       <- long(fields, "pid")
-          _         <- check(pid > 0L, "metadata pid must be positive")
-          sessionId <- string(fields, "sessionId")
-          _         <- check(sessionId.nonEmpty, "metadata sessionId is empty")
-          launchId  <- string(fields, "launchId")
-          _         <- check(launchId.nonEmpty, "metadata launchId is empty")
-          token     <- string(fields, "token")
-          _         <- check(token.length >= 32, "metadata token is too short")
-          kind      <- string(fields, "transport")
-          transport <- kind match
-            case "unix" =>
-              string(fields, "address")
-                .flatMap(unixAddress)
-                .map(PreviewControlTransport.Unix(_))
-            case "tcp" =>
-              for
-                host <- string(fields, "host")
-                port <- integer(fields, "port")
-                _    <- check(
-                  host == "127.0.0.1",
-                  "metadata TCP host is not loopback",
-                )
-                _ <- check(
-                  port > 0 && port <= 65535,
-                  "metadata TCP port is invalid",
-                )
-              yield PreviewControlTransport.Tcp(host, port)
-            case other => Left(s"unknown metadata transport '$other'")
-        yield PreviewControlMetadata(
-          transport = transport,
-          pid = pid,
-          sessionId = sessionId,
-          launchId = launchId,
-          token = token,
-        )
+  private def parseFields(
+      fields: Map[String, PreviewControlJson.Atom],
+      validTcpPort: Int => Boolean,
+  ): Either[String, PreviewControlMetadata] =
+    for
+      version  <- integer(fields, "version")
+      _        <- check(version == 1, s"unsupported metadata version $version")
+      protocol <- string(fields, "protocol")
+      _        <- check(
+        protocol == PreviewControlConfig.Protocol,
+        s"unsupported metadata protocol '$protocol'",
+      )
+      pid       <- long(fields, "pid")
+      _         <- check(pid > 0L, "metadata pid must be positive")
+      sessionId <- string(fields, "sessionId")
+      _         <- check(sessionId.nonEmpty, "metadata sessionId is empty")
+      launchId  <- string(fields, "launchId")
+      _         <- check(launchId.nonEmpty, "metadata launchId is empty")
+      token     <- string(fields, "token")
+      _         <- check(token.length >= 32, "metadata token is too short")
+      kind      <- string(fields, "transport")
+      transport <- kind match
+        case "unix" =>
+          string(fields, "address")
+            .flatMap(unixAddress)
+            .map(PreviewControlTransport.Unix(_))
+        case "tcp" =>
+          for
+            host <- string(fields, "host")
+            port <- integer(fields, "port")
+            _    <- check(
+              host == "127.0.0.1",
+              "metadata TCP host is not loopback",
+            )
+            _ <- check(
+              validTcpPort(port),
+              "metadata TCP port is invalid",
+            )
+          yield PreviewControlTransport.Tcp(host, port)
+        case other => Left(s"unknown metadata transport '$other'")
+    yield PreviewControlMetadata(
+      transport = transport,
+      pid = pid,
+      sessionId = sessionId,
+      launchId = launchId,
+      token = token,
+    )
 
   private def string(
       fields: Map[String, PreviewControlJson.Atom],
@@ -301,6 +356,8 @@ private[sbtplugin] final class PreviewControlServer private (
   private val closed           = AtomicBoolean(false)
   private val stopRequested    = AtomicBoolean(false)
   private val stopAcknowledged = CountDownLatch(1)
+  private val connectionsLock  = Object()
+  private val connections      = java.util.HashSet[Connection]()
 
   def start(): Unit =
     executor.execute(() => acceptLoop())
@@ -310,6 +367,14 @@ private[sbtplugin] final class PreviewControlServer private (
       unit: TimeUnit,
   ): Boolean =
     !stopRequested.get() || stopAcknowledged.await(timeout, unit)
+
+  def siteChanged(revision: Long): Unit =
+    if !closed.get() then
+      val message = PreviewControlProtocol.siteChanged(
+        sessionId = metadata.sessionId,
+        revision = revision,
+      )
+      connectionSnapshot().foreach(_.siteChanged(message))
 
   def close(): Unit =
     if closed.compareAndSet(false, true) then
@@ -324,7 +389,13 @@ private[sbtplugin] final class PreviewControlServer private (
               case Some(existing) => existing.addSuppressed(error)
 
       attempt(server.close())
+      connectionSnapshot().foreach(connection => attempt(connection.close()))
       attempt(executor.shutdownNow(): Unit)
+      attempt:
+        try
+          if !executor.awaitTermination(1L, TimeUnit.SECONDS) then
+            log.warn("DocTrellis IPC executor did not stop within one second.")
+        catch case _: InterruptedException => Thread.currentThread().interrupt()
       attempt(
         PreviewControlEndpoint.cleanupOwned(
           metadataPath = metadataPath,
@@ -338,14 +409,17 @@ private[sbtplugin] final class PreviewControlServer private (
   private def acceptLoop(): Unit =
     while !closed.get() do
       try
-        val client = server.accept()
-        try executor.execute(() => handle(client))
-        catch
-          case NonFatal(error) =>
-            try client.close()
-            catch
-              case NonFatal(cleanupError) => error.addSuppressed(cleanupError)
-            throw error
+        val client     = server.accept()
+        val connection = Connection(client)
+        if register(connection) then
+          try
+            connection.start()
+            executor.execute(() => handle(connection))
+          catch
+            case NonFatal(error) =>
+              connection.close()
+              throw error
+        else connection.close()
       catch
         case NonFatal(error) if !closed.get() =>
           log.warn(
@@ -364,17 +438,16 @@ private[sbtplugin] final class PreviewControlServer private (
                     )
         case NonFatal(_) => ()
 
-  private def handle(channel: SocketChannel): Unit =
-    val input   = Channels.newInputStream(channel)
-    val output  = Channels.newOutputStream(channel)
+  private def handle(connection: Connection): Unit =
+    val input   = Channels.newInputStream(connection.channel)
     val decoder = PreviewFrameDecoder(PreviewControlProtocol.MaxFrameBytes)
     var authenticatedClient = Option.empty[String]
     var keepReading         = true
+    var acknowledgeStop     = false
     val bytes               = Array.ofDim[Byte](2048)
 
     def send(message: String): Unit =
-      output.write(message.getBytes(StandardCharsets.UTF_8))
-      output.flush()
+      if !connection.send(message) then keepReading = false
 
     try
       while keepReading && !closed.get() do
@@ -404,6 +477,7 @@ private[sbtplugin] final class PreviewControlServer private (
                               token,
                               clientId,
                               requestId,
+                              siteEvents,
                             ) =>
                           if authenticatedClient.nonEmpty then
                             send(
@@ -426,7 +500,7 @@ private[sbtplugin] final class PreviewControlServer private (
                             keepReading = false
                           else
                             authenticatedClient = Some(clientId)
-                            send(
+                            val accepted = connection.acceptHello(
                               PreviewControlProtocol.ready(
                                 url = readyUrl,
                                 pid = metadata.pid,
@@ -434,7 +508,9 @@ private[sbtplugin] final class PreviewControlServer private (
                                 launchId = metadata.launchId,
                                 requestId = requestId,
                               ),
+                              siteEvents = siteEvents,
                             )
+                            if !accepted then keepReading = false
                         case PreviewControlRequest.Ping(_, _, requestId) =>
                           if authenticate(
                               request,
@@ -468,15 +544,77 @@ private[sbtplugin] final class PreviewControlServer private (
                                     requestId,
                                   ),
                                 )
-                            finally stopAcknowledged.countDown()
+                            acknowledgeStop = true
                             keepReading = false
     catch
       case NonFatal(error) if !closed.get() =>
         log.warn(s"DocTrellis IPC client ended: ${error.getMessage}")
       case NonFatal(_) => ()
     finally
-      try channel.close()
-      catch case NonFatal(_) => ()
+      val afterWrites =
+        if acknowledgeStop then () => stopAcknowledged.countDown()
+        else () => ()
+      if !connection.finish(afterWrites) && acknowledgeStop then
+        stopAcknowledged.countDown()
+
+  private def register(connection: Connection): Boolean =
+    connectionsLock.synchronized:
+      if closed.get() then false
+      else
+        connections.add(connection)
+        true
+
+  private def unregister(connection: Connection): Unit =
+    connectionsLock.synchronized(connections.remove(connection): Unit)
+
+  private def connectionSnapshot(): Vector[Connection] =
+    connectionsLock.synchronized:
+      val result   = Vector.newBuilder[Connection]
+      val iterator = connections.iterator()
+      while iterator.hasNext do result += iterator.next()
+      result.result()
+
+  private final class Connection(val channel: SocketChannel):
+    private val terminated = AtomicBoolean(false)
+    private val writer     = PreviewFrameWriter(
+      output = Channels.newOutputStream(channel),
+      executor = executor,
+      onFailure = error =>
+        if !closed.get() then
+          log.warn(s"DocTrellis IPC writer ended: ${error.getMessage}")
+        terminate()
+      ,
+      onTerminated = () => terminate(),
+    )
+    private val events = PreviewConnectionEvents(writer.send)
+
+    def start(): Unit = writer.start()
+
+    def send(message: String): Boolean = writer.send(message)
+
+    def acceptHello(message: String, siteEvents: Boolean): Boolean =
+      events.acceptHello(message, siteEvents)
+
+    def siteChanged(message: String): Unit = events.siteChanged(message)
+
+    def finish(afterWrites: () => Unit): Boolean = writer.finish(afterWrites)
+
+    def close(): Unit =
+      events.close()
+      writer.abort()
+      terminate()
+
+    private def terminate(): Unit =
+      if terminated.compareAndSet(false, true) then
+        events.close()
+        unregister(this)
+        try channel.close()
+        catch
+          case NonFatal(error) if !closed.get() =>
+            log.warn(
+              s"DocTrellis IPC connection could not close: ${error.getMessage}",
+            )
+          case NonFatal(_) => ()
 
   private def authenticate(
       request: PreviewControlRequest,
@@ -512,8 +650,9 @@ private[sbtplugin] object PreviewControlServer:
     val sessionId = UUID.randomUUID().toString
     val token     = randomToken()
     val pid       = ProcessHandle.current().pid()
-    val paths  = PreviewControlEndpoint.prepare(config, pid, sessionId, token)
-    var server = Option.empty[ServerSocketChannel]
+    val paths    = PreviewControlEndpoint.prepare(config, pid, sessionId, token)
+    var server   = Option.empty[ServerSocketChannel]
+    var executor = Option.empty[java.util.concurrent.ExecutorService]
     try
       val bound = paths.transport match
         case PreviewControlTransport.Unix(address) =>
@@ -544,14 +683,15 @@ private[sbtplugin] object PreviewControlServer:
         token = token,
       )
       PreviewControlEndpoint.publish(paths.metadataPath, metadata)
-      val executor = Executors.newCachedThreadPool(runnable =>
+      val connectionExecutor = Executors.newCachedThreadPool(runnable =>
         val thread = Thread(runnable, "doctrellis-preview-ipc")
         thread.setDaemon(true)
         thread,
       )
+      executor = Some(connectionExecutor)
       val control = PreviewControlServer(
         server = bound,
-        executor = executor,
+        executor = connectionExecutor,
         metadataPath = paths.metadataPath,
         socketPath = paths.socketPath,
         endpointLease = paths.lease,
@@ -569,6 +709,7 @@ private[sbtplugin] object PreviewControlServer:
           catch case NonFatal(cleanupError) => error.addSuppressed(cleanupError)
 
         cleanup(server.foreach(_.close()))
+        cleanup(executor.foreach(_.shutdownNow(): Unit))
         cleanup(
           PreviewControlEndpoint.cleanupOwned(
             metadataPath = paths.metadataPath,
@@ -634,6 +775,15 @@ private[sbtplugin] object PreviewControlEndpoint:
       sessionId: String,
       token: String,
   ): PreviewControlPaths =
+    prepare(config, pid, sessionId, token, isWindows)
+
+  def prepare(
+      config: PreviewControlConfig,
+      pid: Long,
+      sessionId: String,
+      token: String,
+      windows: Boolean,
+  ): PreviewControlPaths =
     Files.createDirectories(config.runtimeDirectory)
     verifyRuntimeDirectory(config)
     ownerOnly(config.runtimeDirectory, file = false)
@@ -641,10 +791,6 @@ private[sbtplugin] object PreviewControlEndpoint:
       config.runtimeDirectory.resolve(s"${config.workspaceHash}.json")
     val lockPath =
       config.runtimeDirectory.resolve(s"${config.workspaceHash}.lock")
-    val windows = System
-      .getProperty("os.name", "")
-      .toLowerCase(java.util.Locale.ROOT)
-      .contains("win")
     val socketPath = Option.unless(windows)(
       config.runtimeDirectory.resolve(
         s"${config.workspaceHash}.${PreviewControlConfig.shortHash(sessionId).take(16)}.sock",
@@ -668,7 +814,7 @@ private[sbtplugin] object PreviewControlEndpoint:
     val lease = PreviewEndpointLease.acquire(lockPath)
     try
       if Files.exists(metadataPath, LinkOption.NOFOLLOW_LINKS) then
-        val existing = readExisting(metadataPath)
+        val existing = readRecoverable(metadataPath)
         val decision = existing match
           case None           => StaleEndpointDecision.ProtectLive
           case Some(metadata) =>
@@ -689,14 +835,7 @@ private[sbtplugin] object PreviewControlEndpoint:
               .flatMap(staleSocket(config, _))
               .foreach(Files.deleteIfExists)
             Files.deleteIfExists(metadataPath): Unit
-      Files.writeString(
-        metadataPath,
-        provisional.json,
-        StandardCharsets.UTF_8,
-        StandardOpenOption.CREATE_NEW,
-        StandardOpenOption.WRITE,
-      )
-      ownerOnly(metadataPath, file = true)
+      publishProvisional(metadataPath, provisional)
       PreviewControlPaths(
         metadataPath = metadataPath,
         socketPath = socketPath,
@@ -734,7 +873,7 @@ private[sbtplugin] object PreviewControlEndpoint:
       socketPath: Option[Path],
       sessionId: String,
   ): Unit =
-    val owned = readExisting(metadataPath).exists(_.sessionId == sessionId)
+    val owned = readRecoverable(metadataPath).exists(_.sessionId == sessionId)
     if owned then
       socketPath.foreach(Files.deleteIfExists)
       Files.deleteIfExists(metadataPath): Unit
@@ -788,9 +927,45 @@ private[sbtplugin] object PreviewControlEndpoint:
         )(normalized)
       case PreviewControlTransport.Tcp(_, _) => None
 
-  private def readExisting(path: Path): Option[PreviewControlMetadata] =
-    try PreviewControlMetadata.parse(Files.readString(path)).toOption
+  private def readRecoverable(path: Path): Option[PreviewControlMetadata] =
+    try
+      val value = Files.readString(path)
+      PreviewControlMetadata.parse(value) match
+        case Right(metadata) => Some(metadata)
+        case Left(_) => PreviewControlMetadata.parseProvisional(value).toOption
     catch case NonFatal(_) => None
+
+  private def publishProvisional(
+      path: Path,
+      metadata: PreviewControlMetadata,
+  ): Unit =
+    val temporary =
+      path.resolveSibling(s".${path.getFileName}.${metadata.sessionId}.tmp")
+    val value = metadata.transport match
+      case PreviewControlTransport.Tcp(_, 0) =>
+        PreviewControlMetadata.provisionalJson(metadata)
+      case _ => metadata.json
+    try
+      Files.writeString(
+        temporary,
+        value,
+        StandardCharsets.UTF_8,
+        StandardOpenOption.CREATE_NEW,
+        StandardOpenOption.WRITE,
+      )
+      ownerOnly(temporary, file = true)
+      Files.move(
+        temporary,
+        path,
+        StandardCopyOption.ATOMIC_MOVE,
+      ): Unit
+    finally Files.deleteIfExists(temporary): Unit
+
+  private def isWindows: Boolean =
+    System
+      .getProperty("os.name", "")
+      .toLowerCase(java.util.Locale.ROOT)
+      .contains("win")
 
   private def canConnect(metadata: PreviewControlMetadata): Boolean =
     metadata.transport match
@@ -894,10 +1069,137 @@ private[sbtplugin] final class PreviewFrameDecoder(maxFrameBytes: Int):
         index += 1
       error.toLeft(frames.result())
 
+private[sbtplugin] final class PreviewFrameWriter(
+    output: java.io.OutputStream,
+    executor: Executor,
+    onFailure: Throwable => Unit,
+    onTerminated: () => Unit,
+):
+  import PreviewFrameWriter.Command
+
+  private val stateLock   = Object()
+  private val queue       = LinkedBlockingQueue[Command]()
+  private val aborted     = AtomicBoolean(false)
+  private val started     = AtomicBoolean(false)
+  private val completed   = AtomicBoolean(false)
+  private val terminated  = CountDownLatch(1)
+  private var accepting   = true
+  private var afterWrites = Option.empty[() => Unit]
+
+  def start(): Unit =
+    if !started.compareAndSet(false, true) then
+      throw IllegalStateException("DocTrellis IPC writer was already started.")
+    try executor.execute(() => writeLoop())
+    catch
+      case error: Throwable =>
+        stateLock.synchronized:
+          accepting = false
+        complete()
+        throw error
+
+  def send(message: String): Boolean =
+    stateLock.synchronized:
+      if accepting then
+        queue.add(Command.Frame(message))
+        true
+      else false
+
+  def finish(afterWrites: () => Unit = () => ()): Boolean =
+    stateLock.synchronized:
+      if accepting then
+        accepting = false
+        this.afterWrites = Some(afterWrites)
+        queue.add(Command.Finish)
+        true
+      else false
+
+  def abort(): Unit =
+    stateLock.synchronized:
+      aborted.set(true)
+      accepting = false
+      queue.clear()
+      queue.offer(Command.Finish)
+      (): Unit
+    if !started.get() then complete()
+
+  def awaitTermination(timeout: Long, unit: TimeUnit): Boolean =
+    terminated.await(timeout, unit)
+
+  private def writeLoop(): Unit =
+    var continue = true
+    try
+      while continue do
+        queue.take() match
+          case Command.Frame(message) =>
+            output.write(message.getBytes(StandardCharsets.UTF_8))
+            output.flush()
+          case Command.Finish => continue = false
+    catch
+      case _: InterruptedException => Thread.currentThread().interrupt()
+      case NonFatal(error)         =>
+        stopAccepting()
+        notifyFailure(error)
+    finally
+      stopAccepting()
+      complete()
+
+  private def stopAccepting(): Unit =
+    stateLock.synchronized:
+      accepting = false
+      queue.clear()
+
+  private def complete(): Unit =
+    if completed.compareAndSet(false, true) then
+      val finishCallback = stateLock.synchronized:
+        val callback = afterWrites
+        afterWrites = None
+        callback
+      try
+        try finishCallback.foreach(callback => callback())
+        catch case NonFatal(error) => notifyFailure(error)
+      finally
+        try onTerminated()
+        finally terminated.countDown()
+
+  private def notifyFailure(error: Throwable): Unit =
+    if !aborted.get() then
+      try onFailure(error)
+      catch case NonFatal(callbackError) => error.addSuppressed(callbackError)
+
+private object PreviewFrameWriter:
+  private enum Command:
+    case Frame(message: String)
+    case Finish
+
+private[sbtplugin] final class PreviewConnectionEvents(
+    send: String => Boolean,
+):
+  private val lock    = Object()
+  private var enabled = false
+
+  def acceptHello(message: String, siteEvents: Boolean): Boolean =
+    lock.synchronized:
+      val accepted = send(message)
+      if accepted then enabled = siteEvents
+      accepted
+
+  def siteChanged(message: String): Unit =
+    lock.synchronized:
+      if enabled then send(message): Unit
+
+  def close(): Unit =
+    lock.synchronized:
+      enabled = false
+
 private[sbtplugin] enum PreviewControlRequest:
   def token: String
   def clientId: String
-  case Hello(token: String, clientId: String, requestId: String)
+  case Hello(
+      token: String,
+      clientId: String,
+      requestId: String,
+      siteEvents: Boolean,
+  )
   case Ping(token: String, clientId: String, requestId: String)
   case Stop(token: String, clientId: String, requestId: String)
 
@@ -917,7 +1219,14 @@ private[sbtplugin] object PreviewControlProtocol:
           request <- nonEmpty(fields, "requestId")
           message <- kind match
             case "hello" =>
-              Right(PreviewControlRequest.Hello(token, client, request))
+              Right(
+                PreviewControlRequest.Hello(
+                  token,
+                  client,
+                  request,
+                  siteEvents(fields),
+                ),
+              )
             case "ping" =>
               Right(PreviewControlRequest.Ping(token, client, request))
             case "stop" =>
@@ -951,6 +1260,16 @@ private[sbtplugin] object PreviewControlProtocol:
 
   def stopped(requestId: String): String =
     response(kind = "stopped", requestId = requestId, extra = Vector.empty)
+
+  def siteChanged(sessionId: String, revision: Long): String =
+    PreviewControlJson.objectValue(
+      Vector(
+        "version"   -> "1",
+        "type"      -> PreviewControlJson.quoted("siteChanged"),
+        "sessionId" -> PreviewControlJson.quoted(sessionId),
+        "revision"  -> revision.toString,
+      ),
+    ) + "\n"
 
   def error(code: String, message: String, requestId: String): String =
     response(
@@ -1029,6 +1348,13 @@ private[sbtplugin] object PreviewControlProtocol:
     fields.get(name) match
       case Some(PreviewControlJson.Atom.Number(value)) => Right(value)
       case _ => Left(s"IPC field '$name' must be an integer")
+
+  private def siteEvents(
+      fields: Map[String, PreviewControlJson.Atom],
+  ): Boolean =
+    fields
+      .get("siteEvents")
+      .contains(PreviewControlJson.Atom.Number(1L))
 
   private def check(
       condition: Boolean,

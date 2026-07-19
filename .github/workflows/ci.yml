@@ -57,7 +57,9 @@ jobs:
       - name: Verify the local preview server
         shell: bash
         run: |
-          cd examples/basic
+          preview_workspace="$(mktemp -d)"
+          cp -R examples/basic/. "$preview_workspace"
+          cd "$preview_workspace"
           setsid sbt --server --batch doctrellisPreview > /tmp/doctrellis-preview.log 2>&1 &
           preview_pid=$!
           preview_group="-$preview_pid"
@@ -100,6 +102,26 @@ jobs:
           fi
 
           if ! grep -F 'DocTrellis Basic Example' /tmp/doctrellis-preview.html; then
+            cat /tmp/doctrellis-preview.log
+            exit 1
+          fi
+
+          live_marker='LIVE PREVIEW REBUILD VERIFIED'
+          printf '\n%s\n' "$live_marker" >> docs/checklist.md
+          rebuilt=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent http://127.0.0.1:4242/checklist.html > /tmp/doctrellis-preview-rebuilt.html 2>/dev/null &&
+              grep -Fq "$live_marker" /tmp/doctrellis-preview-rebuilt.html; then
+              rebuilt=true
+              break
+            fi
+            if ! kill -0 -- "$preview_group" 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$rebuilt" != true ]; then
             cat /tmp/doctrellis-preview.log
             exit 1
           fi

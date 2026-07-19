@@ -2,19 +2,11 @@ package org.doctrellis.sbtplugin
 
 import java.io.IOException
 import java.net.{BindException, InetSocketAddress}
-import java.nio.file.Path
 import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import scala.util.control.NonFatal
 
-import cats.effect.IO as CatsIO
-import cats.effect.unsafe.implicits.global
-
-import laika.api.Transformer
-import laika.format.{HTML, Markdown}
-import laika.helium.Helium
-import laika.io.syntax.*
 import mdoc.MdocPlugin
 import mdoc.MdocPlugin.autoImport.*
 import sbt.*
@@ -22,14 +14,11 @@ import sbt.Keys.*
 
 object DocTrellisPlugin extends AutoPlugin:
 
-  private val processMdoc = taskKey[Unit](
-    "Process DocTrellis Markdown with the mdoc programmatic API",
-  )
-  private val renderSite = taskKey[Unit](
-    "Render the processed DocTrellis Markdown with Laika",
-  )
   private val resolveLayout = taskKey[DocTrellisLayout](
     "Resolve and verify the DocTrellis source and generated directories",
+  )
+  private val resolveBuildProgram = taskKey[DocTrellisBuildProgram](
+    "Resolve the immutable inputs used by a DocTrellis build",
   )
 
   object autoImport:
@@ -47,7 +36,9 @@ object DocTrellisPlugin extends AutoPlugin:
       "Run mdoc, then render the result to HTML with Laika and Helium",
     )
     val doctrellisPreview =
-      taskKey[Unit]("Build the documentation and serve it until interrupted")
+      taskKey[Unit](
+        "Build the documentation, watch sources, rebuild on changes, and serve it until interrupted",
+      )
 
   import autoImport.*
 
@@ -72,165 +63,154 @@ object DocTrellisPlugin extends AutoPlugin:
         )
         .fold(problem => sys.error(problem.message), identity)
     },
-    processMdoc := Def.uncached {
-      val layout = resolveLayout.value
-      val log    = streams.value.log
-      sbt.IO.delete(layout.mdocDirectory.toFile)
-      sbt.IO.createDirectory(layout.mdocDirectory.toFile)
-      log.info(
-        s"DocTrellis: running mdoc from ${layout.sourceDirectory}",
-      )
+    resolveBuildProgram := Def.uncached {
+      val layout    = resolveLayout.value
+      val log       = streams.value.log
       val converter = fileConverter.value
       val classpath = (Compile / fullClasspath).value.map(entry =>
         converter.toPath(entry.data),
       )
-      MdocProcessor.process(
-        layout,
-        classpath,
-        (Compile / scalacOptions).value,
-        mdocExtraArguments.value,
-        mdocVariables.value,
-        log.info,
-        log.warn,
+      DocTrellisBuildProgram(
+        DocTrellisBuildInputs(
+          layout = layout,
+          classpath = classpath.toVector,
+          scalacOptions = (Compile / scalacOptions).value.toVector,
+          mdocArguments = mdocExtraArguments.value.toVector,
+          mdocVariables = mdocVariables.value,
+          log = log,
+        ),
       )
-    },
-    renderSite := Def.uncached {
-      val layout = resolveLayout.value
-      val log    = streams.value.log
-
-      sbt.IO.delete(layout.siteDirectory.toFile)
-      sbt.IO.createDirectory(layout.siteDirectory.toFile)
-      log.info(
-        s"DocTrellis: rendering HTML with Laika and the Helium theme into ${layout.siteDirectory}",
-      )
-      val rendered = try
-        Transformer
-          .from(Markdown)
-          .to(HTML)
-          .using(Markdown.GitHubFlavor, GfmTaskLists)
-          .parallel[CatsIO]
-          .withTheme(
-            Helium.defaults.site.inlineCSS(GfmTaskLists.themeCSS).build,
-          )
-          .build
-          .use(
-            _.fromDirectory(layout.mdocDirectory.toString)
-              .toDirectory(layout.siteDirectory.toString)
-              .transform,
-          )
-          .unsafeRunSync()
-      catch
-        case NonFatal(error) =>
-          throw IllegalStateException(
-            s"DocTrellis Laika rendering failed: ${error.getMessage}",
-            error,
-          )
-
-      log.info(
-        s"DocTrellis: Laika rendered ${rendered.allDocuments.map(_.path).mkString(", ")}",
-      )
-
-      val index = layout.siteDirectory.resolve("index.html")
-      if !index.toFile.isFile then
-        sys.error(
-          s"DocTrellis did not generate an index page at $index",
-        )
-      log.success(s"DocTrellis site generated at ${layout.siteDirectory}")
-      ()
     },
     doctrellisBuild := Def.uncached {
-      Def
-        .sequential(
-          processMdoc,
-          renderSite,
-        )
-        .value
+      val program = resolveBuildProgram.value
+      program.buildPublic()
     },
     doctrellisPreview := Def.uncached {
-      doctrellisBuild.value
-      val layout = resolveLayout.value
-      val host   = doctrellisHost.value
-      val port   = doctrellisPort.value
-      val log    = streams.value.log
+      val program = resolveBuildProgram.value
+      val host    = doctrellisHost.value
+      val port    = doctrellisPort.value
+      val log     = streams.value.log
 
-      try
+      PreviewExecution.run(host, port):
         PreviewServer.serve(
-          layout.siteDirectory,
-          layout.workspaceDirectory,
+          program,
           host,
           port,
           log,
         )
-      catch
-        case error: BindException =>
-          throw IllegalStateException(
-            s"DocTrellis preview could not bind to $host:$port; the port may already be in use: ${error.getMessage}",
-            error,
-          )
-        case error: IOException =>
-          throw IllegalStateException(
-            s"DocTrellis preview server failed at http://$host:$port: ${error.getMessage}",
-            error,
-          )
     },
   )
 
+private[sbtplugin] object PreviewExecution:
+  def run(host: String, port: Int)(serve: => Unit): Unit =
+    try serve
+    catch
+      case failure: PreviewHttpBindFailure =>
+        val error = failure.cause
+        throw IllegalStateException(
+          s"DocTrellis preview could not bind to $host:$port; the port may already be in use: ${error.getMessage}",
+          error,
+        )
+      case error: IOException =>
+        throw IllegalStateException(
+          s"DocTrellis preview failed while starting or running: ${error.getMessage}",
+          error,
+        )
+
 private[sbtplugin] object PreviewServer:
   def serve(
-      root: Path,
-      workspace: Path,
+      buildProgram: DocTrellisBuildProgram,
       host: String,
       port: Int,
       log: Logger,
   ): Unit =
-    val controlConfig = PreviewControlConfig.fromEnvironment(workspace, sys.env)
+    val layout        = buildProgram.layout
+    val controlConfig = PreviewControlConfig.fromEnvironment(
+      layout.workspaceDirectory,
+      sys.env,
+    )
     PreviewHost.requireCompatible(host, controlConfig.nonEmpty)
-    val binding = PreviewHttpBinding.start(root, host, port)
-    val stopped = CountDownLatch(1)
-
-    val shutdown = PreviewServerShutdown(
-      stopServer = () => binding.stopServer(),
-      stopExecutor = () => binding.stopExecutor(),
-      signalStopped = () => stopped.countDown(),
-    )
-
-    val control = AtomicReference[PreviewControlServer]()
-
-    val shutdownHook = Thread(
-      () =>
-        var failure = Option.empty[Throwable]
-
-        def attempt(action: => Unit): Unit =
-          try action
-          catch
-            case NonFatal(error) =>
-              failure match
-                case None           => failure = Some(error)
-                case Some(existing) => existing.addSuppressed(error)
-
-        attempt(shutdown.stop())
-        attempt(Option(control.get()).foreach(_.close()))
-        failure.foreach(throw _)
-      ,
-      "doctrellis-preview-shutdown",
-    )
-
-    java.lang.Runtime.getRuntime.addShutdownHook(shutdownHook)
-    var primaryFailure = Option.empty[Throwable]
+    val mailbox         = BlockingPreviewEventMailbox()
+    val publication     = PreviewPublication.open(layout, log)
+    var watcher         = Option.empty[PreviewSourceWatcher]
+    var binding         = Option.empty[PreviewHttpBinding]
+    var shutdown        = Option.empty[PreviewServerShutdown]
+    val control         = AtomicReference[PreviewControlServer]()
+    val cleanupComplete = PreviewCleanupCompletion()
+    var shutdownHook    = Option.empty[Thread]
+    var primaryFailure  = Option.empty[Throwable]
     try
+      val openedWatcher = PreviewSourceWatcher.open(
+        layout.sourceDirectory,
+        mailbox,
+      )
+      watcher = Some(openedWatcher)
+      val openedBinding = PreviewStartup.startServing(
+        initialBuild = () => publication.buildAndPublish(buildProgram.build),
+        ensureWatcherHealthy = () => mailbox.throwIfWatcherFailed(),
+        startServing = () =>
+          PreviewHttpBinding.start(
+            layout.siteDirectory,
+            host,
+            port,
+            publication.lock,
+          ),
+      )
+      binding = Some(openedBinding)
+      val openedShutdown = PreviewServerShutdown(
+        stopServer = () => openedBinding.stopServer(),
+        stopExecutor = () => openedBinding.stopExecutor(),
+        signalStopped = () => mailbox.stop(),
+      )
+      shutdown = Some(openedShutdown)
+
+      val hook = Thread(
+        () =>
+          var failure = Option.empty[Throwable]
+
+          def attempt(action: => Unit): Unit =
+            try action
+            catch
+              case NonFatal(error) =>
+                failure match
+                  case None           => failure = Some(error)
+                  case Some(existing) => existing.addSuppressed(error)
+
+          attempt(openedShutdown.stop())
+          attempt(Option(control.get()).foreach(_.close()))
+          attempt(openedWatcher.close())
+          attempt:
+            if !cleanupComplete.await(30L, TimeUnit.SECONDS) then
+              log.warn(
+                "DocTrellis preview cleanup did not finish within 30 seconds of JVM shutdown.",
+              )
+          failure.foreach(throw _)
+        ,
+        "doctrellis-preview-shutdown",
+      )
+      java.lang.Runtime.getRuntime.addShutdownHook(hook)
+      shutdownHook = Some(hook)
+
       controlConfig
         .map(config =>
           PreviewControlServer.open(
             config = config,
-            readyUrl = binding.url,
-            onStop = () => shutdown.stop(),
+            readyUrl = openedBinding.url,
+            onStop = () => openedShutdown.stop(),
             log = log,
           ),
         )
         .foreach(control.set)
-      log.success(s"DocTrellis preview ready at ${binding.url}")
+      log.success(s"DocTrellis preview ready at ${openedBinding.url}")
       log.info("Press Ctrl+C to stop the preview server.")
-      stopped.await()
+      PreviewRebuildLoop.run(
+        mailbox = mailbox,
+        quietPeriodNanos = PreviewRebuildLoop.QuietPeriodNanos,
+        rebuild = () => publication.buildAndPublish(buildProgram.build),
+        onPublished =
+          revision => Option(control.get()).foreach(_.siteChanged(revision)),
+        log = log,
+      )
     catch
       case _: InterruptedException => Thread.currentThread().interrupt()
       case error: Throwable        =>
@@ -256,15 +236,49 @@ private[sbtplugin] object PreviewServer:
           ),
         )
         cleanup(currentControl.foreach(_.close()))
-        cleanup(shutdown.stop())
+        cleanup(shutdown.foreach(_.stop()))
+        if shutdown.isEmpty then
+          cleanup(binding.foreach(_.stopServer()))
+          cleanup(binding.foreach(_.stopExecutor()))
+        cleanup(watcher.foreach(_.close()))
+        cleanup(publication.close())
         if restoreInterrupt then Thread.currentThread().interrupt()
         cleanupFailure.foreach: error =>
           primaryFailure match
             case Some(primary) => primary.addSuppressed(error)
             case None          => throw error
       finally
-        try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook): Unit
-        catch case _: IllegalStateException => ()
+        cleanupComplete.complete()
+        shutdownHook.foreach: hook =>
+          try java.lang.Runtime.getRuntime.removeShutdownHook(hook): Unit
+          catch case _: IllegalStateException => ()
+
+private[sbtplugin] object PreviewStartup:
+  def startServing[A](
+      initialBuild: () => Long,
+      ensureWatcherHealthy: () => Unit,
+      startServing: () => A,
+  ): A =
+    val initialRevision = initialBuild()
+    if initialRevision != 1L then
+      throw IllegalStateException(
+        s"DocTrellis initial publication had unexpected revision $initialRevision.",
+      )
+    ensureWatcherHealthy()
+    try startServing()
+    catch case error: BindException => throw PreviewHttpBindFailure(error)
+
+private[sbtplugin] final class PreviewHttpBindFailure(
+    val cause: BindException,
+) extends RuntimeException(cause)
+
+private[sbtplugin] final class PreviewCleanupCompletion:
+  private val completed = CountDownLatch(1)
+
+  def complete(): Unit = completed.countDown()
+
+  def await(timeout: Long, unit: TimeUnit): Boolean =
+    completed.await(timeout, unit)
 
 private[sbtplugin] object PreviewHost:
   def requireCompatible(host: String, controlEnabled: Boolean): Unit =
@@ -286,7 +300,12 @@ private[sbtplugin] final class PreviewHttpBinding private (
     executor.shutdownNow(): Unit
 
 private[sbtplugin] object PreviewHttpBinding:
-  def start(root: Path, host: String, port: Int): PreviewHttpBinding =
+  def start(
+      root: java.nio.file.Path,
+      host: String,
+      port: Int,
+      publicationLock: PreviewPublicationLock = PreviewPublicationLock(),
+  ): PreviewHttpBinding =
     val executor = Executors.newCachedThreadPool()
     var server   = Option.empty[com.sun.net.httpserver.HttpServer]
     try
@@ -295,7 +314,7 @@ private[sbtplugin] object PreviewHttpBinding:
         0,
       )
       server = Some(created)
-      created.createContext("/", StaticSiteHandler(root))
+      created.createContext("/", StaticSiteHandler(root, publicationLock))
       created.setExecutor(executor)
       created.start()
       val actualPort = created.getAddress.getPort
