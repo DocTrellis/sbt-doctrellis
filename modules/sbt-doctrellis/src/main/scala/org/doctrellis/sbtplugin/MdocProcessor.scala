@@ -37,9 +37,9 @@ private[sbtplugin] object MdocProcessor:
       val paths = list(source)
       paths.foreach: input =>
         val target = output.resolve(source.relativize(input))
-        if Files.isDirectory(input) then Files.createDirectories(target)
+        if Files.isDirectory(input) then Files.createDirectories(target): Unit
         else if Files.isRegularFile(input) then
-          Files.createDirectories(target.getParent)
+          Files.createDirectories(target.getParent): Unit
           if isMarkdown(input) then
             evaluate(
               engine,
@@ -50,7 +50,8 @@ private[sbtplugin] object MdocProcessor:
               info,
               warn,
             )
-          else Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING)
+          else
+            Files.copy(input, target, StandardCopyOption.REPLACE_EXISTING): Unit
       info(
         s"DocTrellis: mdoc processed ${paths.count(isMarkdown)} Markdown file(s)",
       )
@@ -109,7 +110,7 @@ private[sbtplugin] object MdocProcessor:
         .mkString("\n")
       sys.error(s"DocTrellis mdoc processing failed:\n$rendered")
 
-    Files.writeString(output, result.content(), StandardCharsets.UTF_8)
+    Files.writeString(output, result.content(), StandardCharsets.UTF_8): Unit
 
 private final class IsolatedMdocClassLoader(
     urls: Array[URL],

@@ -224,13 +224,13 @@ private[infrastructure] object WorkspaceChannel:
                 ),
               ),
             )
-        socket.once("connect", connected)
-        socket.once("error", failed)
+        socket.once("connect", connected): Unit
+        socket.once("error", failed): Unit
         Some(
           IO.delay:
             settled = true
-            socket.off("connect", connected)
-            socket.off("error", failed)
+            socket.off("connect", connected): Unit
+            socket.off("error", failed): Unit
             socket.destroy(),
         )
 
@@ -584,7 +584,6 @@ private[infrastructure] final class WorkspaceChannelConnection private (
     socket: NodeSocket,
     metadata: WorkspaceChannelMetadata,
     clientId: String,
-    helloRequestId: String,
     readyResult: Deferred[IO, Either[Throwable, PreviewUrl]],
     pongResult: Deferred[IO, Either[Throwable, Unit]],
     terminalResult: Deferred[IO, ProcessExit],
@@ -645,10 +644,10 @@ private[infrastructure] final class WorkspaceChannelConnection private (
     val problem = IllegalStateException("workspace IPC connection closed")
     IO.delay:
       val ignoreError: js.Function1[js.Any, Unit] = _ => ()
-      socket.on("error", ignoreError)
-      socket.off("data", listeners.data)
-      socket.off("error", listeners.error)
-      socket.off("close", listeners.close)
+      socket.on("error", ignoreError): Unit
+      socket.off("data", listeners.data): Unit
+      socket.off("error", listeners.error): Unit
+      socket.off("close", listeners.close): Unit
       socket.destroy()
     *> readyResult.complete(Left(problem)).void
       *> pongResult.complete(Left(problem)).void
@@ -775,10 +774,10 @@ private[infrastructure] object WorkspaceChannelConnection:
         close = close,
       )
       _ <- IO.delay:
-        socket.setEncoding("utf8")
-        socket.on("data", data)
-        socket.on("error", error)
-        socket.once("close", close)
+        socket.setEncoding("utf8"): Unit
+        socket.on("data", data): Unit
+        socket.on("error", error): Unit
+        socket.once("close", close): Unit
         socket.write(
           WorkspaceChannelProtocol.hello(
             token = metadata.token,
@@ -790,7 +789,6 @@ private[infrastructure] object WorkspaceChannelConnection:
       socket = socket,
       metadata = metadata,
       clientId = clientId,
-      helloRequestId = helloRequestId,
       readyResult = ready,
       pongResult = pong,
       terminalResult = terminal,

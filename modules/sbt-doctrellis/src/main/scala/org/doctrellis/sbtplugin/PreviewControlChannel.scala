@@ -324,7 +324,7 @@ private[sbtplugin] final class PreviewControlServer private (
               case Some(existing) => existing.addSuppressed(error)
 
       attempt(server.close())
-      attempt(executor.shutdownNow())
+      attempt(executor.shutdownNow(): Unit)
       attempt(
         PreviewControlEndpoint.cleanupOwned(
           metadataPath = metadataPath,
@@ -683,7 +683,7 @@ private[sbtplugin] object PreviewControlEndpoint:
             existing
               .flatMap(staleSocket(config, _))
               .foreach(Files.deleteIfExists)
-            Files.deleteIfExists(metadataPath)
+            Files.deleteIfExists(metadataPath): Unit
       Files.writeString(
         metadataPath,
         provisional.json,
@@ -721,8 +721,8 @@ private[sbtplugin] object PreviewControlEndpoint:
         path,
         StandardCopyOption.ATOMIC_MOVE,
         StandardCopyOption.REPLACE_EXISTING,
-      )
-    finally Files.deleteIfExists(temporary)
+      ): Unit
+    finally Files.deleteIfExists(temporary): Unit
 
   def cleanupOwned(
       metadataPath: Path,
@@ -732,13 +732,13 @@ private[sbtplugin] object PreviewControlEndpoint:
     val owned = readExisting(metadataPath).exists(_.sessionId == sessionId)
     if owned then
       socketPath.foreach(Files.deleteIfExists)
-      Files.deleteIfExists(metadataPath)
+      Files.deleteIfExists(metadataPath): Unit
 
   def ownerOnly(path: Path, file: Boolean): Unit =
     val permissions =
       if file then PosixFilePermissions.fromString("rw-------")
       else PosixFilePermissions.fromString("rwx------")
-    try Files.setPosixFilePermissions(path, permissions)
+    try Files.setPosixFilePermissions(path, permissions): Unit
     catch case _: UnsupportedOperationException => ()
 
   private def verifyRuntimeDirectory(config: PreviewControlConfig): Unit =

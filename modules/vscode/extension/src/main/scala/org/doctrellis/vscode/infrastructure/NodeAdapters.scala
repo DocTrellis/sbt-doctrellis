@@ -157,7 +157,7 @@ private[infrastructure] object NodeProcess:
                 s"[$workspaceName] Preview process spawn failed: ${errorMessage(raw)}\n",
               ).handleError(_ => ()),
             )
-          child.once("error", reportError)
+          child.once("error", reportError): Unit
           throw IllegalStateException(
             s"${command.executable.value} did not start with an owned process ID.",
           )
@@ -188,10 +188,10 @@ private[infrastructure] object NodeProcess:
           val exit = ProcessExit(number(code), string(signal), processError)
           dispatcher.unsafeRunAndForget(closed.complete(exit).void)
 
-        child.stdout.on("data", stdout)
-        child.stderr.on("data", stderr)
-        child.once("error", error)
-        child.once("close", close)
+        child.stdout.on("data", stdout): Unit
+        child.stderr.on("data", stderr): Unit
+        child.once("error", error): Unit
+        child.once("close", close): Unit
         ProcessHandle(
           process = process,
           closed = closed,
@@ -303,15 +303,15 @@ private[infrastructure] final case class OwnedProcess(
                   ),
                 ),
               )
-        task.once("error", error)
-        task.once("close", close)
+        task.once("error", error): Unit
+        task.once("close", close): Unit
         Some(
           IO.delay:
             val cancellationError: js.Function1[js.Any, Unit] = _ => ()
-            task.once("error", cancellationError)
-            task.off("error", error)
-            task.off("close", close)
-            if !NodeProcess.terminal(task) then task.kill("SIGKILL")
+            task.once("error", cancellationError): Unit
+            task.off("error", error): Unit
+            task.off("close", close): Unit
+            if !NodeProcess.terminal(task) then task.kill("SIGKILL"): Unit
           .void
             .handleError(_ => ()),
         )
@@ -477,10 +477,10 @@ private final case class ProcessHandle(
   private def detach: IO[Unit] =
     IO.delay:
       val child = process.child
-      child.stdout.off("data", stdoutListener)
-      child.stderr.off("data", stderrListener)
-      child.off("error", errorListener)
-      child.off("close", closeListener)
+      child.stdout.off("data", stdoutListener): Unit
+      child.stderr.off("data", stderrListener): Unit
+      child.off("error", errorListener): Unit
+      child.off("close", closeListener): Unit
 
 private[infrastructure] object NodeHttpProbe:
   def ready(url: PreviewUrl): IO[Boolean] =
@@ -508,7 +508,7 @@ private[infrastructure] object NodeHttpProbe:
           if url.value.startsWith("https://") then
             NodeHttps.get(url.value, responseListener)
           else NodeHttp.get(url.value, responseListener)
-        active.once("error", errorListener)
+        active.once("error", errorListener): Unit
 
         Some:
           IO
@@ -516,7 +516,7 @@ private[infrastructure] object NodeHttpProbe:
               val cancellationErrorListener: js.Function1[js.Any, Unit] =
                 _ => ()
               completed = true
-              active.once("error", cancellationErrorListener)
-              active.off("response", responseListener)
+              active.once("error", cancellationErrorListener): Unit
+              active.off("response", responseListener): Unit
               active.destroy()
             .handleError(_ => ())

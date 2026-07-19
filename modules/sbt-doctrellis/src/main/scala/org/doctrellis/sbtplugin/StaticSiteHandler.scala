@@ -33,7 +33,7 @@ private[sbtplugin] final class StaticSiteHandler private (root: Path)
           else
             exchange.sendResponseHeaders(200, size)
             val output = exchange.getResponseBody
-            try Files.copy(file, output)
+            try Files.copy(file, output): Unit
             finally output.close()
         case _ => sendText(exchange, 404, "Not Found")
 

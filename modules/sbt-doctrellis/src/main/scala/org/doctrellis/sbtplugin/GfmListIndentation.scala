@@ -55,7 +55,7 @@ private[sbtplugin] object GfmListIndentation:
 
     def containingItem(indentation: Int): Option[ListItemContext] =
       while stack.lastOption.exists(indentation < _.contentIndent) do
-        stack.remove(stack.length - 1)
+        stack.remove(stack.length - 1): Unit
       stack.lastOption.filter(indentation >= _.contentIndent)
 
     def editContinuation(line: SourceLine, index: Int): Unit =

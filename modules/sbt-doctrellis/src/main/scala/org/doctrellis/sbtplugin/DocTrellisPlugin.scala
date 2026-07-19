@@ -258,7 +258,7 @@ private[sbtplugin] object PreviewServer:
             case Some(primary) => primary.addSuppressed(error)
             case None          => throw error
       finally
-        try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook)
+        try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook): Unit
         catch case _: IllegalStateException => ()
 
 private[sbtplugin] object PreviewHost:
@@ -276,7 +276,9 @@ private[sbtplugin] final class PreviewHttpBinding private (
 ):
   def stopServer(): Unit = server.stop(0)
 
-  def stopExecutor(): Unit = executor.shutdownNow()
+  def stopExecutor(): Unit =
+    // Preview shutdown has no queued work that can be handed to another owner.
+    executor.shutdownNow(): Unit
 
 private[sbtplugin] object PreviewHttpBinding:
   def start(root: Path, host: String, port: Int): PreviewHttpBinding =
