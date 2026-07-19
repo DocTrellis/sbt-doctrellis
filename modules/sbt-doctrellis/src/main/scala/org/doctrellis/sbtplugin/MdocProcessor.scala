@@ -11,9 +11,7 @@ import scala.util.control.NonFatal
 
 private[sbtplugin] object MdocProcessor:
   def process(
-      source: Path,
-      output: Path,
-      workingDirectory: Path,
+      layout: DocTrellisLayout,
       classpath: Seq[Path],
       scalacOptions: Seq[String],
       settings: Seq[String],
@@ -21,15 +19,15 @@ private[sbtplugin] object MdocProcessor:
       info: String => Unit,
       warn: String => Unit,
   ): Unit =
-    if !Files.isDirectory(source) then
-      sys.error(s"DocTrellis source directory does not exist: $source")
+    val source = layout.sourceDirectory
+    val output = layout.mdocDirectory
 
     val loader = IsolatedMdocClassLoader(
       classpath.map(_.toUri.toURL).toArray,
       classOf[Mdoc].getClassLoader,
     )
     val engine = load(loader)
-      .withWorkingDirectory(workingDirectory)
+      .withWorkingDirectory(layout.workspaceDirectory)
       .withClasspath(classpath.asJava)
       .withScalacOptions(scalacOptions.asJava)
       .withSettings(settings.asJava)

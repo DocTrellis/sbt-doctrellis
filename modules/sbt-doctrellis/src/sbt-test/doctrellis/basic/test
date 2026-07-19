@@ -14,6 +14,11 @@ $ exec grep -Fq 'pipeline unchecked' target/doctrellis/site/index.html
 $ exec grep -Fq 'uppercase checked' target/doctrellis/site/index.html
 $ exec grep -Fq 'checked="checked" aria-label="Completed task"> uppercase checked' target/doctrellis/site/index.html
 $ exec grep -Fq 'href="https://doctrellis.org"' target/doctrellis/site/index.html
+> set doctrellisMdocDirectory := doctrellisSourceDirectory.value
+-> doctrellisBuild
+$ exists docs/index.md
+$ exec grep -Fq Scripted docs/index.md
+> session clear
 $ copy-file fixtures/broken-link.md docs/broken-link.md
 -> doctrellisBuild
 $ delete docs/broken-link.md

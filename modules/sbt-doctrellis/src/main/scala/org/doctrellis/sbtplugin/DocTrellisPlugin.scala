@@ -26,6 +26,9 @@ object DocTrellisPlugin extends AutoPlugin:
   private val renderSite = taskKey[Unit](
     "Render the processed DocTrellis Markdown with Laika",
   )
+  private val resolveLayout = taskKey[DocTrellisLayout](
+    "Resolve and verify the DocTrellis source and generated directories",
+  )
 
   object autoImport:
     val doctrellisSourceDirectory =
@@ -57,21 +60,30 @@ object DocTrellisPlugin extends AutoPlugin:
     doctrellisPort := 4242,
     mdocIn         := doctrellisSourceDirectory.value,
     mdocOut        := doctrellisMdocDirectory.value,
-    processMdoc    := Def.uncached {
-      val source        = doctrellisSourceDirectory.value
-      val mdocDirectory = doctrellisMdocDirectory.value
-      val log           = streams.value.log
-      sbt.IO.delete(mdocDirectory)
-      sbt.IO.createDirectory(mdocDirectory)
-      log.info(s"DocTrellis: running mdoc from ${source.getAbsolutePath}")
+    resolveLayout  := Def.uncached {
+      DocTrellisLayout
+        .parse(
+          workspaceDirectory = baseDirectory.value.toPath,
+          sourceDirectory = doctrellisSourceDirectory.value.toPath,
+          mdocDirectory = doctrellisMdocDirectory.value.toPath,
+          siteDirectory = doctrellisOutputDirectory.value.toPath,
+        )
+        .fold(problem => sys.error(problem.message), identity)
+    },
+    processMdoc := Def.uncached {
+      val layout = resolveLayout.value
+      val log    = streams.value.log
+      sbt.IO.delete(layout.mdocDirectory.toFile)
+      sbt.IO.createDirectory(layout.mdocDirectory.toFile)
+      log.info(
+        s"DocTrellis: running mdoc from ${layout.sourceDirectory}",
+      )
       val converter = fileConverter.value
       val classpath = (Compile / fullClasspath).value.map(entry =>
         converter.toPath(entry.data),
       )
       MdocProcessor.process(
-        source.toPath,
-        mdocDirectory.toPath,
-        baseDirectory.value.toPath,
+        layout,
         classpath,
         (Compile / scalacOptions).value,
         mdocExtraArguments.value,
@@ -81,14 +93,13 @@ object DocTrellisPlugin extends AutoPlugin:
       )
     },
     renderSite := Def.uncached {
-      val mdocDirectory = doctrellisMdocDirectory.value
-      val output        = doctrellisOutputDirectory.value
-      val log           = streams.value.log
+      val layout = resolveLayout.value
+      val log    = streams.value.log
 
-      sbt.IO.delete(output)
-      sbt.IO.createDirectory(output)
+      sbt.IO.delete(layout.siteDirectory.toFile)
+      sbt.IO.createDirectory(layout.siteDirectory.toFile)
       log.info(
-        s"DocTrellis: rendering HTML with Laika and the Helium theme into ${output.getAbsolutePath}",
+        s"DocTrellis: rendering HTML with Laika and the Helium theme into ${layout.siteDirectory}",
       )
       val rendered = try
         Transformer
@@ -101,8 +112,8 @@ object DocTrellisPlugin extends AutoPlugin:
           )
           .build
           .use(
-            _.fromDirectory(mdocDirectory.getAbsolutePath)
-              .toDirectory(output.getAbsolutePath)
+            _.fromDirectory(layout.mdocDirectory.toString)
+              .toDirectory(layout.siteDirectory.toString)
               .transform,
           )
           .unsafeRunSync()
@@ -114,12 +125,12 @@ object DocTrellisPlugin extends AutoPlugin:
         s"DocTrellis: Laika rendered ${rendered.allDocuments.map(_.path).mkString(", ")}",
       )
 
-      val index = output / "index.html"
-      if !index.isFile then
+      val index = layout.siteDirectory.resolve("index.html")
+      if !index.toFile.isFile then
         sys.error(
-          s"DocTrellis did not generate an index page at ${index.getAbsolutePath}",
+          s"DocTrellis did not generate an index page at $index",
         )
-      log.success(s"DocTrellis site generated at ${output.getAbsolutePath}")
+      log.success(s"DocTrellis site generated at ${layout.siteDirectory}")
       ()
     },
     doctrellisBuild := Def.uncached {
@@ -132,13 +143,19 @@ object DocTrellisPlugin extends AutoPlugin:
     },
     doctrellisPreview := Def.uncached {
       doctrellisBuild.value
-      val site      = doctrellisOutputDirectory.value
-      val workspace = baseDirectory.value
-      val host      = doctrellisHost.value
-      val port      = doctrellisPort.value
-      val log       = streams.value.log
+      val layout = resolveLayout.value
+      val host   = doctrellisHost.value
+      val port   = doctrellisPort.value
+      val log    = streams.value.log
 
-      try PreviewServer.serve(site.toPath, workspace.toPath, host, port, log)
+      try
+        PreviewServer.serve(
+          layout.siteDirectory,
+          layout.workspaceDirectory,
+          host,
+          port,
+          log,
+        )
       catch
         case error: BindException =>
           sys.error(
