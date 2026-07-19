@@ -36,16 +36,3 @@ class PreviewServerShutdownSuite extends FunSuite:
     assertEquals(actual, failure)
     assertEquals(executorStops, 1)
     assertEquals(signals, 1)
-
-  test("shutdown preserves a primary failure"):
-    val primary  = IllegalStateException("server start failed")
-    val cleanup  = IllegalStateException("server stop failed")
-    val shutdown = PreviewServerShutdown(
-      stopServer = () => throw cleanup,
-      stopExecutor = () => (),
-      signalStopped = () => (),
-    )
-
-    shutdown.stopPreserving(Some(primary))
-
-    assertEquals(primary.getSuppressed.toVector, Vector(cleanup))

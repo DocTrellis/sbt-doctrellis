@@ -16,7 +16,7 @@ private[vscode] object ExtensionRuntime:
       ports = PreviewPorts[IO](
         load = NodeConfig.load,
         policy = VscodePreferences.load,
-        launch = NodeProcess.launch(dispatcher, output.append),
+        launch = WorkspacePreview.launch(dispatcher, output.append),
         probe = NodeHttpProbe.ready,
         show = panels.show,
         update = panels.update,

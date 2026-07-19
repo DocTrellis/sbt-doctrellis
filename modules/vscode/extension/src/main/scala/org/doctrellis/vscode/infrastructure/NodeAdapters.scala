@@ -43,12 +43,44 @@ private[infrastructure] object NodeProcess:
       dispatcher = dispatcher,
       append = append,
       timeouts = ProcessShutdownTimeouts.default,
+      environment = Map.empty,
+    )(workspace, command)
+
+  def launchWithEnvironment(
+      dispatcher: Dispatcher[IO],
+      append: String => IO[Unit],
+      environment: Map[String, String],
+  )(
+      workspace: Workspace,
+      command: PreviewCommand,
+  ): Resource[IO, RunningProcess[IO]] =
+    launchWithTimeouts(
+      dispatcher = dispatcher,
+      append = append,
+      timeouts = ProcessShutdownTimeouts.default,
+      environment = environment,
     )(workspace, command)
 
   private[infrastructure] def launchWithTimeouts(
       dispatcher: Dispatcher[IO],
       append: String => IO[Unit],
       timeouts: ProcessShutdownTimeouts,
+  )(
+      workspace: Workspace,
+      command: PreviewCommand,
+  ): Resource[IO, RunningProcess[IO]] =
+    launchWithTimeouts(
+      dispatcher = dispatcher,
+      append = append,
+      timeouts = timeouts,
+      environment = Map.empty,
+    )(workspace, command)
+
+  private def launchWithTimeouts(
+      dispatcher: Dispatcher[IO],
+      append: String => IO[Unit],
+      timeouts: ProcessShutdownTimeouts,
+      environment: Map[String, String],
   )(
       workspace: Workspace,
       command: PreviewCommand,
@@ -60,7 +92,7 @@ private[infrastructure] object NodeProcess:
     Resource.eval(announce) *>
       Resource
         .make(
-          spawn(command, dispatcher, append, workspace.name),
+          spawn(command, dispatcher, append, workspace.name, environment),
         )(emergencyStop)
         .flatMap: process =>
           Resource
@@ -84,18 +116,27 @@ private[infrastructure] object NodeProcess:
       dispatcher: Dispatcher[IO],
       append: String => IO[Unit],
       workspaceName: String,
+      environment: Map[String, String],
   ): IO[OwnedProcess] =
     IO.delay:
       val platform = ProcessPlatform.parse(NodeRuntime.platform)
-      val child    = NodeChildProcess.spawn(
+      val options  = js.Dynamic.literal(
+        cwd = command.workingDirectory.value,
+        detached = platform == ProcessPlatform.Posix,
+        shell = false,
+        windowsHide = true,
+      )
+      if environment.nonEmpty then
+        val variables = js.Dictionary.empty[String]
+        NodeRuntime.env.foreach: (name, value) =>
+          value.toOption.foreach(actual => variables.update(name, actual))
+        environment.foreach: (name, value) =>
+          variables.update(name, value)
+        options.updateDynamic("env")(variables)
+      val child = NodeChildProcess.spawn(
         command.executable.value,
         command.arguments.map(_.value).toJSArray,
-        js.Dynamic.literal(
-          cwd = command.workingDirectory.value,
-          detached = platform == ProcessPlatform.Posix,
-          shell = false,
-          windowsHide = true,
-        ),
+        options,
       )
       child.pid.toOption.filter(_ > 0) match
         case Some(pid) =>

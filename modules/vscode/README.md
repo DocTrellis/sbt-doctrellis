@@ -16,18 +16,31 @@ are available through **DocTrellis: Show Output**.
 
 The extension is currently packaged for local installation only and is not published to the VS Code Marketplace.
 
-For sbt 2 workspaces, configure the version 1 preview arguments as
-`["--server", "--batch", "doctrellisPreview"]`. This keeps the foreground
+For sbt 2 workspaces, prefer schema version 2 with arguments
+`["--server", "--batch", "set doctrellisPort := 0", "doctrellisPreview"]`
+and endpoint protocol `doctrellis-preview-v1`. The plugin binds HTTP to
+`127.0.0.1:0` and announces the actual positive URL over an authenticated
+per-workspace control channel. This keeps the foreground
 preview JVM in the process tree started by the extension. Stop first requests a
 graceful shutdown and then, only after a bounded timeout, forces that exact
 owned group on POSIX or PID tree on Windows. Workspace removal and extension
 deactivation use the same cleanup path. Existing version 1 argument vectors
 remain valid and are never rewritten.
 
+Version 1 remains the fixed-URL compatibility mode and continues to poll its
+configured URL. Version 2 has no duplicate `url` field. Unix hosts use a
+current-user-owned, non-symlinked runtime directory and a short session-unique
+domain socket; Windows uses a token-authenticated loopback channel. IPC remains
+on the extension host in Remote SSH and Dev Containers, while only HTTP goes
+through `asExternalUri`. A second window can observe and reuse a live workspace
+URL after correlated ready and ping responses, but holds a read-only lease and
+does not stop the process owned by the first window.
+
 On Windows, set `command` to a native executable such as an `sbt.exe`
 package-manager shim or its absolute path. The extension deliberately uses
 direct process spawning, so `.bat` and `.cmd` launchers are not passed through
-a shell. Keep the same `--server --batch doctrellisPreview` argument vector.
+a shell. Keep the same foreground argument vector, including the version 2
+`set doctrellisPort := 0` command when dynamic announcement is used.
 The native launcher must remain the foreground tree root. If it detaches and
 disappears before Windows can address its tree, cleanup fails explicitly rather
 than guessing at unrelated processes by name or port.

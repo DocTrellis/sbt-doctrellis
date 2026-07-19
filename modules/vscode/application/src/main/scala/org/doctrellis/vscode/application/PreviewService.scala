@@ -7,7 +7,20 @@ import cats.effect.syntax.all.*
 import cats.syntax.all.*
 import org.doctrellis.vscode.domain.*
 
-final case class RunningProcess[F[_]](awaitExit: F[ProcessExit])
+final case class RunningProcess[F[_]](
+    awaitExit: F[ProcessExit],
+    announcedUrl: Option[F[PreviewUrl]],
+)
+
+object RunningProcess:
+  def apply[F[_]](awaitExit: F[ProcessExit]): RunningProcess[F] =
+    RunningProcess(awaitExit = awaitExit, announcedUrl = None)
+
+  def announced[F[_]](
+      awaitExit: F[ProcessExit],
+      awaitUrl: F[PreviewUrl],
+  ): RunningProcess[F] =
+    RunningProcess(awaitExit = awaitExit, announcedUrl = Some(awaitUrl))
 
 final case class PreviewPorts[F[_]](
     load: Workspace => F[PreviewCommand],
@@ -24,19 +37,24 @@ final case class PreviewPorts[F[_]](
 sealed abstract class PreviewFailure(message: String)
     extends RuntimeException(message)
 
-final case class PreviewTimedOut(url: PreviewUrl, timeout: StartupTimeout)
+final case class PreviewTimedOut(target: String, timeout: StartupTimeout)
     extends PreviewFailure(
-      s"Timed out after ${timeout.duration.toMillis} ms waiting for ${url.value}.",
+      s"Timed out after ${timeout.duration.toMillis} ms waiting for $target.",
     )
 
-final case class PreviewExited(url: PreviewUrl, exit: ProcessExit)
+final case class PreviewExited(target: String, exit: ProcessExit)
     extends PreviewFailure(
-      s"Preview process exited before ${url.value} became ready (${exit.render}).",
+      s"Preview process exited before $target became ready (${exit.render}).",
     )
 
-final case class PreviewStoppedDuringStartup(url: PreviewUrl)
+final case class PreviewStoppedDuringStartup(target: String)
     extends PreviewFailure(
-      s"Preview startup for ${url.value} was stopped before it became ready.",
+      s"Preview startup for $target was stopped before it became ready.",
+    )
+
+final case class DynamicPreviewNotStarted(workspace: String)
+    extends PreviewFailure(
+      s"Start the dynamic DocTrellis preview for $workspace before opening it.",
     )
 
 final class PreviewService[F[_]] private (
@@ -61,7 +79,7 @@ final class PreviewService[F[_]] private (
     F.uncancelable: _ =>
       selectForStop(workspace.key).flatMap:
         case Some(session) =>
-          val stopped = PreviewStoppedDuringStartup(session.command.url)
+          val stopped = PreviewStoppedDuringStartup(session.target)
           session.ready.complete(Left(stopped)).void *>
             session.close *>
             removeAndStopView(workspace, session)
@@ -79,40 +97,59 @@ final class PreviewService[F[_]] private (
       _.get(workspace.key) match
         case Some(session) =>
           session.status.get.flatMap: initial =>
-            showView(workspace, sessionView(session, initial)) *>
+            session.view(initial).flatMap(showView(workspace, _)) *>
               convergeOpen(workspace, session, initial)
         case None =>
           ports
             .load(workspace)
             .flatMap: command =>
-              ports
-                .probe(command.url)
-                .flatMap: ready =>
-                  val state =
-                    if ready then PreviewViewState.Ready(command.url)
-                    else PreviewViewState.Stopped
-                  showView(workspace, state)
+              command.endpoint match
+                case PreviewEndpoint.Fixed(url) =>
+                  ports
+                    .probe(url)
+                    .flatMap: ready =>
+                      val state =
+                        if ready then PreviewViewState.Ready(url)
+                        else PreviewViewState.Stopped
+                      showView(workspace, state)
+                case PreviewEndpoint.Announced =>
+                  val failure = DynamicPreviewNotStarted(workspace.name)
+                  showView(
+                    workspace,
+                    PreviewViewState.Failed(failure.getMessage),
+                  ) *> ports.info(failure.getMessage)
 
   def openExternal(workspace: Workspace): F[Unit] =
     sessions.get.flatMap:
       _.get(workspace.key) match
-        case Some(session) => ports.openExternal(session.command.url)
-        case None          =>
+        case Some(session) =>
+          session.actualUrl.get.flatMap:
+            case Some(url) => ports.openExternal(url)
+            case None      =>
+              session.command.endpoint match
+                case PreviewEndpoint.Fixed(url) => ports.openExternal(url)
+                case PreviewEndpoint.Announced  =>
+                  F.raiseError(DynamicPreviewNotStarted(workspace.name))
+        case None =>
           ports
             .load(workspace)
-            .flatMap(command => ports.openExternal(command.url))
+            .flatMap:
+              _.endpoint match
+                case PreviewEndpoint.Fixed(url) => ports.openExternal(url)
+                case PreviewEndpoint.Announced  =>
+                  F.raiseError(DynamicPreviewNotStarted(workspace.name))
 
   def stopAll: F[Unit] =
     F.uncancelable: _ =>
       selectAllForStop.flatMap: selected =>
         selected.traverse_(session =>
-          val stopped = PreviewStoppedDuringStartup(session.command.url)
+          val stopped = PreviewStoppedDuringStartup(session.target)
           (session.ready.complete(Left(stopped)).void *>
             session.close *>
             removeAndStopView(session.workspace, session))
             .handleErrorWith(error =>
               report(
-                s"Failed to stop preview at ${session.command.url.value}: ${message(error)}",
+                s"Failed to stop preview at ${session.target}: ${message(error)}",
               ),
             ),
         )
@@ -198,9 +235,10 @@ final class PreviewService[F[_]] private (
       .flatMap:
         case (running, release) =>
           for
-            status <- Ref.of[F, PreviewStatus](PreviewStatus.Starting)
-            ready  <- Deferred[F, Either[Throwable, Unit]]
-            closer <- SessionCloser.create(release)
+            status    <- Ref.of[F, PreviewStatus](PreviewStatus.Starting)
+            ready     <- Deferred[F, Either[Throwable, PreviewUrl]]
+            actualUrl <- Ref.of[F, Option[PreviewUrl]](None)
+            closer    <- SessionCloser.create(release)
           yield PreviewSession(
             workspace = workspace,
             command = command,
@@ -208,6 +246,7 @@ final class PreviewService[F[_]] private (
             running = running,
             status = status,
             ready = ready,
+            actualUrl = actualUrl,
             closer = closer,
           )
 
@@ -215,14 +254,14 @@ final class PreviewService[F[_]] private (
       workspace: Workspace,
       session: PreviewSession[F],
   ): F[Unit] =
-    val startup = awaitReady(session.command, session.policy).attempt
+    val startup = awaitReady(session).attempt
       .race(session.running.awaitExit.attempt)
     startup
       .flatMap:
-        case Left(Right(_))     => onReady(workspace, session)
+        case Left(Right(url))   => onReady(workspace, session, url)
         case Left(Left(error))  => failStartup(workspace, session, error)
         case Right(Right(exit)) =>
-          val failure = PreviewExited(session.command.url, exit)
+          val failure = PreviewExited(session.target, exit)
           failStartup(workspace, session, failure)
         case Right(Left(error)) => failStartup(workspace, session, error)
 
@@ -241,38 +280,42 @@ final class PreviewService[F[_]] private (
   private def onReady(
       workspace: Workspace,
       session: PreviewSession[F],
+      url: PreviewUrl,
   ): F[Unit] =
-    session.status
-      .modify:
-        case PreviewStatus.Stopping => PreviewStatus.Stopping -> false
-        case _                      => PreviewStatus.Ready    -> true
-      .flatMap:
-        case false =>
-          session.ready
-            .complete(Left(PreviewStoppedDuringStartup(session.command.url)))
-            .void
-        case true =>
-          ports
-            .info(s"DocTrellis preview is ready for ${workspace.name}.")
-            .attempt
-            .void *>
-            displayReady(workspace, session).flatMap: displayed =>
-              session.status.get.flatMap:
-                case PreviewStatus.Ready =>
-                  session.ready.complete(Right(())).void *>
-                    F.whenA(displayed)(continueReadySession(workspace, session))
-                case PreviewStatus.Stopping =>
-                  session.ready
-                    .complete(
-                      Left(PreviewStoppedDuringStartup(session.command.url)),
-                    )
-                    .void
-                case PreviewStatus.Starting | PreviewStatus.Terminal(_) =>
-                  session.ready
-                    .complete(
-                      Left(PreviewStoppedDuringStartup(session.command.url)),
-                    )
-                    .void
+    session.actualUrl.set(Some(url)) *>
+      session.status
+        .modify:
+          case PreviewStatus.Stopping => PreviewStatus.Stopping -> false
+          case _                      => PreviewStatus.Ready    -> true
+        .flatMap:
+          case false =>
+            session.ready
+              .complete(Left(PreviewStoppedDuringStartup(session.target)))
+              .void
+          case true =>
+            ports
+              .info(s"DocTrellis preview is ready for ${workspace.name}.")
+              .attempt
+              .void *>
+              displayReady(workspace, session, url).flatMap: displayed =>
+                session.status.get.flatMap:
+                  case PreviewStatus.Ready =>
+                    session.ready.complete(Right(url)).void *>
+                      F.whenA(displayed)(
+                        continueReadySession(workspace, session),
+                      )
+                  case PreviewStatus.Stopping =>
+                    session.ready
+                      .complete(
+                        Left(PreviewStoppedDuringStartup(session.target)),
+                      )
+                      .void
+                  case PreviewStatus.Starting | PreviewStatus.Terminal(_) =>
+                    session.ready
+                      .complete(
+                        Left(PreviewStoppedDuringStartup(session.target)),
+                      )
+                      .void
 
   private def continueReadySession(
       workspace: Workspace,
@@ -360,21 +403,36 @@ final class PreviewService[F[_]] private (
                 updateView(workspace, PreviewViewState.Stopped).as(false)
       case _ => F.pure(displayed)
 
-  private def awaitReady(
-      command: PreviewCommand,
-      policy: PreviewPolicy,
-  ): F[Unit] =
-    def loop: F[Unit] =
+  private def awaitReady(session: PreviewSession[F]): F[PreviewUrl] =
+    def loop(url: PreviewUrl): F[PreviewUrl] =
       ports
-        .probe(command.url)
+        .probe(url)
         .flatMap:
-          case true  => F.unit
-          case false => F.sleep(policy.pollInterval.duration) *> loop
+          case true  => F.pure(url)
+          case false =>
+            F.sleep(session.policy.pollInterval.duration) *> loop(url)
 
-    loop.timeoutTo(
-      command.startupTimeout.duration,
-      F.raiseError(PreviewTimedOut(command.url, command.startupTimeout)),
-    )
+    announcedUrl(session)
+      .flatMap(loop)
+      .timeoutTo(
+        session.command.startupTimeout.duration,
+        F.raiseError(
+          PreviewTimedOut(session.target, session.command.startupTimeout),
+        ),
+      )
+
+  private def announcedUrl(session: PreviewSession[F]): F[PreviewUrl] =
+    session.command.endpoint match
+      case PreviewEndpoint.Fixed(url) => F.pure(url)
+      case PreviewEndpoint.Announced  =>
+        session.running.announcedUrl match
+          case Some(awaitUrl) => awaitUrl
+          case None           =>
+            F.raiseError(
+              IllegalStateException(
+                "The dynamic preview process did not provide an IPC announcement.",
+              ),
+            )
 
   private def removeExact(
       key: String,
@@ -416,15 +474,6 @@ final class PreviewService[F[_]] private (
           case None    => updateView(workspace, PreviewViewState.Stopped)
           case Some(_) => F.unit
 
-  private def sessionView(
-      session: PreviewSession[F],
-      status: PreviewStatus,
-  ): PreviewViewState = status match
-    case PreviewStatus.Starting => PreviewViewState.Starting
-    case PreviewStatus.Ready    => PreviewViewState.Ready(session.command.url)
-    case PreviewStatus.Stopping => PreviewViewState.Stopped
-    case PreviewStatus.Terminal(terminal) => terminal.viewState
-
   private def convergeOpen(
       workspace: Workspace,
       session: PreviewSession[F],
@@ -436,12 +485,13 @@ final class PreviewService[F[_]] private (
           case Some(actual) if actual.eq(session) =>
             session.status.get.flatMap: current =>
               F.whenA(current != initial):
-                updateView(workspace, sessionView(session, current))
+                session.view(current).flatMap(updateView(workspace, _))
           case _ => F.unit
 
   private def displayReady(
       workspace: Workspace,
       session: PreviewSession[F],
+      url: PreviewUrl,
   ): F[Boolean] =
     val current = mutex.lock.surround:
       sessions.get.flatMap:
@@ -453,12 +503,12 @@ final class PreviewService[F[_]] private (
       if session.policy.openWhenReady then
         showView(
           workspace,
-          PreviewViewState.Ready(session.command.url),
+          PreviewViewState.Ready(url),
         )
       else
         updateView(
           workspace,
-          PreviewViewState.Ready(session.command.url),
+          PreviewViewState.Ready(url),
         )
 
     current.flatMap:
@@ -476,15 +526,21 @@ final class PreviewService[F[_]] private (
             session.status.get.flatMap:
               case PreviewStatus.Ready => F.pure(true)
               case current             =>
-                updateView(workspace, sessionView(session, current)).as(false)
+                session
+                  .view(current)
+                  .flatMap(updateView(workspace, _))
+                  .as(false)
           case Some(actual) =>
             actual.status.get.flatMap: current =>
-              updateView(workspace, sessionView(actual, current)).as(false)
+              actual.view(current).flatMap(updateView(workspace, _)).as(false)
           case None =>
             session.status.get.flatMap:
               case PreviewStatus.Ready => F.pure(false)
               case current             =>
-                updateView(workspace, sessionView(session, current)).as(false)
+                session
+                  .view(current)
+                  .flatMap(updateView(workspace, _))
+                  .as(false)
 
   private def updateStoppedIfCurrent(
       workspace: Workspace,
@@ -525,11 +581,27 @@ private final case class PreviewSession[F[_]](
     policy: PreviewPolicy,
     running: RunningProcess[F],
     status: Ref[F, PreviewStatus],
-    ready: Deferred[F, Either[Throwable, Unit]],
+    ready: Deferred[F, Either[Throwable, PreviewUrl]],
+    actualUrl: Ref[F, Option[PreviewUrl]],
     closer: SessionCloser[F],
 ):
   def awaitReady(using F: Temporal[F]): F[Unit] =
-    ready.get.flatMap(_.liftTo[F])
+    ready.get.flatMap(_.liftTo[F]).void
+
+  def target: String = command.endpoint.description
+
+  def view(status: PreviewStatus)(using F: Temporal[F]): F[PreviewViewState] =
+    status match
+      case PreviewStatus.Starting => F.pure(PreviewViewState.Starting)
+      case PreviewStatus.Ready    =>
+        actualUrl.get.map:
+          case Some(url) => PreviewViewState.Ready(url)
+          case None      =>
+            PreviewViewState.Failed(
+              "The preview became ready without an announced URL.",
+            )
+      case PreviewStatus.Stopping           => F.pure(PreviewViewState.Stopped)
+      case PreviewStatus.Terminal(terminal) => F.pure(terminal.viewState)
 
   def close: F[Unit] = closer.close
 

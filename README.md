@@ -95,6 +95,10 @@ Or build and serve the site at `http://127.0.0.1:4242` with:
 sbt doctrellisPreview
 ```
 
+`doctrellisPort` still defaults to `4242` for direct CLI use. Setting it to
+`0` asks the operating system to choose and bind a free port atomically; the
+server reports the positive port returned by its bound address.
+
 ### GFM task lists
 
 DocTrellis supports GitHub Flavored Markdown task markers in unordered,
@@ -147,12 +151,20 @@ Create `.doctrellis.json` at each workspace folder root:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "preview": {
     "command": "sbt",
-    "args": ["--server", "--batch", "doctrellisPreview"],
+    "args": [
+      "--server",
+      "--batch",
+      "set doctrellisPort := 0",
+      "doctrellisPreview"
+    ],
     "workingDirectory": ".",
-    "url": "http://127.0.0.1:4242",
+    "endpoint": {
+      "source": "ipc",
+      "protocol": "doctrellis-preview-v1"
+    },
     "startupTimeoutMs": 90000
   }
 }
@@ -161,15 +173,20 @@ Create `.doctrellis.json` at each workspace folder root:
 `command` is spawned directly with `args`; it is never assembled into a shell
 string. `workingDirectory` is relative to the selected workspace folder and is
 resolved before use, including a check that symlinks do not escape the
-workspace. The extension accepts schema version 1 only and reports malformed,
-missing, and unexpected fields before starting a process.
+workspace. Version 2 receives the actual positive HTTP URL from a project-keyed
+IPC control channel, then probes and displays that URL. It never finds a free
+port and closes it before server startup. Malformed, missing, unexpected, and
+version-incompatible fields are rejected before process launch.
 
 For sbt 2, keep `--server` and `--batch` in the configured argument vector as
-shown above. This foreground form keeps the preview JVM in the exact process
+shown above. Version 2 additionally sets `doctrellisPort := 0`; arbitrary
+commands are still passed verbatim. This foreground form keeps the preview JVM in the exact process
 tree owned by the extension, so Stop, workspace close, and deactivation can
 terminate it and wait for the HTTP listener to close. Existing version 1
 configurations remain valid and commands are always used verbatim; the
 extension never inserts sbt-specific arguments into arbitrary executables.
+Version 1 fixed-URL configurations remain supported without migration and
+continue polling their configured URL.
 On Windows, `command` must resolve to a native executable such as an
 `sbt.exe` package-manager shim (or its absolute path). Node intentionally does
 not invoke a shell, so `.bat` and `.cmd` launchers are not directly executable;
@@ -199,6 +216,20 @@ panel across repeated opens and restarts, and shows stopped, startup-failure,
 or unexpected-exit status without closing the tab. Preview HTTP URLs pass
 through VS Code's remote URI resolver before they enter either the Webview
 iframe or the explicit external-browser command.
+
+For version 2, the Preview JVM owns an authenticated local control channel.
+macOS and Linux use a Unix-domain socket; Windows uses a token-authenticated
+loopback control socket as the JDK-portable named-pipe equivalent. Endpoint
+metadata and sockets live in a current-user-only temporary directory under a
+short hash of the canonical workspace path, never in the project. POSIX
+runtimes verify that this directory is a real directory owned by the current
+UID. A per-workspace file lock serializes ownership and stale cleanup, while
+session-unique socket names keep one cleanup attempt from unlinking another
+session. IPC stays on the Remote SSH or Dev Container extension host; only the
+announced HTTP URL is passed to `asExternalUri`. A second VS Code window may
+reuse the existing URL under a read-only lease after a correlated ready and
+ping response. Only the window that spawned the process stops it on folder
+close or deactivation; the observing window merely releases its connection.
 
 ## Develop and verify
 

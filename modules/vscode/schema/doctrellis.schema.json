@@ -1,48 +1,90 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://doctrellis.org/schema/v1/doctrellis.schema.json",
+  "$id": "https://doctrellis.org/schema/doctrellis.schema.json",
   "title": "DocTrellis workspace configuration",
   "description": "Configures the local preview process launched by the DocTrellis VS Code extension.",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["version", "preview"],
-  "properties": {
-    "version": {
-      "description": "DocTrellis configuration schema version.",
-      "const": 1
+  "oneOf": [
+    {
+      "title": "Version 1 fixed URL",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "preview"],
+      "properties": {
+        "version": { "const": 1 },
+        "preview": { "$ref": "#/$defs/fixedPreview" }
+      }
     },
-    "preview": {
+    {
+      "title": "Version 2 IPC-announced URL",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "preview"],
+      "properties": {
+        "version": { "const": 2 },
+        "preview": { "$ref": "#/$defs/announcedPreview" }
+      }
+    }
+  ],
+  "$defs": {
+    "command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Native executable to spawn directly. This is not interpreted as a shell string; Windows .bat and .cmd launchers require a native executable shim."
+    },
+    "args": {
+      "type": "array",
+      "description": "Arguments passed directly and verbatim to the executable.",
+      "items": { "type": "string" }
+    },
+    "workingDirectory": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Directory relative to the workspace folder. It must remain inside that folder."
+    },
+    "startupTimeoutMs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600000,
+      "description": "Maximum time to wait for the preview to become ready."
+    },
+    "fixedPreview": {
       "type": "object",
       "additionalProperties": false,
       "required": ["command", "args", "workingDirectory", "url", "startupTimeoutMs"],
       "properties": {
-        "command": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Native executable to spawn directly. This is not interpreted as a shell string; Windows .bat and .cmd launchers require a native executable shim."
-        },
-        "args": {
-          "type": "array",
-          "description": "Arguments passed directly to the executable. For sbt 2 previews, use [\"--server\", \"--batch\", \"doctrellisPreview\"] so the extension owns the foreground JVM.",
-          "items": { "type": "string" }
-        },
-        "workingDirectory": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Directory relative to the workspace folder. It must remain inside that folder."
-        },
+        "command": { "$ref": "#/$defs/command" },
+        "args": { "$ref": "#/$defs/args" },
+        "workingDirectory": { "$ref": "#/$defs/workingDirectory" },
         "url": {
           "type": "string",
           "format": "uri",
           "pattern": "^https?://",
-          "description": "HTTP(S) URL polled until a 2xx or 3xx response is available."
+          "description": "Fixed HTTP(S) URL polled until a 2xx or 3xx response is available."
         },
-        "startupTimeoutMs": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 600000,
-          "description": "Maximum time to wait for the preview URL."
-        }
+        "startupTimeoutMs": { "$ref": "#/$defs/startupTimeoutMs" }
+      }
+    },
+    "announcedPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "args", "workingDirectory", "endpoint", "startupTimeoutMs"],
+      "properties": {
+        "command": { "$ref": "#/$defs/command" },
+        "args": {
+          "allOf": [{ "$ref": "#/$defs/args" }],
+          "description": "Arguments passed verbatim. For sbt 2 use [\"--server\", \"--batch\", \"set doctrellisPort := 0\", \"doctrellisPreview\"]."
+        },
+        "workingDirectory": { "$ref": "#/$defs/workingDirectory" },
+        "endpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source", "protocol"],
+          "properties": {
+            "source": { "const": "ipc" },
+            "protocol": { "const": "doctrellis-preview-v1" }
+          }
+        },
+        "startupTimeoutMs": { "$ref": "#/$defs/startupTimeoutMs" }
       }
     }
   }

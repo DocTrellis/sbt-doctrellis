@@ -17,6 +17,7 @@ class ModelSuite extends munit.FunSuite:
     assert(RelativeDirectory.parse("/tmp", _.startsWith("/")).isLeft)
     assert(PreviewUrl.parse("file:///tmp/site").isLeft)
     assert(PreviewUrl.parse("http://localhost:99999").isLeft)
+    assert(PreviewUrl.parse("http://127.0.0.1:0").isLeft)
     assert(PreviewUrl.parse("http://bad host:4242").isLeft)
     assert(ProcessArgument.parse("bad\u0000argument", 0).isLeft)
     assert(StartupTimeout.parse(0).isLeft)

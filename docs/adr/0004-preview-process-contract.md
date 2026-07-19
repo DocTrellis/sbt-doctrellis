@@ -90,6 +90,8 @@ or cleaned up.
 - Shell metacharacters in arguments are data rather than executable syntax.
 - Readiness reflects the service response rather than an arbitrary delay.
 - Multi-root workspaces have isolated sessions and an explicit folder choice.
-- The initial schema cannot express environment variables, shell pipelines,
-  readiness headers/bodies, or alternative shutdown signals. Those require a
-  future versioned contract rather than ad hoc optional behavior.
+- Version 1 cannot express environment variables, shell pipelines, readiness
+  headers/bodies, or alternative shutdown signals. Those require a versioned
+  contract rather than ad hoc optional behavior.
+- ADR 0005 adds version 2's IPC-announced endpoint and dynamic HTTP port while
+  retaining every version 1 process and fixed-URL behavior described here.

@@ -1,10 +1,18 @@
 {
-  "version": 1,
+  "version": 2,
   "preview": {
     "command": "sbt",
-    "args": ["--server", "--batch", "doctrellisPreview"],
+    "args": [
+      "--server",
+      "--batch",
+      "set doctrellisPort := 0",
+      "doctrellisPreview"
+    ],
     "workingDirectory": ".",
-    "url": "http://127.0.0.1:4242",
+    "endpoint": {
+      "source": "ipc",
+      "protocol": "doctrellis-preview-v1"
+    },
     "startupTimeoutMs": 90000
   }
 }

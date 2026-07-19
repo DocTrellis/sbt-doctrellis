@@ -15,7 +15,8 @@ enum ConfigProblem:
     case Expected(path, expected)   => s"$path must be $expected"
     case Missing(path)              => s"missing required field: $path"
     case Unexpected(path)           => s"unexpected field: $path"
-    case UnsupportedVersion(actual) => s"version must be 1, but was $actual"
+    case UnsupportedVersion(actual) =>
+      s"version must be 1 or 2, but was $actual"
     case InvalidValue(path, detail) => s"$path $detail"
 
 opaque type Executable = String
@@ -148,17 +149,31 @@ final case class PreviewTemplate(
     executable: Executable,
     arguments: Vector[ProcessArgument],
     relativeDirectory: RelativeDirectory,
-    url: PreviewUrl,
+    endpoint: PreviewEndpoint,
     startupTimeout: StartupTimeout,
 ):
   def resolve(workingDirectory: WorkingDirectory): PreviewCommand =
-    PreviewCommand(executable, arguments, workingDirectory, url, startupTimeout)
+    PreviewCommand(
+      executable = executable,
+      arguments = arguments,
+      workingDirectory = workingDirectory,
+      endpoint = endpoint,
+      startupTimeout = startupTimeout,
+    )
+
+enum PreviewEndpoint:
+  case Fixed(url: PreviewUrl)
+  case Announced
+
+  def description: String = this match
+    case Fixed(url) => url.value
+    case Announced  => "the workspace IPC endpoint"
 
 final case class PreviewCommand(
     executable: Executable,
     arguments: Vector[ProcessArgument],
     workingDirectory: WorkingDirectory,
-    url: PreviewUrl,
+    endpoint: PreviewEndpoint,
     startupTimeout: StartupTimeout,
 )
 

@@ -14,7 +14,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
       right(Executable.parse("sbt")),
       Vector(right(ProcessArgument.parse("doctrellisPreview", 0))),
       right(WorkingDirectory.parseResolved("/workspace", "", "/", false)),
-      right(PreviewUrl.parse("http://127.0.0.1:4242")),
+      PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:4242")),
+      ),
       right(StartupTimeout.parse(90000)),
     )
 
@@ -414,7 +416,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(count, 2)
       assertEquals(
         afterStart.lastOption,
-        Some(PreviewViewState.Ready(command.url)),
+        Some(PreviewViewState.Ready(urlOf(command))),
       )
 
   test("open passes the workspace and session URL to the preview view"):
@@ -433,12 +435,14 @@ class PreviewServiceSuite extends CatsEffectSuite:
       actual <- shown.get
     yield assertEquals(
       actual.lastOption,
-      Some(workspace -> PreviewViewState.Ready(command.url)),
+      Some(workspace -> PreviewViewState.Ready(urlOf(command))),
     )
 
   test("openExternal uses the active session URL or loads the configured URL"):
-    val configured = command.copy(
-      url = right(PreviewUrl.parse("http://127.0.0.1:5252")),
+    val configured = command.copy(endpoint =
+      PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:5252")),
+      ),
     )
     for
       launches <- Ref.of[IO, Int](0)
@@ -460,7 +464,33 @@ class PreviewServiceSuite extends CatsEffectSuite:
             service.stop(workspace) *>
             service.openExternal(workspace)
       actual <- opened.get
-    yield assertEquals(actual, Vector(command.url, configured.url))
+    yield assertEquals(actual, Vector(urlOf(command), urlOf(configured)))
+
+  test("openExternal keeps the fixed URL while its session is starting"):
+    for
+      probeEntered  <- Deferred[IO, Unit]
+      continueProbe <- Deferred[IO, Unit]
+      launches      <- Ref.of[IO, Int](0)
+      releases      <- Ref.of[IO, Int](0)
+      opened        <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
+      base  = healthyPorts(launches, releases)
+      ports = base.copy(
+        probe =
+          _ => probeEntered.complete(()).void *> continueProbe.get.as(true),
+        openExternal = url => opened.update(_ :+ url),
+      )
+      actual <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).start
+            _        <- probeEntered.get
+            _        <- service.openExternal(workspace)
+            result   <- opened.get
+            _        <- continueProbe.complete(())
+            _        <- starting.joinWithNever
+          yield result
+    yield assertEquals(actual, Vector(urlOf(command)))
 
   test("open without an active session reports a stopped preview"):
     for
@@ -648,8 +678,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("an old open cannot overwrite a replacement session"):
-    val replacement = command.copy(
-      url = right(PreviewUrl.parse("http://127.0.0.1:5252")),
+    val replacement = command.copy(endpoint =
+      PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:5252")),
+      ),
     )
     for
       loads            <- Ref.of[IO, Int](0)
@@ -667,13 +699,13 @@ class PreviewServiceSuite extends CatsEffectSuite:
         show = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == command.url =>
+              case PreviewViewState.Ready(url) if url == urlOf(command) =>
                 showEntered.complete(()).void *> continueShow.get
               case _ => IO.unit),
         update = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == replacement.url =>
+              case PreviewViewState.Ready(url) if url == urlOf(replacement) =>
                 replacementReady.complete(()).void
               case _ => IO.unit),
         openExternal = _ => IO.unit,
@@ -696,7 +728,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield current
     yield assertEquals(
       actual.lastOption,
-      Some(PreviewViewState.Ready(replacement.url)),
+      Some(PreviewViewState.Ready(urlOf(replacement))),
     )
 
   test("open-when-ready shows the ready session in its workspace panel"):
@@ -713,7 +745,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       actual <- shown.get
     yield assertEquals(
       actual.lastOption,
-      Some(workspace -> PreviewViewState.Ready(command.url)),
+      Some(workspace -> PreviewViewState.Ready(urlOf(command))),
     )
 
   test("configuration or launch failure updates an existing workspace panel"):
@@ -811,8 +843,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("a replaced session suppresses its old ready continuation"):
-    val replacement = command.copy(
-      url = right(PreviewUrl.parse("http://127.0.0.1:5252")),
+    val replacement = command.copy(endpoint =
+      PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:5252")),
+      ),
     )
     for
       loads            <- Ref.of[IO, Int](0)
@@ -832,7 +866,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         update = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == replacement.url =>
+              case PreviewViewState.Ready(url) if url == urlOf(replacement) =>
                 replacementReady.complete(()).void
               case _ => IO.unit),
         openExternal = _ => IO.unit,
@@ -860,7 +894,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield current
     yield assertEquals(
       actual.lastOption,
-      Some(PreviewViewState.Ready(replacement.url)),
+      Some(PreviewViewState.Ready(urlOf(replacement))),
     )
 
   test("stop racing a startup failure converges the panel to stopped"):
@@ -993,7 +1027,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(actualOrdering, Vector("old-exited", "new-start"))
       assertEquals(
         actualStates.lastOption,
-        Some(PreviewViewState.Ready(command.url)),
+        Some(PreviewViewState.Ready(urlOf(command))),
       )
 
   test("stop suppresses an await-exit observation failure after readiness"):
@@ -1052,8 +1086,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
       uri = "file:///workspace-two",
     )
     val failure       = IllegalStateException("startup failed")
-    val secondCommand = command.copy(
-      url = right(PreviewUrl.parse("http://127.0.0.1:5252")),
+    val secondCommand = command.copy(endpoint =
+      PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:5252")),
+      ),
     )
     for
       closeEntered   <- Deferred[IO, Unit]
@@ -1075,7 +1111,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
             )
         ,
         probe = url =>
-          if url == command.url then IO.raiseError(failure)
+          if url == urlOf(command) then IO.raiseError(failure)
           else IO.pure(true),
         show = (_, _) => IO.unit,
         update = (_, _) => IO.unit,
@@ -1132,6 +1168,243 @@ class PreviewServiceSuite extends CatsEffectSuite:
       count <- releases.get
     yield assertEquals(count, 4)
 
+  test("announced IPC URL is probed and stored as the ready session URL"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53111"))
+    for
+      probes <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
+      states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(announced),
+            ),
+          ),
+        probe = url => probes.update(_ :+ url).as(true),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actualStates <- PreviewService
+        .resource(ports)
+        .use(service =>
+          service.start(workspace) *> service.open(workspace) *> states.get,
+        )
+      actualProbes <- probes.get
+    yield
+      assertEquals(actualProbes, Vector(announced))
+      assertEquals(
+        actualStates.lastOption,
+        Some(PreviewViewState.Ready(announced)),
+      )
+
+  test("dynamic startup reports process exit before ready announcement"):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    val exit    = ProcessExit(code = Some(2), signal = None, error = None)
+    val ports   = PreviewPorts[IO](
+      load = _ => IO.pure(dynamic),
+      policy = _ => IO.pure(policy),
+      launch = (_, _) =>
+        Resource.pure(
+          RunningProcess.announced(
+            awaitExit = IO.pure(exit),
+            awaitUrl = IO.never,
+          ),
+        ),
+      probe = _ => IO.pure(false),
+      show = (_, _) => IO.unit,
+      update = (_, _) => IO.unit,
+      openExternal = _ => IO.unit,
+      info = _ => IO.unit,
+      error = _ => IO.unit,
+    )
+    PreviewService
+      .resource(ports)
+      .use(_.start(workspace).attempt)
+      .map: result =>
+        assert(result.swap.exists:
+          case PreviewExited(_, actual) => actual == exit
+          case _                        => false)
+
+  test(
+    "dynamic startup reports process exit after ready but before HTTP probe",
+  ):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53112"))
+    val exit      = ProcessExit(code = Some(3), signal = None, error = None)
+    val ports     = PreviewPorts[IO](
+      load = _ => IO.pure(dynamic),
+      policy = _ => IO.pure(policy),
+      launch = (_, _) =>
+        Resource.pure(
+          RunningProcess.announced(
+            awaitExit = IO.pure(exit),
+            awaitUrl = IO.pure(announced),
+          ),
+        ),
+      probe = _ => IO.never,
+      show = (_, _) => IO.unit,
+      update = (_, _) => IO.unit,
+      openExternal = _ => IO.unit,
+      info = _ => IO.unit,
+      error = _ => IO.unit,
+    )
+    PreviewService
+      .resource(ports)
+      .use(_.start(workspace).attempt)
+      .map: result =>
+        assert(result.swap.exists:
+          case PreviewExited(_, actual) => actual == exit
+          case _                        => false)
+
+  test("dynamic startup timeout includes announcement and HTTP probe"):
+    val timeout = right(StartupTimeout.parse(25))
+    val dynamic = command.copy(
+      endpoint = PreviewEndpoint.Announced,
+      startupTimeout = timeout,
+    )
+    val ports = PreviewPorts[IO](
+      load = _ => IO.pure(dynamic),
+      policy = _ => IO.pure(policy),
+      launch = (_, _) =>
+        Resource.pure(
+          RunningProcess.announced(
+            awaitExit = IO.never,
+            awaitUrl = IO.never,
+          ),
+        ),
+      probe = _ => IO.pure(false),
+      show = (_, _) => IO.unit,
+      update = (_, _) => IO.unit,
+      openExternal = _ => IO.unit,
+      info = _ => IO.unit,
+      error = _ => IO.unit,
+    )
+    PreviewService
+      .resource(ports)
+      .use(_.start(workspace).attempt)
+      .map: result =>
+        assert(result.swap.exists:
+          case PreviewTimedOut(_, actual) => actual == timeout
+          case _                          => false)
+
+  test("restart replaces the announced URL instead of reusing the old URL"):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    val first   = right(PreviewUrl.parse("http://127.0.0.1:53113"))
+    val second  = right(PreviewUrl.parse("http://127.0.0.1:53114"))
+    for
+      launches <- Ref.of[IO, Int](0)
+      states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.eval(
+            launches.modify: count =>
+              val url = if count == 0 then first else second
+              count + 1 -> RunningProcess.announced(
+                awaitExit = IO.never,
+                awaitUrl = IO.pure(url),
+              ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      actual <- PreviewService
+        .resource(ports)
+        .use(service =>
+          service.start(workspace) *> service.restart(workspace) *> states.get,
+        )
+    yield
+      assert(actual.contains(PreviewViewState.Ready(first)))
+      assertEquals(actual.lastOption, Some(PreviewViewState.Ready(second)))
+
+  test("two dynamic workspaces keep independently announced URLs"):
+    val dynamic         = command.copy(endpoint = PreviewEndpoint.Announced)
+    val secondWorkspace = workspace.copy(
+      key = "file:///workspace-two",
+      name = "example-two",
+      root = "/workspace-two",
+      uri = "file:///workspace-two",
+    )
+    val firstUrl  = right(PreviewUrl.parse("http://127.0.0.1:53115"))
+    val secondUrl = right(PreviewUrl.parse("http://127.0.0.1:53116"))
+    for
+      states <- Ref.of[IO, Vector[(Workspace, PreviewViewState)]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (current, _) =>
+          Resource.pure(
+            RunningProcess.announced(
+              awaitExit = IO.never,
+              awaitUrl = IO.pure(
+                if current.key == workspace.key then firstUrl else secondUrl,
+              ),
+            ),
+          ),
+        probe = _ => IO.pure(true),
+        show = (current, state) => states.update(_ :+ (current -> state)),
+        update = (current, state) => states.update(_ :+ (current -> state)),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      _ <- PreviewService
+        .resource(ports)
+        .use: service =>
+          (
+            service.start(workspace),
+            service.start(secondWorkspace),
+          ).parTupled.void
+      actual <- states.get
+    yield
+      assert(actual.contains(workspace -> PreviewViewState.Ready(firstUrl)))
+      assert(
+        actual.contains(secondWorkspace -> PreviewViewState.Ready(secondUrl)),
+      )
+
+  test(
+    "open commands explain that an inactive dynamic preview must be started",
+  ):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    for
+      states   <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      messages <- Ref.of[IO, Vector[String]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
+        probe = _ => IO.pure(false),
+        show = (_, state) => states.update(_ :+ state),
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = message => messages.update(_ :+ message),
+        error = _ => IO.unit,
+      )
+      external <- PreviewService
+        .resource(ports)
+        .use: service =>
+          service.open(workspace) *> service.openExternal(workspace).attempt
+      actualStates   <- states.get
+      actualMessages <- messages.get
+    yield
+      assert(actualStates.exists:
+        case PreviewViewState.Failed(reason) => reason.contains("Start")
+        case _                               => false)
+      assert(actualMessages.exists(_.contains("Start")))
+      assert(external.swap.exists(_.isInstanceOf[DynamicPreviewNotStarted]))
+
   private def healthyPorts(
       launches: Ref[IO, Int],
       releases: Ref[IO, Int],
@@ -1153,6 +1426,11 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)
+
+  private def urlOf(value: PreviewCommand): PreviewUrl =
+    value.endpoint match
+      case PreviewEndpoint.Fixed(url) => url
+      case PreviewEndpoint.Announced  => fail("expected a fixed preview URL")
 
   private def assertStoppedDuringStartup(
       result: Either[Throwable, Unit],

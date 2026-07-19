@@ -52,6 +52,15 @@ object NodeRuntime extends js.Object:
 object NodeFsPromises extends js.Object:
   def readFile(path: String, encoding: String): js.Promise[String] = js.native
   def realpath(path: String): js.Promise[String]                   = js.native
+  def mkdir(path: String, options: js.Object): js.Promise[js.Any]  = js.native
+  def chmod(path: String, mode: Int): js.Promise[Unit]             = js.native
+  def lstat(path: String): js.Promise[NodeFileStats]               = js.native
+
+@js.native
+trait NodeFileStats extends js.Object:
+  val uid: Int                  = js.native
+  def isDirectory(): Boolean    = js.native
+  def isSymbolicLink(): Boolean = js.native
 
 @js.native
 @JSImport("node:path", JSImport.Namespace)
@@ -61,6 +70,52 @@ object NodePath extends js.Object:
   def resolve(parts: String*): String            = js.native
   def relative(from: String, to: String): String = js.native
   def isAbsolute(path: String): Boolean          = js.native
+
+@js.native
+trait NodeUserInfo extends js.Object:
+  val username: String = js.native
+  val uid: Int         = js.native
+
+@js.native
+@JSImport("node:os", JSImport.Namespace)
+object NodeOs extends js.Object:
+  def tmpdir(): String         = js.native
+  def userInfo(): NodeUserInfo = js.native
+
+@js.native
+trait NodeHash extends js.Object:
+  def update(value: String): NodeHash  = js.native
+  def digest(encoding: String): String = js.native
+
+@js.native
+trait NodeBufferConstructor extends js.Object:
+  def byteLength(value: String, encoding: String): Int = js.native
+
+@js.native
+@JSImport("node:crypto", JSImport.Namespace)
+object NodeCrypto extends js.Object:
+  def createHash(algorithm: String): NodeHash = js.native
+  def randomUUID(): String                    = js.native
+
+@js.native
+@JSImport("node:buffer", JSImport.Namespace)
+object NodeBuffer extends js.Object:
+  val Buffer: NodeBufferConstructor = js.native
+
+@js.native
+trait NodeSocket extends js.Object:
+  def on(event: String, listener: js.Function): NodeSocket   = js.native
+  def once(event: String, listener: js.Function): NodeSocket = js.native
+  def off(event: String, listener: js.Function): NodeSocket  = js.native
+  def write(value: String): Boolean                          = js.native
+  def setEncoding(encoding: String): NodeSocket              = js.native
+  def end(): Unit                                            = js.native
+  def destroy(): Unit                                        = js.native
+
+@js.native
+@JSImport("node:net", JSImport.Namespace)
+object NodeNet extends js.Object:
+  def createConnection(options: js.Object): NodeSocket = js.native
 
 @js.native
 @JSImport("node:http", JSImport.Namespace)

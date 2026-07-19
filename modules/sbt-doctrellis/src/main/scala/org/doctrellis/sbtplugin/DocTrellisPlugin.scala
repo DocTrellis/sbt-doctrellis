@@ -14,8 +14,8 @@ import sbt.Keys.*
 import java.io.IOException
 import java.net.{BindException, InetSocketAddress}
 import java.nio.file.Path
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.{CountDownLatch, Executors}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 import scala.util.control.NonFatal
 
 object DocTrellisPlugin extends AutoPlugin:
@@ -132,12 +132,13 @@ object DocTrellisPlugin extends AutoPlugin:
     },
     doctrellisPreview := Def.uncached {
       doctrellisBuild.value
-      val site = doctrellisOutputDirectory.value
-      val host = doctrellisHost.value
-      val port = doctrellisPort.value
-      val log  = streams.value.log
+      val site      = doctrellisOutputDirectory.value
+      val workspace = baseDirectory.value
+      val host      = doctrellisHost.value
+      val port      = doctrellisPort.value
+      val log       = streams.value.log
 
-      try PreviewServer.serve(site.toPath, host, port, log)
+      try PreviewServer.serve(site.toPath, workspace.toPath, host, port, log)
       catch
         case error: BindException =>
           sys.error(
@@ -151,30 +152,58 @@ object DocTrellisPlugin extends AutoPlugin:
   )
 
 private[sbtplugin] object PreviewServer:
-  def serve(root: Path, host: String, port: Int, log: Logger): Unit =
-    val executor = Executors.newCachedThreadPool()
-    val stopped  = CountDownLatch(1)
-    val server   =
-      com.sun.net.httpserver.HttpServer.create(InetSocketAddress(host, port), 0)
-    server.createContext("/", StaticSiteHandler(root))
-    server.setExecutor(executor)
+  def serve(
+      root: Path,
+      workspace: Path,
+      host: String,
+      port: Int,
+      log: Logger,
+  ): Unit =
+    val binding = PreviewHttpBinding.start(root, host, port)
+    val stopped = CountDownLatch(1)
 
     val shutdown = PreviewServerShutdown(
-      stopServer = () => server.stop(0),
-      stopExecutor = () => executor.shutdownNow(),
+      stopServer = () => binding.stopServer(),
+      stopExecutor = () => binding.stopExecutor(),
       signalStopped = () => stopped.countDown(),
     )
 
+    val control = AtomicReference[PreviewControlServer]()
+
     val shutdownHook = Thread(
-      () => shutdown.stop(),
+      () =>
+        var failure = Option.empty[Throwable]
+
+        def attempt(action: => Unit): Unit =
+          try action
+          catch
+            case NonFatal(error) =>
+              failure match
+                case None           => failure = Some(error)
+                case Some(existing) => existing.addSuppressed(error)
+
+        attempt(shutdown.stop())
+        attempt(Option(control.get()).foreach(_.close()))
+        failure.foreach(throw _)
+      ,
       "doctrellis-preview-shutdown",
     )
 
     java.lang.Runtime.getRuntime.addShutdownHook(shutdownHook)
     var primaryFailure = Option.empty[Throwable]
     try
-      server.start()
-      log.success(s"DocTrellis preview ready at http://$host:$port")
+      PreviewControlConfig
+        .fromEnvironment(workspace, sys.env)
+        .map(config =>
+          PreviewControlServer.open(
+            config = config,
+            readyUrl = binding.url,
+            onStop = () => shutdown.stop(),
+            log = log,
+          ),
+        )
+        .foreach(control.set)
+      log.success(s"DocTrellis preview ready at ${binding.url}")
       log.info("Press Ctrl+C to stop the preview server.")
       stopped.await()
     catch
@@ -183,10 +212,63 @@ private[sbtplugin] object PreviewServer:
         primaryFailure = Some(error)
         throw error
     finally
-      try shutdown.stopPreserving(primaryFailure)
+      try
+        var cleanupFailure                 = Option.empty[Throwable]
+        def cleanup(action: => Unit): Unit =
+          try action
+          catch
+            case NonFatal(error) =>
+              cleanupFailure match
+                case None           => cleanupFailure = Some(error)
+                case Some(existing) => existing.addSuppressed(error)
+
+        val currentControl = Option(control.get())
+        cleanup(
+          currentControl.foreach(
+            _.awaitStopAcknowledgedIfRequested(1L, TimeUnit.SECONDS),
+          ),
+        )
+        cleanup(currentControl.foreach(_.close()))
+        cleanup(shutdown.stop())
+        cleanupFailure.foreach: error =>
+          primaryFailure match
+            case Some(primary) => primary.addSuppressed(error)
+            case None          => throw error
       finally
         try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook)
         catch case _: IllegalStateException => ()
+
+private[sbtplugin] final class PreviewHttpBinding private (
+    val url: String,
+    val port: Int,
+    server: com.sun.net.httpserver.HttpServer,
+    executor: java.util.concurrent.ExecutorService,
+):
+  def stopServer(): Unit = server.stop(0)
+
+  def stopExecutor(): Unit = executor.shutdownNow()
+
+private[sbtplugin] object PreviewHttpBinding:
+  def start(root: Path, host: String, port: Int): PreviewHttpBinding =
+    val executor = Executors.newCachedThreadPool()
+    val server   =
+      com.sun.net.httpserver.HttpServer.create(InetSocketAddress(host, port), 0)
+    try
+      server.createContext("/", StaticSiteHandler(root))
+      server.setExecutor(executor)
+      server.start()
+      val actualPort = server.getAddress.getPort
+      new PreviewHttpBinding(
+        url = s"http://$host:$actualPort",
+        port = actualPort,
+        server = server,
+        executor = executor,
+      )
+    catch
+      case error: Throwable =>
+        server.stop(0)
+        executor.shutdownNow()
+        throw error
 
 private[sbtplugin] final class PreviewServerShutdown(
     stopServer: () => Unit,
@@ -209,11 +291,3 @@ private[sbtplugin] final class PreviewServerShutdown(
       attempt(stopExecutor)
       attempt(signalStopped)
       failure.foreach(throw _)
-
-  def stopPreserving(primary: Option[Throwable]): Unit =
-    try stop()
-    catch
-      case NonFatal(cleanup) =>
-        primary match
-          case Some(error) => error.addSuppressed(cleanup)
-          case None        => throw cleanup

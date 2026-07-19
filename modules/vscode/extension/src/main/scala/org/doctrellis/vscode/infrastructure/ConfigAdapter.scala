@@ -17,16 +17,12 @@ private[infrastructure] object ConfigParser:
         root    <- objectAt(raw, "$", Set("version", "preview"))
         version <- integerAt(root, "version", "version")
         _       <- Either.cond(
-          version == 1,
+          version == 1 || version == 2,
           (),
           ConfigProblem.UnsupportedVersion(version),
         )
-        previewRaw <- fieldAt(root, "preview", "preview")
-        preview    <- objectAt(
-          previewRaw,
-          "preview",
-          Set("command", "args", "workingDirectory", "url", "startupTimeoutMs"),
-        )
+        previewRaw   <- fieldAt(root, "preview", "preview")
+        preview      <- previewObject(previewRaw, version)
         commandRaw   <- stringAt(preview, "command", "preview.command")
         command      <- Executable.parse(commandRaw)
         argumentText <- stringArrayAt(preview, "args", "preview.args")
@@ -37,15 +33,74 @@ private[infrastructure] object ConfigParser:
           "preview.workingDirectory",
         )
         directory  <- RelativeDirectory.parse(directoryRaw, isAbsolute)
-        urlRaw     <- stringAt(preview, "url", "preview.url")
-        url        <- PreviewUrl.parse(urlRaw)
+        endpoint   <- previewEndpoint(preview, version)
         timeoutRaw <- integerAt(
           preview,
           "startupTimeoutMs",
           "preview.startupTimeoutMs",
         )
         timeout <- StartupTimeout.parse(timeoutRaw)
-      yield PreviewTemplate(command, arguments, directory, url, timeout)
+      yield PreviewTemplate(
+        executable = command,
+        arguments = arguments,
+        relativeDirectory = directory,
+        endpoint = endpoint,
+        startupTimeout = timeout,
+      )
+
+  private def previewObject(
+      raw: js.Any,
+      version: Int,
+  ): Either[ConfigProblem, js.Dynamic] =
+    val common = Set("command", "args", "workingDirectory", "startupTimeoutMs")
+    val fields = if version == 1 then common + "url" else common + "endpoint"
+    objectAt(raw, "preview", fields)
+
+  private def previewEndpoint(
+      preview: js.Dynamic,
+      version: Int,
+  ): Either[ConfigProblem, PreviewEndpoint] =
+    if version == 1 then
+      for
+        raw <- stringAt(preview, "url", "preview.url")
+        url <- PreviewUrl.parse(raw)
+      yield PreviewEndpoint.Fixed(url)
+    else
+      for
+        raw      <- fieldAt(preview, "endpoint", "preview.endpoint")
+        endpoint <- objectAt(
+          raw,
+          "preview.endpoint",
+          Set("source", "protocol"),
+        )
+        source <- stringAt(endpoint, "source", "preview.endpoint.source")
+        _      <- exact(
+          actual = source,
+          expected = "ipc",
+          path = "preview.endpoint.source",
+        )
+        protocol <- stringAt(
+          endpoint,
+          "protocol",
+          "preview.endpoint.protocol",
+        )
+        _ <- exact(
+          actual = protocol,
+          expected = "doctrellis-preview-v1",
+          path = "preview.endpoint.protocol",
+        )
+      yield PreviewEndpoint.Announced
+
+  private def exact(
+      actual: String,
+      expected: String,
+      path: String,
+  ): Either[ConfigProblem, Unit] =
+    Either.cond(
+      actual == expected,
+      (),
+      ConfigProblem.InvalidValue(path, s"must be '$expected'"),
+    )
 
   private def decodeJson(text: String): Either[ConfigProblem, js.Any] =
     try Right(js.JSON.parse(text))

@@ -7,12 +7,16 @@ import munit.CatsEffectSuite
 import org.doctrellis.vscode.application.RunningProcess
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.{
+  NodeFsPromises,
+  NodeOs,
   NodePath,
   NodeRuntime,
+  TestNodeFsPromises,
   TestNodeRuntime,
 }
 
 import scala.concurrent.duration.*
+import scala.scalajs.js
 import scala.util.matching.Regex
 
 class NodeProcessSuite extends CatsEffectSuite:
@@ -21,6 +25,13 @@ class NodeProcessSuite extends CatsEffectSuite:
     name = "node-process-suite",
     root = TestNodeRuntime.cwd(),
     uri = "file:///node-process-suite",
+  )
+
+  private val exampleWorkspace = Workspace(
+    key = "file:///doctrellis-basic-example",
+    name = "doctrellis-basic-example",
+    root = NodePath.join(TestNodeRuntime.cwd(), "examples", "basic"),
+    uri = "file:///doctrellis-basic-example",
   )
 
   test("stops a ready process, releases its port, and tolerates repeat stop"):
@@ -145,6 +156,18 @@ class NodeProcessSuite extends CatsEffectSuite:
     if !runExampleIntegration then IO.unit
     else Dispatcher.parallel[IO](await = false).use(testExampleLifecycle)
 
+  test("runs two actual workspace previews on distinct dynamic ports"):
+    if !runExampleIntegration then IO.unit
+    else Dispatcher.parallel[IO](await = false).use(testTwoExampleWorkspaces)
+
+  test("signal fallback cleans the actual workspace IPC endpoint"):
+    if !runExampleIntegration then IO.unit
+    else Dispatcher.parallel[IO](await = false).use(testSignalEndpointCleanup)
+
+  test("replaces stale TCP metadata on a recycled loopback port"):
+    if !runExampleIntegration then IO.unit
+    else Dispatcher.parallel[IO](await = false).use(testRecycledTcpMetadata)
+
   private def testReadyStop(dispatcher: Dispatcher[IO]): IO[Unit] =
     for
       firstReady <- Deferred[IO, Started]
@@ -241,37 +264,407 @@ class NodeProcessSuite extends CatsEffectSuite:
 
   private def testExampleLifecycle(dispatcher: Dispatcher[IO]): IO[Unit] =
     for
-      ready        <- Deferred[IO, PreviewUrl]
-      ownedPid     <- Deferred[IO, Int]
-      log          <- Ref.of[IO, String]("")
-      activeBefore <- NodeHttpProbe.ready(exampleUrl)
-      _            <- IO.raiseWhen(activeBefore)(
-        IllegalStateException("port 4242 was already in use"),
-      )
-      result <- managedProcess(
+      occupiedReady <- Deferred[IO, Started]
+      occupiedLog   <- Ref.of[IO, String]("")
+      result        <- managedProcess(
         dispatcher = dispatcher,
-        command = exampleCommand,
-        append = captureExample(log, ownedPid, ready),
+        command = command(serverScript(port = 4242, ignoreTerm = false)),
+        append = capture(occupiedLog, occupiedReady),
+        timeouts = ProcessShutdownTimeouts.default,
+      ).use:
+        case (_, stopOccupier) =>
+          for
+            occupied    <- occupiedReady.get.timeout(5.seconds)
+            ownedPid    <- Deferred[IO, Int]
+            log         <- Ref.of[IO, String]("")
+            observerLog <- Ref.of[IO, String]("")
+            active      <- WorkspacePreview
+              .launch(dispatcher, captureOwnedPid(log, ownedPid))(
+                exampleWorkspace,
+                exampleCommand,
+              )
+              .use: running =>
+                for
+                  announced <- IO.fromOption(running.announcedUrl)(
+                    IllegalStateException("dynamic URL was not available"),
+                  )
+                  url            <- announced.timeout(120.seconds)
+                  pid            <- ownedPid.get.timeout(10.seconds)
+                  served         <- NodeHttpProbe.ready(url)
+                  occupiedDuring <- NodeHttpProbe.ready(exampleUrl)
+                  observed       <- WorkspacePreview
+                    .launch(dispatcher, chunk => observerLog.update(_ + chunk))(
+                      exampleWorkspace,
+                      exampleCommand,
+                    )
+                    .use: observer =>
+                      IO.fromOption(observer.announcedUrl)(
+                        IllegalStateException(
+                          "observer dynamic URL was not available",
+                        ),
+                      ).flatten
+                        .timeout(5.seconds)
+                  readyAfterObserver <- NodeHttpProbe.ready(url)
+                  observerOutput     <- observerLog.get
+                yield (
+                  running,
+                  url,
+                  pid,
+                  served,
+                  occupiedDuring,
+                  observed,
+                  readyAfterObserver,
+                  observerOutput,
+                )
+            (
+              running,
+              url,
+              pid,
+              served,
+              occupiedDuring,
+              observed,
+              readyAfterObserver,
+              observerOutput,
+            ) = active
+            exit          <- running.awaitExit
+            stopped       <- NodeHttpProbe.ready(url)
+            alive         <- processIsAlive(pid)
+            occupiedAfter <- NodeHttpProbe.ready(exampleUrl)
+            dynamicPort   <- IO.fromOption(
+              url.value.stripPrefix("http://127.0.0.1:").toIntOption,
+            )(IllegalStateException(s"unexpected dynamic URL ${url.value}"))
+            rebound <- rebind(dispatcher, dynamicPort)
+            _       <- stopOccupier
+          yield (
+            served,
+            occupiedDuring,
+            occupiedAfter,
+            observed,
+            readyAfterObserver,
+            observerOutput,
+            dynamicPort,
+            occupied.port,
+            exit,
+            stopped,
+            alive,
+            rebound,
+          )
+      (
+        served,
+        occupiedDuring,
+        occupiedAfter,
+        observed,
+        readyAfterObserver,
+        observerOutput,
+        dynamicPort,
+        occupiedPort,
+        exit,
+        stopped,
+        alive,
+        rebound,
+      ) = result
+      fixedRegression <- testFixedExampleLifecycle(dispatcher)
+    yield
+      assert(served)
+      assert(occupiedDuring)
+      assert(occupiedAfter)
+      assertEquals(observed.value, s"http://127.0.0.1:$dynamicPort")
+      assert(readyAfterObserver)
+      assert(observerOutput.contains("read-only lease"))
+      assertEquals(occupiedPort, 4242)
+      assertNotEquals(dynamicPort, 4242)
+      assert(exit.code.nonEmpty || exit.signal.nonEmpty)
+      assert(!stopped)
+      assert(!alive)
+      assert(rebound)
+      assert(fixedRegression)
+
+  private def testFixedExampleLifecycle(
+      dispatcher: Dispatcher[IO],
+  ): IO[Boolean] =
+    for
+      ready    <- Deferred[IO, PreviewUrl]
+      ownedPid <- Deferred[IO, Int]
+      log      <- Ref.of[IO, String]("")
+      result   <- managedProcess(
+        dispatcher = dispatcher,
+        command = exampleFixedCommand,
+        append = captureFixedExample(log, ownedPid, ready),
         timeouts = ProcessShutdownTimeouts.default,
       ).use:
         case (running, stop) =>
           for
             url     <- ready.get.timeout(120.seconds)
-            pid     <- ownedPid.get.timeout(5.seconds)
+            pid     <- ownedPid.get.timeout(10.seconds)
             served  <- NodeHttpProbe.ready(url)
             _       <- stop
-            exit    <- running.awaitExit
+            _       <- running.awaitExit
             stopped <- NodeHttpProbe.ready(url)
             alive   <- processIsAlive(pid)
-            rebound <- rebind(dispatcher, port = 4242)
-          yield (served, exit, stopped, alive, rebound)
-      (served, exit, stopped, alive, rebound) = result
+          yield served && !stopped && !alive
+    yield result
+
+  private def testTwoExampleWorkspaces(
+      dispatcher: Dispatcher[IO],
+  ): IO[Unit] =
+    val source = NodePath.join(TestNodeRuntime.cwd(), "examples", "basic")
+    promise(
+      TestNodeFsPromises.mkdtemp(
+        NodePath.join(NodeOs.tmpdir(), "doctrellis-two-workspaces-"),
+      ),
+    ).bracket(temporary =>
+      val firstRoot  = NodePath.join(temporary, "first")
+      val secondRoot = NodePath.join(temporary, "second")
+      val first      = Workspace(
+        key = s"file://$firstRoot",
+        name = "first-dynamic-example",
+        root = firstRoot,
+        uri = s"file://$firstRoot",
+      )
+      val second = Workspace(
+        key = s"file://$secondRoot",
+        name = "second-dynamic-example",
+        root = secondRoot,
+        uri = s"file://$secondRoot",
+      )
+      for
+        _              <- prepareExampleCopy(source, firstRoot)
+        _              <- prepareExampleCopy(source, secondRoot)
+        firstPid       <- Deferred[IO, Int]
+        secondPid      <- Deferred[IO, Int]
+        firstLog       <- Ref.of[IO, String]("")
+        secondLog      <- Ref.of[IO, String]("")
+        firstEndpoint  <- WorkspaceChannel.endpoint(first)
+        secondEndpoint <- WorkspaceChannel.endpoint(second)
+        active         <- (
+          WorkspacePreview.launch(
+            dispatcher,
+            captureOwnedPid(firstLog, firstPid),
+          )(first, dynamicExampleCommand(firstRoot)),
+          WorkspacePreview.launch(
+            dispatcher,
+            captureOwnedPid(secondLog, secondPid),
+          )(second, dynamicExampleCommand(secondRoot)),
+        ).tupled.use: (firstRunning, secondRunning) =>
+          for
+            firstAnnouncement <- IO.fromOption(firstRunning.announcedUrl)(
+              IllegalStateException("first dynamic URL was not available"),
+            )
+            secondAnnouncement <- IO.fromOption(secondRunning.announcedUrl)(
+              IllegalStateException("second dynamic URL was not available"),
+            )
+            urls <- (
+              firstAnnouncement.timeout(120.seconds),
+              secondAnnouncement.timeout(120.seconds),
+            ).parTupled
+            (firstUrl, secondUrl) = urls
+            ready <- (
+              NodeHttpProbe.ready(firstUrl),
+              NodeHttpProbe.ready(secondUrl),
+            ).parTupled
+            pids <- (
+              firstPid.get.timeout(10.seconds),
+              secondPid.get.timeout(10.seconds),
+            ).parTupled
+          yield (firstRunning, secondRunning, firstUrl, secondUrl, ready, pids)
+        (firstRunning, secondRunning, firstUrl, secondUrl, ready, pids) = active
+        exits   <- (firstRunning.awaitExit, secondRunning.awaitExit).parTupled
+        stopped <- (
+          NodeHttpProbe.ready(firstUrl),
+          NodeHttpProbe.ready(secondUrl),
+        ).parTupled
+        alive <- (
+          processIsAlive(pids._1),
+          processIsAlive(pids._2),
+        ).parTupled
+        metadataExists <- (
+          exists(firstEndpoint.metadataPath),
+          exists(secondEndpoint.metadataPath),
+        ).parTupled
+        ports = (
+          dynamicPort(firstUrl),
+          dynamicPort(secondUrl),
+        )
+        rebound <- (
+          rebind(dispatcher, ports._1),
+          rebind(dispatcher, ports._2),
+        ).parTupled
+      yield
+        assertNotEquals(firstUrl, secondUrl)
+        assertNotEquals(ports._1, ports._2)
+        assertEquals(ready, (true, true))
+        assert(exits._1.code.nonEmpty || exits._1.signal.nonEmpty)
+        assert(exits._2.code.nonEmpty || exits._2.signal.nonEmpty)
+        assertEquals(stopped, (false, false))
+        assertEquals(alive, (false, false))
+        assertEquals(metadataExists, (false, false))
+        assertEquals(rebound, (true, true)),
+    )(temporary =>
+      promise(
+        TestNodeFsPromises.rm(
+          temporary,
+          js.Dynamic.literal(recursive = true, force = true),
+        ),
+      ),
+    )
+
+  private def testSignalEndpointCleanup(
+      dispatcher: Dispatcher[IO],
+  ): IO[Unit] =
+    for
+      endpoint <- WorkspaceChannel.endpoint(exampleWorkspace)
+      ready    <- Deferred[IO, PreviewUrl]
+      ownedPid <- Deferred[IO, Int]
+      log      <- Ref.of[IO, String]("")
+      active   <- NodeProcess
+        .launchWithEnvironment(
+          dispatcher = dispatcher,
+          append = captureDynamicExample(log, ownedPid, ready),
+          environment = endpoint.environment,
+        )(exampleWorkspace, exampleCommand)
+        .use: running =>
+          for
+            url          <- ready.get.timeout(120.seconds)
+            pid          <- ownedPid.get.timeout(10.seconds)
+            served       <- NodeHttpProbe.ready(url)
+            metadataText <- promise(
+              NodeFsPromises.readFile(endpoint.metadataPath, "utf8"),
+            )
+            metadata <- IO.fromEither(
+              WorkspaceChannelMetadataParser
+                .parse(metadataText, endpoint)
+                .leftMap(IllegalStateException(_)),
+            )
+            socketPath = metadata.transport match
+              case WorkspaceChannelTransport.Unix(path) => Some(path)
+              case WorkspaceChannelTransport.Tcp(_, _)  => None
+            socket <- socketPath.traverse(exists).map(_.exists(identity))
+          yield (running, url, pid, served, socketPath, socket)
+      (running, url, pid, served, socketPath, socketDuring) = active
+      _             <- running.awaitExit
+      stopped       <- NodeHttpProbe.ready(url)
+      alive         <- processIsAlive(pid)
+      metadataAfter <- exists(endpoint.metadataPath)
+      socketAfter   <- socketPath.traverse(exists).map(_.exists(identity))
+      portReusable  <- rebind(dispatcher, dynamicPort(url))
+      expectsUnixFile =
+        ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Posix
     yield
       assert(served)
-      assert(exit.code.nonEmpty || exit.signal.nonEmpty)
+      assertEquals(socketDuring, expectsUnixFile)
       assert(!stopped)
       assert(!alive)
-      assert(rebound)
+      assert(!metadataAfter)
+      assert(!socketAfter)
+      assert(portReusable)
+
+  private def testRecycledTcpMetadata(
+      dispatcher: Dispatcher[IO],
+  ): IO[Unit] =
+    for
+      endpoint      <- WorkspaceChannel.endpoint(exampleWorkspace)
+      occupiedReady <- Deferred[IO, Started]
+      occupiedLog   <- Ref.of[IO, String]("")
+      result        <- managedProcess(
+        dispatcher = dispatcher,
+        command = command(serverScript(port = 0, ignoreTerm = false)),
+        append = capture(occupiedLog, occupiedReady),
+        timeouts = ProcessShutdownTimeouts.default,
+      ).use:
+        case (_, stopOccupier) =>
+          for
+            fixture <- occupiedReady.get.timeout(5.seconds)
+            stale =
+              s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":2147483647,"sessionId":"stale-session","token":"${"0" * 64}"}"""
+            _ <- promise(
+              TestNodeFsPromises.writeFile(endpoint.metadataPath, stale),
+            )
+            ownedPid <- Deferred[IO, Int]
+            log      <- Ref.of[IO, String]("")
+            active   <- WorkspacePreview
+              .launch(dispatcher, captureOwnedPid(log, ownedPid))(
+                exampleWorkspace,
+                exampleCommand,
+              )
+              .use: running =>
+                for
+                  announcement <- IO.fromOption(running.announcedUrl)(
+                    IllegalStateException("dynamic URL was not available"),
+                  )
+                  url           <- announcement.timeout(120.seconds)
+                  pid           <- ownedPid.get.timeout(10.seconds)
+                  served        <- NodeHttpProbe.ready(url)
+                  fixtureServed <- NodeHttpProbe.ready(
+                    right(PreviewUrl.parse(fixture.url)),
+                  )
+                yield (running, url, pid, served, fixtureServed)
+            (running, url, pid, served, occupiedDuring) = active
+            _             <- running.awaitExit
+            stopped       <- NodeHttpProbe.ready(url)
+            alive         <- processIsAlive(pid)
+            metadataAfter <- exists(endpoint.metadataPath)
+            _             <- stopOccupier
+          yield (served, occupiedDuring, stopped, alive, metadataAfter)
+      (served, occupiedDuring, stopped, alive, metadataAfter) = result
+    yield
+      assert(served)
+      assert(occupiedDuring)
+      assert(!stopped)
+      assert(!alive)
+      assert(!metadataAfter)
+
+  private def prepareExampleCopy(
+      source: String,
+      destination: String,
+  ): IO[Unit] =
+    val recursive = js.Dynamic.literal(recursive = true, force = true)
+    val parents   = js.Dynamic.literal(recursive = true)
+    promise(TestNodeFsPromises.mkdir(destination, parents)).void *>
+      promise(
+        TestNodeFsPromises.cp(
+          NodePath.join(source, "build.sbt"),
+          NodePath.join(destination, "build.sbt"),
+          js.Dynamic.literal(force = true),
+        ),
+      ) *>
+      promise(
+        TestNodeFsPromises.cp(
+          NodePath.join(source, "project"),
+          NodePath.join(destination, "project"),
+          recursive,
+        ),
+      ) *>
+      promise(
+        TestNodeFsPromises.cp(
+          NodePath.join(source, "docs"),
+          NodePath.join(destination, "docs"),
+          recursive,
+        ),
+      )
+
+  private def dynamicExampleCommand(directory: String): PreviewCommand =
+    exampleCommand.copy(workingDirectory =
+      right(
+        WorkingDirectory.parseResolved(
+          resolved = directory,
+          relativeFromRoot = "",
+          separator = NodePath.sep,
+          relativeIsAbsolute = false,
+        ),
+      ),
+    )
+
+  private def dynamicPort(url: PreviewUrl): Int =
+    url.value
+      .stripPrefix("http://127.0.0.1:")
+      .toIntOption
+      .getOrElse(fail(s"unexpected dynamic URL ${url.value}"))
+
+  private def exists(path: String): IO[Boolean] =
+    promise(TestNodeFsPromises.access(path)).as(true).handleError(_ => false)
+
+  private def promise[A](value: => js.Promise[A]): IO[A] =
+    IO.fromPromise(IO.delay(value))
 
   private def managedProcess(
       dispatcher: Dispatcher[IO],
@@ -325,7 +718,20 @@ class NodeProcessSuite extends CatsEffectSuite:
         parseRoot(current).traverse_(value => root.complete(value).void) *>
           parseStarted(current).traverse_(value => ready.complete(value).void)
 
-  private def captureExample(
+  private def captureOwnedPid(
+      output: Ref[IO, String],
+      ownedPid: Deferred[IO, Int],
+  )(chunk: String): IO[Unit] =
+    output
+      .updateAndGet(_ + chunk)
+      .flatMap: current =>
+        val completePid = OwnedPidPattern
+          .findFirstMatchIn(current)
+          .flatMap(_.group(1).toIntOption)
+          .traverse_(value => ownedPid.complete(value).void)
+        completePid
+
+  private def captureFixedExample(
       output: Ref[IO, String],
       ownedPid: Deferred[IO, Int],
       ready: Deferred[IO, PreviewUrl],
@@ -337,9 +743,27 @@ class NodeProcessSuite extends CatsEffectSuite:
           .findFirstMatchIn(current)
           .flatMap(_.group(1).toIntOption)
           .traverse_(value => ownedPid.complete(value).void)
-        val completeReady = ExampleReadyPattern
+        val completeReady = FixedExampleReadyPattern
           .findFirstMatchIn(current)
           .traverse_(_ => ready.complete(exampleUrl).void)
+        completePid *> completeReady
+
+  private def captureDynamicExample(
+      output: Ref[IO, String],
+      ownedPid: Deferred[IO, Int],
+      ready: Deferred[IO, PreviewUrl],
+  )(chunk: String): IO[Unit] =
+    output
+      .updateAndGet(_ + chunk)
+      .flatMap: current =>
+        val completePid = OwnedPidPattern
+          .findFirstMatchIn(current)
+          .flatMap(_.group(1).toIntOption)
+          .traverse_(value => ownedPid.complete(value).void)
+        val completeReady = DynamicExampleReadyPattern
+          .findFirstMatchIn(current)
+          .flatMap(found => PreviewUrl.parse(found.group(1)).toOption)
+          .traverse_(value => ready.complete(value).void)
         completePid *> completeReady
 
   private def parseStarted(value: String): Option[Started] =
@@ -373,7 +797,9 @@ class NodeProcessSuite extends CatsEffectSuite:
           relativeIsAbsolute = false,
         ),
       ),
-      url = right(PreviewUrl.parse("http://127.0.0.1:4242")),
+      endpoint = PreviewEndpoint.Fixed(
+        right(PreviewUrl.parse("http://127.0.0.1:4242")),
+      ),
       startupTimeout = right(StartupTimeout.parse(5000)),
     )
 
@@ -381,6 +807,7 @@ class NodeProcessSuite extends CatsEffectSuite:
     val arguments = Vector(
       "--server",
       "--batch",
+      "set doctrellisPort := 0",
       "doctrellisPreview",
     ).zipWithIndex.map:
       case (value, index) => right(ProcessArgument.parse(value, index))
@@ -396,7 +823,22 @@ class NodeProcessSuite extends CatsEffectSuite:
           relativeIsAbsolute = false,
         ),
       ),
-      url = exampleUrl,
+      endpoint = PreviewEndpoint.Announced,
+      startupTimeout = right(StartupTimeout.parse(120000)),
+    )
+
+  private val exampleFixedCommand: PreviewCommand =
+    val arguments = Vector(
+      "--server",
+      "--batch",
+      "doctrellisPreview",
+    ).zipWithIndex.map:
+      case (value, index) => right(ProcessArgument.parse(value, index))
+    PreviewCommand(
+      executable = right(Executable.parse("sbt")),
+      arguments = arguments,
+      workingDirectory = exampleCommand.workingDirectory,
+      endpoint = PreviewEndpoint.Fixed(exampleUrl),
       startupTimeout = right(StartupTimeout.parse(120000)),
     )
 
@@ -414,7 +856,7 @@ class NodeProcessSuite extends CatsEffectSuite:
           relativeIsAbsolute = false,
         ),
       ),
-      url = exampleUrl,
+      endpoint = PreviewEndpoint.Fixed(exampleUrl),
       startupTimeout = right(StartupTimeout.parse(5000)),
     )
 
@@ -461,8 +903,10 @@ class NodeProcessSuite extends CatsEffectSuite:
   private final case class Started(pid: Int, port: Int):
     def url: String = s"http://127.0.0.1:$port"
 
-  private val StartedPattern: Regex      = "READY:([0-9]+):([0-9]+)".r
-  private val RootPattern: Regex         = "ROOT:([0-9]+)".r
-  private val OwnedPidPattern: Regex     = "Owned process tree PID: ([0-9]+)".r
-  private val ExampleReadyPattern: Regex =
+  private val StartedPattern: Regex  = "READY:([0-9]+):([0-9]+)".r
+  private val RootPattern: Regex     = "ROOT:([0-9]+)".r
+  private val OwnedPidPattern: Regex = "Owned process tree PID: ([0-9]+)".r
+  private val FixedExampleReadyPattern: Regex =
     "DocTrellis preview ready at http://127\\.0\\.0\\.1:4242".r
+  private val DynamicExampleReadyPattern: Regex =
+    "DocTrellis preview ready at (http://127\\.0\\.0\\.1:[0-9]+)".r
