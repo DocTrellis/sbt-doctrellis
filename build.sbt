@@ -1,6 +1,8 @@
 import org.scalajs.linker.interface.{ModuleKind, ModuleSplitStyle}
 import sbt.AutoPlugin
 
+val hedgehogVersion = "0.13.1"
+
 ThisBuild / organization      := "org.doctrellis"
 ThisBuild / version           := "0.1.0-SNAPSHOT"
 ThisBuild / homepage          := Some(uri("https://doctrellis.org"))
@@ -38,7 +40,8 @@ lazy val sbtDoctrellis = project
     libraryDependencies ++= Seq(
       "org.scalameta"  % "mdoc-interfaces" % "2.9.1",
       "org.typelevel" %% "laika-io"        % "1.3.2",
-      "org.scalameta" %% "munit"           % "1.3.4" % Test,
+      "org.scalameta" %% "munit"           % "1.3.4"         % Test,
+      "qa.hedgehog"   %% "hedgehog-munit"  % hedgehogVersion % Test,
     ),
     Compile / compile / wartremoverErrors ++= doctrellisWarts,
     scriptedLaunchOpts ++= Seq(
@@ -58,7 +61,10 @@ lazy val vscodeDomain = project
     Test / fork    := false,
     Compile / compile / wartremoverErrors ++= doctrellisWarts,
     // sbt 2 uses the project `platform` setting, so %% adds the _sjs1 suffix.
-    libraryDependencies += "org.scalameta" %% "munit" % "1.3.4" % Test,
+    libraryDependencies ++= Seq(
+      "org.scalameta" %% "munit"          % "1.3.4"         % Test,
+      "qa.hedgehog"   %% "hedgehog-munit" % hedgehogVersion % Test,
+    ),
   )
 
 lazy val vscodeApplication = project
