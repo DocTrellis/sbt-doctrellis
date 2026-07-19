@@ -95,6 +95,38 @@ Or build and serve the site at `http://127.0.0.1:4242` with:
 sbt doctrellisPreview
 ```
 
+### GFM task lists
+
+DocTrellis supports GitHub Flavored Markdown task markers in unordered,
+ordered, and nested lists. Both lowercase and uppercase checked markers are
+accepted, and inline Markdown after the marker is parsed normally:
+
+```markdown
+- [ ] unchecked
+- [x] **checked**
+- [X] [`doctrellisBuild`](https://doctrellis.org) executed
+
+1. [ ] ordered unchecked
+2. [x] ordered checked
+
+- [ ] parent
+  - [x] nested child
+```
+
+A marker is recognized only as the first content in a list item. Marker-like
+text in a paragraph, inline or fenced code, and an escaped marker such as
+`- \[ ]` is not converted. Rendered checkboxes are disabled because they show
+static document state, and task list elements expose `task-list-item` and
+`contains-task-list` classes for theme customization. For example:
+
+```html
+<input type="checkbox" disabled="disabled" aria-label="Incomplete task">
+<input type="checkbox" disabled="disabled" checked="checked" aria-label="Completed task">
+```
+
+Task list handling does not relax Laika validation; unrelated unresolved link
+references still fail `doctrellisBuild`.
+
 The plugin exposes these settings and tasks:
 
 | Key | Default |

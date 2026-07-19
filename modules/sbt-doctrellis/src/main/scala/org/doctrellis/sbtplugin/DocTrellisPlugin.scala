@@ -93,9 +93,11 @@ object DocTrellisPlugin extends AutoPlugin:
         Transformer
           .from(Markdown)
           .to(HTML)
-          .using(Markdown.GitHubFlavor)
+          .using(Markdown.GitHubFlavor, GfmTaskLists)
           .parallel[CatsIO]
-          .withTheme(Helium.defaults.build)
+          .withTheme(
+            Helium.defaults.site.inlineCSS(GfmTaskLists.themeCSS).build,
+          )
           .build
           .use(
             _.fromDirectory(mdocDirectory.getAbsolutePath)

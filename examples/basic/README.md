@@ -1,8 +1,9 @@
 # DocTrellis basic example
 
 This is a minimal consumer of `sbt-doctrellis`. Its Markdown contains an mdoc
-block, `directory.conf` makes `index.md` Laika's title document and defines the
-navigation order, and the plugin selects Laika's Helium theme.
+block and GFM task lists, `directory.conf` makes `index.md` Laika's title
+document and defines the navigation order, and the plugin selects Laika's
+Helium theme. `checklist.md` is a second, plan-style task list fixture.
 
 The development plugin is not published remotely. From the repository root,
 publish the current snapshot locally and then build the example:
@@ -14,7 +15,8 @@ sbt --batch doctrellisBuild
 ```
 
 The processed Markdown is written to `target/doctrellis/mdoc/index.md` and the
-site entry point to `target/doctrellis/site/index.html`.
+site entry point to `target/doctrellis/site/index.html`. The plan fixture is
+rendered to `target/doctrellis/site/checklist.html`.
 
 Start the blocking local server with:
 

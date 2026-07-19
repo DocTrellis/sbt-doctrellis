@@ -9,3 +9,9 @@ tools.map(_.toUpperCase).mkString(" + ")
 
 The generated result above proves that the Markdown code was compiled and
 evaluated rather than copied directly into the HTML site.
+
+## Task List
+
+- [x] Markdown processed by **mdoc**
+- [x] HTML rendered by [Laika](https://typelevel.org/Laika/)
+- [ ] Preview opened in `VS Code`

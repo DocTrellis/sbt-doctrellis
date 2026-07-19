@@ -4,3 +4,16 @@ $ exec grep -Fq res0: target/doctrellis/mdoc/index.md
 $ exists target/doctrellis/site/index.html
 $ exec grep -Fq Scripted target/doctrellis/site/index.html
 $ exec grep -Fq res0 target/doctrellis/site/index.html
+$ exec grep -Fq 'type="checkbox"' target/doctrellis/site/index.html
+$ exec grep -Fq 'disabled="disabled"' target/doctrellis/site/index.html
+$ exec grep -Fq 'checked="checked"' target/doctrellis/site/index.html
+$ exec grep -Fq 'aria-label="Incomplete task"' target/doctrellis/site/index.html
+$ exec grep -Fq 'task-list-item' target/doctrellis/site/index.html
+$ exec grep -Fq 'contains-task-list' target/doctrellis/site/index.html
+$ exec grep -Fq 'pipeline unchecked' target/doctrellis/site/index.html
+$ exec grep -Fq 'uppercase checked' target/doctrellis/site/index.html
+$ exec grep -Fq 'checked="checked" aria-label="Completed task"> uppercase checked' target/doctrellis/site/index.html
+$ exec grep -Fq 'href="https://doctrellis.org"' target/doctrellis/site/index.html
+$ copy-file fixtures/broken-link.md docs/broken-link.md
+-> doctrellisBuild
+$ delete docs/broken-link.md
