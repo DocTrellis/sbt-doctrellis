@@ -8,19 +8,24 @@ import org.doctrellis.vscode.infrastructure.facade.{NodeFsPromises, NodePath}
 import scala.scalajs.js
 
 private[infrastructure] object ConfigParser:
+  private enum ConfigVersion:
+    case One, Two
+
+  private object ConfigVersion:
+    def parse(value: Int): Either[ConfigProblem, ConfigVersion] = value match
+      case 1     => Right(ConfigVersion.One)
+      case 2     => Right(ConfigVersion.Two)
+      case other => Left(ConfigProblem.UnsupportedVersion(other))
+
   def parse(
       text: String,
       isAbsolute: String => Boolean,
   ): Either[ConfigProblem, PreviewTemplate] =
     decodeJson(text).flatMap: raw =>
       for
-        root    <- objectAt(raw, "$", Set("version", "preview"))
-        version <- integerAt(root, "version", "version")
-        _       <- Either.cond(
-          version == 1 || version == 2,
-          (),
-          ConfigProblem.UnsupportedVersion(version),
-        )
+        root         <- objectAt(raw, "$", Set("version", "preview"))
+        versionRaw   <- integerAt(root, "version", "version")
+        version      <- ConfigVersion.parse(versionRaw)
         previewRaw   <- fieldAt(root, "preview", "preview")
         preview      <- previewObject(previewRaw, version)
         commandRaw   <- stringAt(preview, "command", "preview.command")
@@ -50,22 +55,24 @@ private[infrastructure] object ConfigParser:
 
   private def previewObject(
       raw: js.Any,
-      version: Int,
+      version: ConfigVersion,
   ): Either[ConfigProblem, js.Dynamic] =
     val common = Set("command", "args", "workingDirectory", "startupTimeoutMs")
-    val fields = if version == 1 then common + "url" else common + "endpoint"
+    val fields = version match
+      case ConfigVersion.One => common + "url"
+      case ConfigVersion.Two => common + "endpoint"
     objectAt(raw, "preview", fields)
 
   private def previewEndpoint(
       preview: js.Dynamic,
-      version: Int,
-  ): Either[ConfigProblem, PreviewEndpoint] =
-    if version == 1 then
+      version: ConfigVersion,
+  ): Either[ConfigProblem, PreviewEndpoint] = version match
+    case ConfigVersion.One =>
       for
         raw <- stringAt(preview, "url", "preview.url")
         url <- PreviewUrl.parse(raw)
       yield PreviewEndpoint.Fixed(url)
-    else
+    case ConfigVersion.Two =>
       for
         raw      <- fieldAt(preview, "endpoint", "preview.endpoint")
         endpoint <- objectAt(

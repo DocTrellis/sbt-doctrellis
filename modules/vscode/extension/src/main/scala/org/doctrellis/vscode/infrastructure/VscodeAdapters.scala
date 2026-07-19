@@ -46,10 +46,49 @@ private[infrastructure] object VscodePreferences:
         VSWorkspace.getConfiguration("doctrellis", VSUri.parse(workspace.uri))
       val open     = settings.get("openPreviewWhenReady", true)
       val interval = settings.get("pollIntervalMs", 500)
-      PreviewPolicy
+      VscodePreferencesParser
         .parse(open, interval)
         .leftMap(problem => IllegalArgumentException(problem.message))
     .flatMap(IO.fromEither)
+
+private[infrastructure] object VscodePreferencesParser:
+  private val OpenPath     = "doctrellis.openPreviewWhenReady"
+  private val IntervalPath = "doctrellis.pollIntervalMs"
+
+  def parse(
+      openWhenReady: js.Any,
+      pollIntervalMs: js.Any,
+  ): Either[ConfigProblem, PreviewPolicy] =
+    for
+      open     <- boolean(openWhenReady, OpenPath)
+      interval <- integer(pollIntervalMs, IntervalPath)
+      policy   <- PreviewPolicy.parse(open, interval)
+    yield policy
+
+  private def boolean(
+      value: js.Any,
+      path: String,
+  ): Either[ConfigProblem, Boolean] =
+    Either.cond(
+      js.typeOf(value) == "boolean",
+      value.asInstanceOf[Boolean],
+      ConfigProblem.Expected(path, "a boolean"),
+    )
+
+  private def integer(
+      value: js.Any,
+      path: String,
+  ): Either[ConfigProblem, Int] =
+    if js.typeOf(value) != "number" then
+      Left(ConfigProblem.Expected(path, "an integer"))
+    else
+      val number = value.asInstanceOf[Double]
+      Either.cond(
+        number.isFinite && number.isWhole &&
+          number >= Int.MinValue && number <= Int.MaxValue,
+        number.toInt,
+        ConfigProblem.Expected(path, "an integer"),
+      )
 
 private[infrastructure] object WorkspaceSelection:
   def choose: IO[Option[Workspace]] =
@@ -77,9 +116,7 @@ private[infrastructure] object WorkspaceSelection:
           IO.delay(VSWindow.showQuickPick(labels.toJSArray, quickPickOptions)),
         ).map: selected =>
           selected.toOption.flatMap: label =>
-            candidates.indexWhere(_._1 == label) match
-              case -1    => None
-              case index => Some(candidates(index)._2)
+            WorkspaceOptions.select(candidates, label)
 
   def fromFolder(folder: WorkspaceFolder): Workspace =
     val uri = folder.uri.toString()

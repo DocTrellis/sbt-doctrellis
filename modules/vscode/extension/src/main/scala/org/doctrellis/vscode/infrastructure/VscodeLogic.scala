@@ -8,6 +8,12 @@ private[infrastructure] object WorkspaceOptions:
       s"${workspace.name} — ${workspace.root}" -> workspace,
     )
 
+  def select(
+      candidates: Vector[(String, Workspace)],
+      label: String,
+  ): Option[Workspace] =
+    candidates.find(_._1 == label).map(_._2)
+
 private[infrastructure] object WorkspaceTrust:
   def validate(
       required: Boolean,

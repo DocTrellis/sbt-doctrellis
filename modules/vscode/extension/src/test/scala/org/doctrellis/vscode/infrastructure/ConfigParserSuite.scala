@@ -74,10 +74,7 @@ class ConfigParserSuite extends munit.FunSuite:
       valid.replace("\"version\": 1", "\"version\": 1, \"extra\": true"),
       isAbsolute,
     )
-    assertEquals(
-      version.left.map(_.message),
-      Left("version must be 1 or 2, but was 3"),
-    )
+    assertEquals(version, Left(ConfigProblem.UnsupportedVersion(3)))
     assertEquals(extra.left.map(_.message), Left("unexpected field: extra"))
 
   test("rejects absolute working directories and non-HTTP URLs"):

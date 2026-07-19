@@ -49,7 +49,7 @@ trait WorkspaceFoldersChangeEvent extends js.Object:
 
 @js.native
 trait WorkspaceConfiguration extends js.Object:
-  def get[T](section: String, defaultValue: T): T = js.native
+  def get(section: String, defaultValue: js.Any): js.Any = js.native
 
 @js.native
 trait WorkspaceApi extends js.Object:
