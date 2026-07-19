@@ -14,7 +14,8 @@ optional practices respectively.
 ## Sources of truth
 
 - `.scalafmt.conf` is the source of truth for mechanical Scala formatting.
-- `build.sbt` is the source of truth for enabled WartRemover checks.
+- `build.sbt` is the source of truth for the sbt-tpolecat compiler-warning
+  policy and enabled WartRemover checks.
 - `.scalafix.conf` is the source of truth for import organization.
 - The accepted ADRs under `docs/adr/` are the source of truth for architectural
   decisions.
@@ -189,6 +190,23 @@ final class PreviewService[F[_]: Concurrent](
 
 Avoid adding braces around declarations and callbacks that have a direct
 indentation-based form.
+
+### Compiler warnings
+
+The compiler-warning policy is enforced by sbt-tpolecat. The default build
+mode treats warnings as errors so production and test code remain warning
+free.
+
+- Configure compiler options through sbt-tpolecat keys such as
+  `tpolecatScalacOptions` and `tpolecatExcludeOptions`; do not modify
+  `scalacOptions` directly.
+- For temporary local iteration without fatal warnings, run the
+  `tpolecatDevMode` command or launch sbt with `SBT_TPOLECAT_DEV=1`; do not edit
+  `build.sbt` to switch modes.
+- Scope exclusions as narrowly as possible and document why the excluded
+  warning cannot be fixed at its source.
+- Do not exclude a warning globally merely to accommodate one test, generated
+  source, REPL, or platform boundary.
 
 ### Import organization
 
@@ -507,7 +525,8 @@ Before requesting review, confirm that:
 - significant indentation is used wherever it improves clarity;
 - public contracts, schema, examples, and documentation agree;
 - regression and lifecycle tests cover the meaningful failure modes; and
-- formatting, WartRemover, tests, and relevant packaging checks pass.
+- formatting, compiler warnings, WartRemover, tests, and relevant packaging
+  checks pass.
 
 ## References
 
@@ -518,6 +537,7 @@ Before requesting review, confirm that:
 - [MUnit Cats Effect](https://github.com/typelevel/munit-cats-effect)
 - [Hedgehog for Scala](https://hedgehogqa.github.io/scala-hedgehog/)
 - [Hedgehog integration with MUnit](https://hedgehogqa.github.io/scala-hedgehog/docs/integration-munit/)
+- [sbt-tpolecat](https://github.com/typelevel/sbt-tpolecat)
 - [스칼라에서 속성 기반 테스트로 블록체인 개발하기](https://github.com/sungkmi/liftio-2022-slides/blob/main/liftio-2022-slides.md)
 - [Scalafix `OrganizeImports`](https://scalacenter.github.io/scalafix/docs/rules/OrganizeImports.html)
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
