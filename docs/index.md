@@ -14,3 +14,4 @@ This site documents the architecture and operating contracts of DocTrellis.
 - [Scala.js VS Code extension](adr/0003-scalajs-vscode-extension.md)
 - [Preview process contract](adr/0004-preview-process-contract.md)
 - [Workspace IPC and dynamically bound preview ports](adr/0005-workspace-ipc-dynamic-port.md)
+- [Live preview rebuild and WebView refresh](adr/0006-live-preview-rebuild-and-webview-refresh.md)
