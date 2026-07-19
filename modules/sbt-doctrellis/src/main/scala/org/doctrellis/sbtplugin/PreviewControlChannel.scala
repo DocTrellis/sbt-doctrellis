@@ -38,6 +38,7 @@ import scala.util.control.NonFatal
 private[sbtplugin] final case class PreviewControlConfig(
     runtimeDirectory: Path,
     workspaceHash: String,
+    launchId: String,
     runtimeOwner: Option[Long] = None,
 )
 
@@ -48,6 +49,7 @@ private[sbtplugin] object PreviewControlConfig:
   val HashEnvironment      = "DOCTRELLIS_WORKSPACE_HASH"
   val WorkspaceEnvironment = "DOCTRELLIS_WORKSPACE_CANONICAL"
   val OwnerEnvironment     = "DOCTRELLIS_RUNTIME_OWNER"
+  val LaunchEnvironment    = "DOCTRELLIS_LAUNCH_ID"
 
   def fromEnvironment(
       workspace: Path,
@@ -60,22 +62,23 @@ private[sbtplugin] object PreviewControlConfig:
           throw IllegalArgumentException(
             s"Unsupported DocTrellis preview protocol '$protocol'.",
           )
-        val project   = workspace.toRealPath()
+        val project       = workspace.toRealPath()
+        val canonicalText = environment.getOrElse(
+          WorkspaceEnvironment,
+          throw IllegalArgumentException(
+            "Missing canonical workspace path.",
+          ),
+        )
         val canonical = Path
           .of(
-            environment.getOrElse(
-              WorkspaceEnvironment,
-              throw IllegalArgumentException(
-                "Missing canonical workspace path.",
-              ),
-            ),
+            canonicalText,
           )
           .toRealPath()
         if !project.startsWith(canonical) then
           throw IllegalArgumentException(
             "The preview working directory is outside the canonical workspace.",
           )
-        val expected = shortHash(canonical.toString)
+        val expected = shortHash(canonicalText)
         val supplied = environment
           .getOrElse(
             HashEnvironment,
@@ -114,9 +117,16 @@ private[sbtplugin] object PreviewControlConfig:
           throw IllegalArgumentException(
             "Missing workspace IPC runtime owner.",
           )
+        val launchId = environment
+          .get(LaunchEnvironment)
+          .filter(_.nonEmpty)
+          .getOrElse(
+            throw IllegalArgumentException("Missing workspace launch ID."),
+          )
         PreviewControlConfig(
           runtimeDirectory = runtime,
           workspaceHash = expected,
+          launchId = launchId,
           runtimeOwner = runtimeOwner,
         )
 
@@ -143,6 +153,7 @@ private[sbtplugin] final case class PreviewControlMetadata(
     transport: PreviewControlTransport,
     pid: Long,
     sessionId: String,
+    launchId: String,
     token: String,
 ):
   def json: String =
@@ -151,6 +162,7 @@ private[sbtplugin] final case class PreviewControlMetadata(
       "protocol"  -> PreviewControlJson.quoted(PreviewControlConfig.Protocol),
       "pid"       -> pid.toString,
       "sessionId" -> PreviewControlJson.quoted(sessionId),
+      "launchId"  -> PreviewControlJson.quoted(launchId),
       "token"     -> PreviewControlJson.quoted(token),
     )
     val transportFields = transport match
@@ -183,7 +195,11 @@ private[sbtplugin] object PreviewControlMetadata:
           pid       <- long(fields, "pid")
           _         <- check(pid > 0L, "metadata pid must be positive")
           sessionId <- string(fields, "sessionId")
+          _         <- check(sessionId.nonEmpty, "metadata sessionId is empty")
+          launchId  <- string(fields, "launchId")
+          _         <- check(launchId.nonEmpty, "metadata launchId is empty")
           token     <- string(fields, "token")
+          _         <- check(token.length >= 32, "metadata token is too short")
           kind      <- string(fields, "transport")
           transport <- kind match
             case "unix" =>
@@ -207,6 +223,7 @@ private[sbtplugin] object PreviewControlMetadata:
           transport = transport,
           pid = pid,
           sessionId = sessionId,
+          launchId = launchId,
           token = token,
         )
 
@@ -303,14 +320,33 @@ private[sbtplugin] final class PreviewControlServer private (
       failure.foreach(throw _)
 
   private def acceptLoop(): Unit =
-    try
-      while !closed.get() do
+    while !closed.get() do
+      try
         val client = server.accept()
-        executor.execute(() => handle(client))
-    catch
-      case NonFatal(error) if !closed.get() =>
-        log.error(s"DocTrellis IPC accept loop failed: ${error.getMessage}")
-      case NonFatal(_) => ()
+        try executor.execute(() => handle(client))
+        catch
+          case NonFatal(error) =>
+            try client.close()
+            catch
+              case NonFatal(cleanupError) => error.addSuppressed(cleanupError)
+            throw error
+      catch
+        case NonFatal(error) if !closed.get() =>
+          log.warn(
+            s"DocTrellis IPC accept failed; retrying: ${error.getMessage}",
+          )
+          try Thread.sleep(50L)
+          catch
+            case _: InterruptedException =>
+              Thread.currentThread().interrupt()
+              if !closed.get() then
+                try close()
+                catch
+                  case NonFatal(closeError) =>
+                    log.warn(
+                      s"DocTrellis IPC accept loop could not close after interruption: ${closeError.getMessage}",
+                    )
+        case NonFatal(_) => ()
 
   private def handle(channel: SocketChannel): Unit =
     val input   = Channels.newInputStream(channel)
@@ -379,6 +415,7 @@ private[sbtplugin] final class PreviewControlServer private (
                                 url = readyUrl,
                                 pid = metadata.pid,
                                 sessionId = metadata.sessionId,
+                                launchId = metadata.launchId,
                                 requestId = requestId,
                               ),
                             )
@@ -482,6 +519,7 @@ private[sbtplugin] object PreviewControlServer:
         transport = transport,
         pid = pid,
         sessionId = sessionId,
+        launchId = config.launchId,
         token = token,
       )
       PreviewControlEndpoint.publish(paths.metadataPath, metadata)
@@ -603,6 +641,7 @@ private[sbtplugin] object PreviewControlEndpoint:
         .getOrElse(PreviewControlTransport.Tcp("127.0.0.1", 0)),
       pid = pid,
       sessionId = sessionId,
+      launchId = config.launchId,
       token = token,
     )
     val lease = PreviewEndpointLease.acquire(lockPath)
@@ -819,7 +858,10 @@ private[sbtplugin] final class PreviewFrameDecoder(maxFrameBytes: Int):
         else frames += String(raw, 0, length, StandardCharsets.UTF_8)
       else
         pending.write(byte.toInt)
-        if pending.size() > maxFrameBytes then
+        val pendingBytes                  = pending.size()
+        val allowedTrailingCarriageReturn =
+          pendingBytes == maxFrameBytes + 1 && byte == '\r'.toByte
+        if pendingBytes > maxFrameBytes && !allowedTrailingCarriageReturn then
           error = Some(s"IPC frame exceeds $maxFrameBytes bytes")
       index += 1
     error.toLeft(frames.result())
@@ -859,6 +901,7 @@ private[sbtplugin] object PreviewControlProtocol:
       url: String,
       pid: Long,
       sessionId: String,
+      launchId: String,
       requestId: String,
   ): String =
     response(
@@ -868,6 +911,7 @@ private[sbtplugin] object PreviewControlProtocol:
         "url"       -> PreviewControlJson.quoted(url),
         "pid"       -> pid.toString,
         "sessionId" -> PreviewControlJson.quoted(sessionId),
+        "launchId"  -> PreviewControlJson.quoted(launchId),
       ),
     )
 
@@ -908,6 +952,9 @@ private[sbtplugin] object PreviewControlProtocol:
           fields
             .get("sessionId")
             .contains(PreviewControlJson.Atom.Text(metadata.sessionId)) &&
+          fields
+            .get("launchId")
+            .contains(PreviewControlJson.Atom.Text(metadata.launchId)) &&
           fields
             .get("pid")
             .contains(PreviewControlJson.Atom.Number(metadata.pid)) &&

@@ -18,6 +18,14 @@ private[infrastructure] object ProcessPlatform:
   def parse(value: String): ProcessPlatform =
     if value == "win32" then ProcessPlatform.Windows else ProcessPlatform.Posix
 
+private[infrastructure] object NodeError:
+  def hasCode(error: Throwable, expected: String): Boolean =
+    val raw = error match
+      case js.JavaScriptException(exception) => exception
+      case _                                 => error.asInstanceOf[js.Any]
+    val code = raw.asInstanceOf[js.Dynamic].selectDynamic("code")
+    NodeProcess.present(code) && code.toString == expected
+
 private[infrastructure] final case class ProcessShutdownTimeouts(
     graceful: FiniteDuration,
     forced: FiniteDuration,
@@ -308,11 +316,11 @@ private[infrastructure] final case class OwnedProcess(
         )
 
   private def missingProcess(error: Throwable): Boolean =
-    Option(error.getMessage).exists(_.contains("ESRCH"))
+    NodeError.hasCode(error, "ESRCH")
 
 private[infrastructure] object OwnedProcess:
   def permissionDenied(error: Throwable): Boolean =
-    Option(error.getMessage).exists(_.contains("EPERM"))
+    NodeError.hasCode(error, "EPERM")
 
   def configuredTaskkillExecutable: String =
     taskkillExecutable(

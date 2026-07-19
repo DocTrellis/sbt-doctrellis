@@ -13,7 +13,8 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 class PreviewControlChannelSuite extends munit.FunSuite:
-  private val hello =
+  private val launchId = "test-launch"
+  private val hello    =
     """{"version":1,"type":"hello","token":"token","clientId":"client","requestId":"request"}"""
 
   test("NDJSON framing accepts every split position"):
@@ -35,6 +36,14 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       decoder.offer(bytes, bytes.length),
       Right(Vector(hello, hello)),
     )
+
+  test("NDJSON framing accepts an exact maximum CRLF frame across chunks"):
+    val payload = "x" * PreviewControlProtocol.MaxFrameBytes
+    val decoder = PreviewFrameDecoder(PreviewControlProtocol.MaxFrameBytes)
+    val prefix  = (payload + "\r").getBytes(StandardCharsets.UTF_8)
+    val newline = Array('\n'.toByte)
+    assertEquals(decoder.offer(prefix, prefix.length), Right(Vector.empty))
+    assertEquals(decoder.offer(newline, newline.length), Right(Vector(payload)))
 
   test("NDJSON framing rejects malformed and oversized frames"):
     val oversized =
@@ -88,6 +97,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       PreviewControlConfig.RuntimeEnvironment  -> runtime.toString,
       PreviewControlConfig.HashEnvironment     -> hash,
       PreviewControlConfig.WorkspaceEnvironment -> canonical.toString,
+      PreviewControlConfig.LaunchEnvironment    -> "environment-launch",
     ) ++ owner.map(value =>
       PreviewControlConfig.OwnerEnvironment -> value.toString,
     )
@@ -98,6 +108,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           PreviewControlConfig(
             runtimeDirectory = runtime.toAbsolutePath.normalize(),
             workspaceHash = hash,
+            launchId = "environment-launch",
             runtimeOwner = owner,
           ),
         ),
@@ -113,6 +124,14 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           ),
         ).getMessage.contains("hash"),
       )
+      assert(
+        intercept[IllegalArgumentException](
+          PreviewControlConfig.fromEnvironment(
+            project,
+            environment - PreviewControlConfig.LaunchEnvironment,
+          ),
+        ).getMessage.contains("launch ID"),
+      )
     finally
       deleteTree(runtime)
       deleteTree(workspace)
@@ -126,13 +145,23 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       transport = PreviewControlTransport.Unix(socket),
       pid = Long.MaxValue,
       sessionId = "stale-session",
+      launchId = "stale-launch",
       token = "0" * 64,
+    )
+    assert(
+      PreviewControlMetadata
+        .parse(stale.json.replace("0" * 64, "short"))
+        .isLeft,
     )
     try
       Files.writeString(socket, "stale")
       Files.writeString(metadataPath, stale.json)
       val prepared = PreviewControlEndpoint.prepare(
-        config = PreviewControlConfig(runtime, hash),
+        config = PreviewControlConfig(
+          runtimeDirectory = runtime,
+          workspaceHash = hash,
+          launchId = launchId,
+        ),
         pid = ProcessHandle.current().pid(),
         sessionId = "replacement-session",
         token = "1" * 64,
@@ -161,6 +190,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       transport = PreviewControlTransport.Unix(staleSocket),
       pid = Long.MaxValue,
       sessionId = "stale-session",
+      launchId = "stale-launch",
       token = "0" * 64,
     )
     val start = CountDownLatch(1)
@@ -179,6 +209,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
                     config = PreviewControlConfig(
                       runtimeDirectory = runtime,
                       workspaceHash = hash,
+                      launchId = launchId,
                     ),
                     pid = ProcessHandle.current().pid(),
                     sessionId = session,
@@ -222,6 +253,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             config = PreviewControlConfig(
               runtimeDirectory = link,
               workspaceHash = "4123456789abcdef01234567",
+              launchId = launchId,
               runtimeOwner = Some(runtimeOwner(target)),
             ),
             pid = ProcessHandle.current().pid(),
@@ -234,6 +266,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             config = PreviewControlConfig(
               runtimeDirectory = target,
               workspaceHash = "5123456789abcdef01234567",
+              launchId = launchId,
               runtimeOwner = Some(runtimeOwner(target) + 1L),
             ),
             pid = ProcessHandle.current().pid(),
@@ -251,7 +284,11 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       Files.writeString(metadataPath, "not-json")
       intercept[IllegalStateException](
         PreviewControlEndpoint.prepare(
-          config = PreviewControlConfig(runtime, hash),
+          config = PreviewControlConfig(
+            runtimeDirectory = runtime,
+            workspaceHash = hash,
+            launchId = launchId,
+          ),
           pid = ProcessHandle.current().pid(),
           sessionId = "new-session",
           token = "1" * 64,
@@ -283,16 +320,21 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         second.stopServer()
         second.stopExecutor()
 
-  test("fixed port 4242 remains available for direct CLI previews"):
+  test("a configured positive port is preserved for direct CLI previews"):
     withSite: site =>
-      val binding = PreviewHttpBinding.start(site, "127.0.0.1", 4242)
+      val configured = Using.resource(new ServerSocket(0))(_.getLocalPort)
+      val binding    = PreviewHttpBinding.start(
+        site,
+        "127.0.0.1",
+        configured,
+      )
       try
-        assertEquals(binding.port, 4242)
+        assertEquals(binding.port, configured)
         assertEquals(status(binding.url), 200)
       finally
         binding.stopServer()
         binding.stopExecutor()
-      assertPortReusable(4242)
+      assertPortReusable(configured)
 
   test("control channel authenticates, announces actual URL, and stops HTTP"):
     withSite: site =>
@@ -307,6 +349,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         config = PreviewControlConfig(
           runtimeDirectory = runtime,
           workspaceHash = "0123456789abcdef01234567",
+          launchId = launchId,
         ),
         readyUrl = binding.url,
         onStop = () => shutdown.stop(),
@@ -325,6 +368,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             config = PreviewControlConfig(
               runtimeDirectory = runtime,
               workspaceHash = "0123456789abcdef01234567",
+              launchId = "competing-launch",
             ),
             readyUrl = binding.url,
             onStop = () => (),
@@ -386,6 +430,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           assert(ready.contains("\"type\":\"ready\""))
           assert(ready.contains(PreviewControlJson.quoted(binding.url)))
           assert(ready.contains(s"\"pid\":${ProcessHandle.current().pid()}"))
+          assert(ready.contains(s"\"launchId\":\"$launchId\""))
           assertEquals(status(binding.url), 200)
 
           write(

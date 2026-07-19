@@ -407,7 +407,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           onDispose: IO[Unit],
       ): IO[PreviewPanel] =
         IO.delay:
-          val panel = FakePanel(onDispose, failOnDispose = created.isEmpty)
+          val panel = FakePanel(onDispose, failOnDispose = true)
           created += panel
           panel
 
@@ -420,6 +420,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             registry.show(second, PreviewViewState.Starting) *>
             release.attempt.map: result =>
               assert(result.isLeft)
+              assertEquals(
+                result.swap.toOption.toVector.flatMap(_.getSuppressed).size,
+                1,
+              )
               assertEquals(created.map(_.disposed).toList, List(true, true))
 
   test("cancellation abandons an empty display reservation"):

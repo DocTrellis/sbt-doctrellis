@@ -5,6 +5,8 @@ import cats.syntax.all.*
 import munit.CatsEffectSuite
 import org.doctrellis.vscode.domain.*
 
+import scala.concurrent.duration.*
+
 class PreviewServiceSuite extends CatsEffectSuite:
   private val workspace =
     Workspace("file:///workspace", "example", "/workspace", "file:///workspace")
@@ -47,6 +49,170 @@ class PreviewServiceSuite extends CatsEffectSuite:
             .map(assertEquals(_, 1))
       released <- releases.get
     yield assertEquals(released, 1)
+
+  test("a slow launch does not block a different workspace"):
+    val second = workspace.copy(
+      key = "file:///workspace-two",
+      name = "example-two",
+      root = "/workspace-two",
+      uri = "file:///workspace-two",
+    )
+    for
+      firstEntered  <- Deferred[IO, Unit]
+      continueFirst <- Deferred[IO, Unit]
+      secondEntered <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (current, _) =>
+          Resource.eval:
+            if current.key == workspace.key then
+              firstEntered.complete(()).void *>
+                continueFirst.get.as(RunningProcess(IO.never))
+            else secondEntered.complete(()).as(RunningProcess(IO.never))
+        ,
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      _ <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            first  <- service.start(workspace).start
+            _      <- firstEntered.get
+            second <- service.start(second).start
+            _      <- secondEntered.get
+              .timeout(1.second)
+              .guarantee(continueFirst.complete(()).void)
+            _ <- first.joinWithNever
+            _ <- second.joinWithNever
+          yield ()
+    yield ()
+
+  test("stop all cancels and waits for an in-flight launch"):
+    for
+      launchEntered <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.eval(
+            launchEntered.complete(()).void *> IO.never[RunningProcess[IO]],
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).attempt.start
+            _        <- launchEntered.get
+            _        <- service.stopAll.timeout(1.second)
+            outcome  <- starting.joinWithNever.timeout(1.second)
+          yield outcome
+    yield assert(result.left.exists(_.isInstanceOf[PreviewServiceClosed]))
+
+  test("explicit stop cancels an in-flight launch for its workspace"):
+    for
+      launchEntered <- Deferred[IO, Unit]
+      states        <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.eval(
+            launchEntered.complete(()).void *> IO.never[RunningProcess[IO]],
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, state) => states.update(_ :+ state),
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).attempt.start
+            _        <- launchEntered.get
+            _        <- service.stop(workspace).timeout(1.second)
+            outcome  <- starting.joinWithNever.timeout(1.second)
+          yield outcome
+      actual <- states.get
+    yield
+      assert(result.left.exists(_.isInstanceOf[PreviewLaunchStopped]))
+      assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
+
+  test("stop releases a process acquired at the cancellation boundary"):
+    for
+      launchEntered   <- Deferred[IO, Unit]
+      continueAcquire <- Deferred[IO, Unit]
+      released        <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            IO.uncancelable: _ =>
+              launchEntered.complete(()).void *>
+                continueAcquire.get.as(RunningProcess(IO.never)),
+          )(_ => released.complete(()).void),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).attempt.start
+            _        <- launchEntered.get
+            stopping <- service.stop(workspace).start
+            _        <- IO.cede
+            _        <- continueAcquire.complete(())
+            _        <- released.get.timeout(1.second)
+            outcome  <- starting.joinWithNever.timeout(1.second)
+            _        <- stopping.joinWithNever.timeout(1.second)
+          yield outcome
+    yield assert(result.left.exists(_.isInstanceOf[PreviewLaunchStopped]))
+
+  test("cancelling a registered launch does not strand shutdown"):
+    for
+      loadEntered <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => loadEntered.complete(()).void *> IO.never,
+        policy = _ => IO.pure(policy),
+        launch = (_, _) => Resource.pure(RunningProcess(IO.never)),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      _ <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).start
+            _        <- loadEntered.get
+            _        <- starting.cancel
+            _        <- service.stopAll.timeout(1.second)
+          yield ()
+    yield ()
 
   test("reports an exit that happens before readiness"):
     val exit  = ProcessExit(Some(1), None, None)
@@ -492,6 +658,43 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield result
     yield assertEquals(actual, Vector(urlOf(command)))
 
+  test("openExternal reports an announced preview that is still starting"):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    for
+      launched <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.eval(
+            launched
+              .complete(())
+              .as(
+                RunningProcess.announced(
+                  awaitExit = IO.never,
+                  awaitUrl = IO.never,
+                ),
+              ),
+          ),
+        probe = _ => IO.pure(false),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            starting <- service.start(workspace).attempt.start
+            _        <- launched.get
+            external <- service.openExternal(workspace).attempt
+            _        <- service.stop(workspace)
+            _        <- starting.joinWithNever
+          yield external
+    yield assert(result.left.exists(_.isInstanceOf[DynamicPreviewStarting]))
+
   test("open without an active session reports a stopped preview"):
     for
       shown  <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
@@ -807,7 +1010,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(count, 1)
       assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
-  test("stop racing a ready display converges the panel to stopped"):
+  test("ready completion does not wait for panel display"):
     val exit = ProcessExit(None, Some("SIGTERM"), None)
     for
       infoEntered  <- Deferred[IO, Unit]
@@ -833,12 +1036,11 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .use: service =>
           for
             start  <- service.start(workspace).attempt.start
+            result <- start.joinWithNever.timeout(1.second)
             _      <- infoEntered.get
             _      <- service.stop(workspace)
             _      <- continueInfo.complete(())
-            result <- start.joinWithNever
-            _      <- IO(assertStoppedDuringStartup(result))
-          yield ()
+          yield assert(result.isRight)
       actual <- states.get
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
@@ -888,7 +1090,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
             _          <- replacementReady.get
             _          <- continueInfo.complete(())
             first      <- firstStart.joinWithNever
-            _          <- IO(assertStoppedDuringStartup(first))
+            _          <- IO(assert(first.isRight))
             _          <- restart.joinWithNever
             current    <- states.get
           yield current
@@ -1167,6 +1369,47 @@ class PreviewServiceSuite extends CatsEffectSuite:
             service.stopAll
       count <- releases.get
     yield assertEquals(count, 4)
+
+  test("stops independent workspace sessions concurrently"):
+    val second = workspace.copy(
+      key = "file:///workspace-two",
+      name = "example-two",
+      root = "/workspace-two",
+      uri = "file:///workspace-two",
+    )
+    for
+      firstEntered  <- Deferred[IO, Unit]
+      secondEntered <- Deferred[IO, Unit]
+      continueClose <- Deferred[IO, Unit]
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(command),
+        policy = _ => IO.pure(policy),
+        launch = (current, _) =>
+          Resource.make(IO.pure(RunningProcess(IO.never)))(_ =>
+            (if current.key == workspace.key then firstEntered
+             else secondEntered).complete(()).void *>
+              continueClose.get,
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      _ <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _        <- service.start(workspace)
+            _        <- service.start(second)
+            stopping <- service.stopAll.start
+            _        <- (firstEntered.get, secondEntered.get).parTupled
+              .timeout(1.second)
+              .guarantee(continueClose.complete(()).void)
+            _ <- stopping.joinWithNever
+          yield ()
+    yield ()
 
   test("announced IPC URL is probed and stored as the ready session URL"):
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)

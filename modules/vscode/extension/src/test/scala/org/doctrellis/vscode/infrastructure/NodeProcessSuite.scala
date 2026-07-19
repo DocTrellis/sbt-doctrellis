@@ -50,6 +50,17 @@ class NodeProcessSuite extends CatsEffectSuite:
         OwnedProcess.taskkillArguments(pid = 1234, force = false),
         Vector("/PID", "1234", "/T"),
       )
+
+  test("process errors use the Node code instead of message substrings"):
+    IO:
+      val missing = new js.JavaScriptException(
+        js.Dynamic.literal(code = "ESRCH", message = "process unavailable"),
+      )
+      val misleading = new js.JavaScriptException(
+        js.Dynamic.literal(code = "EIO", message = "path contains EPERM"),
+      )
+      assert(NodeError.hasCode(missing, "ESRCH"))
+      assert(!NodeError.hasCode(misleading, "EPERM"))
       assertEquals(
         OwnedProcess.taskkillArguments(pid = 1234, force = true),
         Vector("/PID", "1234", "/T", "/F"),
@@ -520,7 +531,7 @@ class NodeProcessSuite extends CatsEffectSuite:
         .launchWithEnvironment(
           dispatcher = dispatcher,
           append = captureDynamicExample(log, ownedPid, ready),
-          environment = endpoint.environment,
+          environment = endpoint.environment("signal-cleanup-launch"),
         )(exampleWorkspace, exampleCommand)
         .use: running =>
           for
@@ -575,7 +586,7 @@ class NodeProcessSuite extends CatsEffectSuite:
           for
             fixture <- occupiedReady.get.timeout(5.seconds)
             stale =
-              s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":2147483647,"sessionId":"stale-session","token":"${"0" * 64}"}"""
+              s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":2147483647,"sessionId":"stale-session","launchId":"stale-launch","token":"${"0" * 64}"}"""
             _ <- promise(
               TestNodeFsPromises.writeFile(endpoint.metadataPath, stale),
             )

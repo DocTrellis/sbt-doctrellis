@@ -35,6 +35,12 @@ on the extension host in Remote SSH and Dev Containers, while only HTTP goes
 through `asExternalUri`. A second window can observe and reuse a live workspace
 URL after correlated ready and ping responses, but holds a read-only lease and
 does not stop the process owned by the first window.
+A concurrent cold start also carries a random launch ID through the child
+environment, endpoint metadata, and ready response, so a losing window cannot
+adopt or stop the winning window's process.
+Restart from an observing window releases and reacquires the read-only lease;
+it does not restart the process owned by the first window. The announced IPC
+mode requires the plugin host to remain `127.0.0.1`.
 
 On Windows, set `command` to a native executable such as an `sbt.exe`
 package-manager shim or its absolute path. The extension deliberately uses

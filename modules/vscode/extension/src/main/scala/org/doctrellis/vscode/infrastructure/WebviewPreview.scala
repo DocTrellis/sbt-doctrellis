@@ -244,9 +244,12 @@ private[infrastructure] final class PreviewPanelRegistry private (
           .flatMap(_.panel.toList)
           .traverse(_.panel.dispose.attempt)
           .flatMap: results =>
-            results.collectFirst { case Left(error) => error } match
-              case Some(error) => IO.raiseError(error)
-              case None        => IO.unit
+            results.collect { case Left(error) => error } match
+              case first :: remaining =>
+                IO.delay(
+                  remaining.foreach(first.addSuppressed),
+                ) *> IO.raiseError(first)
+              case Nil => IO.unit
 
 private[infrastructure] object PreviewPanelRegistry:
   private final class Revision

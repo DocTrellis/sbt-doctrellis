@@ -159,6 +159,8 @@ private[sbtplugin] object PreviewServer:
       port: Int,
       log: Logger,
   ): Unit =
+    val controlConfig = PreviewControlConfig.fromEnvironment(workspace, sys.env)
+    PreviewHost.requireCompatible(host, controlConfig.nonEmpty)
     val binding = PreviewHttpBinding.start(root, host, port)
     val stopped = CountDownLatch(1)
 
@@ -192,8 +194,7 @@ private[sbtplugin] object PreviewServer:
     java.lang.Runtime.getRuntime.addShutdownHook(shutdownHook)
     var primaryFailure = Option.empty[Throwable]
     try
-      PreviewControlConfig
-        .fromEnvironment(workspace, sys.env)
+      controlConfig
         .map(config =>
           PreviewControlServer.open(
             config = config,
@@ -213,11 +214,13 @@ private[sbtplugin] object PreviewServer:
         throw error
     finally
       try
+        var restoreInterrupt               = Thread.interrupted()
         var cleanupFailure                 = Option.empty[Throwable]
         def cleanup(action: => Unit): Unit =
           try action
           catch
-            case NonFatal(error) =>
+            case _: InterruptedException => restoreInterrupt = true
+            case NonFatal(error)         =>
               cleanupFailure match
                 case None           => cleanupFailure = Some(error)
                 case Some(existing) => existing.addSuppressed(error)
@@ -230,6 +233,7 @@ private[sbtplugin] object PreviewServer:
         )
         cleanup(currentControl.foreach(_.close()))
         cleanup(shutdown.stop())
+        if restoreInterrupt then Thread.currentThread().interrupt()
         cleanupFailure.foreach: error =>
           primaryFailure match
             case Some(primary) => primary.addSuppressed(error)
@@ -237,6 +241,13 @@ private[sbtplugin] object PreviewServer:
       finally
         try java.lang.Runtime.getRuntime.removeShutdownHook(shutdownHook)
         catch case _: IllegalStateException => ()
+
+private[sbtplugin] object PreviewHost:
+  def requireCompatible(host: String, controlEnabled: Boolean): Unit =
+    if controlEnabled && host != "127.0.0.1" then
+      throw IllegalArgumentException(
+        "DocTrellis IPC preview requires doctrellisHost := \"127.0.0.1\".",
+      )
 
 private[sbtplugin] final class PreviewHttpBinding private (
     val url: String,
@@ -251,23 +262,29 @@ private[sbtplugin] final class PreviewHttpBinding private (
 private[sbtplugin] object PreviewHttpBinding:
   def start(root: Path, host: String, port: Int): PreviewHttpBinding =
     val executor = Executors.newCachedThreadPool()
-    val server   =
-      com.sun.net.httpserver.HttpServer.create(InetSocketAddress(host, port), 0)
+    var server   = Option.empty[com.sun.net.httpserver.HttpServer]
     try
-      server.createContext("/", StaticSiteHandler(root))
-      server.setExecutor(executor)
-      server.start()
-      val actualPort = server.getAddress.getPort
+      val created = com.sun.net.httpserver.HttpServer.create(
+        InetSocketAddress(host, port),
+        0,
+      )
+      server = Some(created)
+      created.createContext("/", StaticSiteHandler(root))
+      created.setExecutor(executor)
+      created.start()
+      val actualPort = created.getAddress.getPort
       new PreviewHttpBinding(
         url = s"http://$host:$actualPort",
         port = actualPort,
-        server = server,
+        server = created,
         executor = executor,
       )
     catch
-      case error: Throwable =>
-        server.stop(0)
-        executor.shutdownNow()
+      case NonFatal(error) =>
+        try server.foreach(_.stop(0))
+        catch case NonFatal(cleanupError) => error.addSuppressed(cleanupError)
+        try executor.shutdownNow()
+        catch case NonFatal(cleanupError) => error.addSuppressed(cleanupError)
         throw error
 
 private[sbtplugin] final class PreviewServerShutdown(
@@ -285,7 +302,9 @@ private[sbtplugin] final class PreviewServerShutdown(
         try action()
         catch
           case NonFatal(error) =>
-            if failure.isEmpty then failure = Some(error)
+            failure match
+              case None           => failure = Some(error)
+              case Some(existing) => existing.addSuppressed(error)
 
       attempt(stopServer)
       attempt(stopExecutor)

@@ -29,3 +29,11 @@ class ModelSuite extends munit.FunSuite:
       WorkingDirectory.parseResolved("/outside", "../outside", "/", false)
     assertEquals(contained.map(_.value), Right("/workspace/docs"))
     assert(escaped.isLeft)
+
+  test("renders a synthesized process error before generic exit status"):
+    val exit = ProcessExit(
+      code = None,
+      signal = None,
+      error = Some("workspace IPC connection ended"),
+    )
+    assertEquals(exit.render, "workspace IPC connection ended")

@@ -36,3 +36,25 @@ class PreviewServerShutdownSuite extends FunSuite:
     assertEquals(actual, failure)
     assertEquals(executorStops, 1)
     assertEquals(signals, 1)
+
+  test("shutdown preserves secondary cleanup failures"):
+    val serverFailure   = IllegalStateException("server stop failed")
+    val executorFailure = IllegalStateException("executor stop failed")
+    val shutdown        = PreviewServerShutdown(
+      stopServer = () => throw serverFailure,
+      stopExecutor = () => throw executorFailure,
+      signalStopped = () => (),
+    )
+
+    val actual = intercept[IllegalStateException](shutdown.stop())
+
+    assertEquals(actual, serverFailure)
+    assertEquals(actual.getSuppressed.toVector, Vector(executorFailure))
+
+  test("IPC previews require the loopback host while direct previews do not"):
+    PreviewHost.requireCompatible("0.0.0.0", controlEnabled = false)
+    PreviewHost.requireCompatible("127.0.0.1", controlEnabled = true)
+    val failure = intercept[IllegalArgumentException](
+      PreviewHost.requireCompatible("0.0.0.0", controlEnabled = true),
+    )
+    assert(failure.getMessage.contains("127.0.0.1"))

@@ -64,18 +64,29 @@ PID is confirmed dead. Malformed metadata, a live PID, or a valid handshake
 protects the endpoint. The empty lock file is persistent coordination state;
 metadata and session sockets are removed on shutdown.
 
-Each server generates a 256-bit random token and session ID. The token is
-stored only in the current-user endpoint metadata, sent on control requests,
-compared in constant time by the plugin, and never logged. A second VS Code
+Each extension launch generates a launch ID, and each server generates a
+256-bit random token and session ID. The launch ID crosses the process boundary
+in the environment and is repeated in endpoint metadata and the `ready`
+response. The token is stored only in the current-user endpoint metadata, sent
+on control requests, compared in constant time by the plugin, and never logged.
+A second VS Code
 window can authenticate and reuse the existing ready URL as a read-only lease.
 Reuse is accepted only after both the correlated `ready` response and a
 correlated `ping`/`pong` exchange, so a recycled Windows loopback port cannot
-impersonate a live preview.
-The spawning window remains the sole lifecycle owner; releasing an observer
-does not stop another window's process. If two windows race before either
-server has published `ready`, the operating-system file lock chooses one owner
-and the loser fails clearly; retrying Start after publication reuses the
-winner.
+impersonate a live preview. When metadata identifies a live owner, reuse
+retries within the configured startup timeout; a missing or dead owner proceeds
+directly to a new launch and stale cleanup.
+The spawning window accepts an owned connection only when all three launch IDs
+match, so it remains the sole lifecycle owner; releasing an observer does not
+stop another window's process. If two windows race before either server has
+published `ready`, the operating-system file lock chooses one owner. The loser
+cannot adopt or stop the winner and fails clearly; retrying Start after
+publication reuses the winner.
+
+The token is a local bearer credential, not mutual authentication. On Windows,
+the initial `hello` can disclose a stale session's token to a process that has
+recycled its loopback port. That token cannot authenticate a fresh session, is
+never logged, and endpoint metadata remains restricted to the current user.
 
 ## Protocol
 
@@ -87,15 +98,19 @@ unknown-version, and unknown-type messages are errors.
 Every request contains `version`, `type`, `token`, `clientId`, and `requestId`:
 
 - client to plugin: `hello`, `ping`, `stop`;
-- plugin to client: `ready` (`url`, `pid`, `sessionId`), `pong`, `stopping`,
-  `stopped`, and `error` (`code`, `message`).
+- plugin to client: `ready` (`url`, `pid`, `sessionId`, `launchId`), `pong`,
+  `stopping`, `stopped`, and `error` (`code`, `message`).
 
-The client accepts `ready` only for its hello request, metadata PID, and session
-ID. A second ready frame is rejected whether its URL is duplicate or
+The client accepts `ready` only for its hello request, metadata PID, session ID,
+and launch ID. A second ready frame is rejected whether its URL is duplicate or
 conflicting. Stop first waits for `stopping`/`stopped`; disconnect, timeout, or
 an error falls back to the exact owned process-tree termination from ADR 0004.
 The single startup timeout covers both the IPC announcement and the HTTP probe,
 and both phases race the owned process exit.
+
+Announced IPC previews require `doctrellisHost := "127.0.0.1"`; the plugin
+rejects other hosts before binding. Direct fixed-port CLI previews retain the
+configurable host setting.
 
 ## Compatibility
 
@@ -110,6 +125,10 @@ Version-specific fields are exclusive: version 1 requires `url` and rejects
 `endpoint`; version 2 requires the exact IPC endpoint declaration and rejects
 `url`. Dynamic Open Preview without a live session displays a Start-required
 message instead of guessing a URL.
+
+Restart from an observer window releases and reacquires its read-only lease; it
+does not restart the process owned by another window. Only an owner-window
+Restart stops and launches the preview process.
 
 ## Consequences
 

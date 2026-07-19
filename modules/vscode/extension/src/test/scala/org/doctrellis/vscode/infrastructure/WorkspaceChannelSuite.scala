@@ -1,5 +1,6 @@
 package org.doctrellis.vscode.infrastructure
 
+import cats.effect.std.Dispatcher
 import cats.effect.{Deferred, IO, Ref}
 import munit.CatsEffectSuite
 import org.doctrellis.vscode.domain.*
@@ -29,6 +30,12 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       Right(Vector(frame, frame)),
     )
 
+  test("NDJSON framing accepts an exact maximum CRLF frame across chunks"):
+    val payload = "x" * WorkspaceChannel.MaxFrameBytes
+    val decoder = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+    assertEquals(decoder.offer(payload + "\r"), Right(Vector.empty))
+    assertEquals(decoder.offer("\n"), Right(Vector(payload)))
+
   test("NDJSON framing rejects empty and oversized frames"):
     val empty = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
     assert(empty.offer("\n").isLeft)
@@ -43,6 +50,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       stopRequestId = None,
       expectedSessionId = "session",
       expectedPid = 42,
+      expectedLaunchId = "launch",
     )
     assertEquals(valid, Right(WorkspaceChannelMessage.Ready(firstUrl)))
     assert(
@@ -54,6 +62,21 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           stopRequestId = None,
           expectedSessionId = "session",
           expectedPid = 42,
+          expectedLaunchId = "launch",
+        )
+        .isLeft,
+    )
+    assert(
+      WorkspaceChannelProtocol
+        .decodeServer(
+          frame = readyFrame(firstUrl, requestId = "hello", pid = 42)
+            .replace("\"launchId\":\"launch\"", "\"launchId\":\"other\""),
+          helloRequestId = "hello",
+          pingRequestId = None,
+          stopRequestId = None,
+          expectedSessionId = "session",
+          expectedPid = 42,
+          expectedLaunchId = "launch",
         )
         .isLeft,
     )
@@ -66,6 +89,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           stopRequestId = None,
           expectedSessionId = "session",
           expectedPid = 42,
+          expectedLaunchId = "launch",
         )
         .isLeft,
     )
@@ -78,6 +102,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           stopRequestId = None,
           expectedSessionId = "session",
           expectedPid = 42,
+          expectedLaunchId = "launch",
         )
         .isLeft,
     )
@@ -91,6 +116,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           stopRequestId = None,
           expectedSessionId = "session",
           expectedPid = 42,
+          expectedLaunchId = "launch",
         )
         .isLeft,
     )
@@ -104,6 +130,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           stopRequestId = None,
           expectedSessionId = "session",
           expectedPid = 42,
+          expectedLaunchId = "launch",
         )
         .isLeft,
     )
@@ -116,6 +143,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       stopRequestId = None,
       expectedSessionId = "session",
       expectedPid = 42,
+      expectedLaunchId = "launch",
     )
     val unknown = WorkspaceChannelProtocol.decodeServer(
       frame = """{"version":1,"type":"pong","requestId":"other"}""",
@@ -124,6 +152,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       stopRequestId = None,
       expectedSessionId = "session",
       expectedPid = 42,
+      expectedLaunchId = "launch",
     )
     assertEquals(valid, Right(WorkspaceChannelMessage.Pong))
     assert(unknown.isLeft)
@@ -157,8 +186,9 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       runtimeOwner = Some(501),
     )
     val valid =
-      """{"version":1,"protocol":"doctrellis-preview-v1","transport":"unix","address":"/tmp/doctrellis-user/workspace.0123456789abcdef.sock","pid":42,"sessionId":"session","token":"0123456789abcdef0123456789abcdef"}"""
+      """{"version":1,"protocol":"doctrellis-preview-v1","transport":"unix","address":"/tmp/doctrellis-user/workspace.0123456789abcdef.sock","pid":42,"sessionId":"session","launchId":"launch","token":"0123456789abcdef0123456789abcdef"}"""
     assert(WorkspaceChannelMetadataParser.parse(valid, endpoint).isRight)
+    assertEquals(WorkspaceChannelMetadataParser.ownerPid(valid), Right(42))
     assert(
       WorkspaceChannelMetadataParser
         .parse(
@@ -182,6 +212,147 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         "\"host\":\"0.0.0.0\",\"port\":43123",
       )
     assert(WorkspaceChannelMetadataParser.parse(tcp, endpoint).isLeft)
+
+  test("an owned preview rejects metadata from a competing launch"):
+    promise(
+      TestNodeFsPromises.mkdtemp(
+        NodePath.join(NodeOs.tmpdir(), "doctrellis-launch-correlation-"),
+      ),
+    ).bracket(temporary =>
+      val metadataPath = NodePath.join(temporary, "workspace.json")
+      val endpoint     = WorkspaceChannelEndpoint(
+        canonicalWorkspace = "/workspace",
+        runtimeDirectory = temporary,
+        metadataPath = metadataPath,
+        socketPrefix = NodePath.join(temporary, "workspace."),
+        workspaceHash = "workspace",
+        runtimeOwner = None,
+      )
+      val metadata =
+        s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":9,"pid":42,"sessionId":"winner-session","launchId":"winner-launch","token":"${"0" * 64}"}"""
+      for
+        _      <- promise(TestNodeFsPromises.writeFile(metadataPath, metadata))
+        result <- Dispatcher
+          .parallel[IO]
+          .use: dispatcher =>
+            WorkspaceChannel
+              .connectReady(
+                dispatcher = dispatcher,
+                endpoint = endpoint,
+                verifyPing = true,
+                expectedLaunchId = Some("loser-launch"),
+              )
+              .attempt
+      yield assert(
+        result.left.exists(_.getMessage.contains("different preview launch")),
+      ),
+    )(temporary =>
+      promise(
+        TestNodeFsPromises.rm(
+          temporary,
+          js.Dynamic.literal(recursive = true, force = true),
+        ),
+      ),
+    )
+
+  test("closing a connection settles pending ready and ping waits"):
+    Dispatcher
+      .parallel[IO]
+      .use: dispatcher =>
+        val metadata = WorkspaceChannelMetadata(
+          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+          pid = 42,
+          sessionId = "session",
+          launchId = "launch",
+          token = "0" * 64,
+        )
+        for
+          connection <- WorkspaceChannelConnection.create(
+            dispatcher = dispatcher,
+            socket = inertSocket(),
+            metadata = metadata,
+          )
+          ready       <- connection.awaitUrl.attempt.start
+          pong        <- connection.ping.attempt.start
+          _           <- IO.cede
+          _           <- connection.close
+          readyResult <- ready.joinWithNever.timeout(1.second)
+          pongResult  <- pong.joinWithNever.timeout(1.second)
+        yield
+          assert(readyResult.isLeft)
+          assert(pongResult.isLeft)
+
+  test("reinstalling a shared connection does not close it"):
+    Dispatcher
+      .parallel[IO]
+      .use: dispatcher =>
+        val metadata = WorkspaceChannelMetadata(
+          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+          pid = 42,
+          sessionId = "session",
+          launchId = "launch",
+          token = "0" * 64,
+        )
+        val (socket, destroyCount) = trackedInertSocket()
+        for
+          connection <- WorkspaceChannelConnection.create(
+            dispatcher = dispatcher,
+            socket = socket,
+            metadata = metadata,
+          )
+          state <- Ref.of[IO, DynamicPreviewConnection](
+            DynamicPreviewConnection.Pending,
+          )
+          first    <- DynamicPreviewRuntime.installConnection(state, connection)
+          second   <- DynamicPreviewRuntime.installConnection(state, connection)
+          destroys <- IO.delay(destroyCount())
+          _        <- connection.close
+        yield
+          assert(first.eq(connection))
+          assert(second.eq(connection))
+          assertEquals(destroys, 0)
+
+  test(
+    "releasing a reused runtime closes a connection acquired at the stop boundary",
+  ):
+    Dispatcher
+      .parallel[IO]
+      .use: dispatcher =>
+        val metadata = WorkspaceChannelMetadata(
+          transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+          pid = 42,
+          sessionId = "session",
+          launchId = "launch",
+          token = "0" * 64,
+        )
+        val (socket, destroyCount) = trackedInertSocket()
+        for
+          connection <- WorkspaceChannelConnection.create(
+            dispatcher = dispatcher,
+            socket = socket,
+            metadata = metadata,
+          )
+          acquireEntered  <- Deferred[IO, Unit]
+          continueAcquire <- Deferred[IO, Unit]
+          runtime         <- DynamicPreviewRuntime.reused(
+            IO.uncancelable: _ =>
+              acquireEntered.complete(()).void *>
+                continueAcquire.get.as(connection),
+          )
+          awaitUrl <- runtime.running.announcedUrl match
+            case Some(wait) => wait.attempt.start
+            case None       =>
+              IO.raiseError(
+                IllegalStateException("expected a dynamic preview URL wait"),
+              )
+          _        <- acquireEntered.get
+          _        <- runtime.release
+          _        <- continueAcquire.complete(())
+          result   <- awaitUrl.joinWithNever.timeout(1.second)
+          destroys <- IO.delay(destroyCount())
+        yield
+          assert(result.isLeft)
+          assertEquals(destroys, 1)
 
   test("workspace endpoints are stable, distinct, short, and outside projects"):
     val root  = TestNodeRuntime.cwd()
@@ -303,10 +474,37 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       requestId: String,
       pid: Int,
   ): String =
-    s"""{"version":1,"type":"ready","requestId":"$requestId","sessionId":"session","pid":$pid,"url":"${url.value}"}"""
+    s"""{"version":1,"type":"ready","requestId":"$requestId","sessionId":"session","launchId":"launch","pid":$pid,"url":"${url.value}"}"""
 
   private def promise[A](value: => js.Promise[A]): IO[A] =
     IO.fromPromise(IO.delay(value))
+
+  private def inertSocket(): NodeSocket =
+    trackedInertSocket()._1
+
+  private def trackedInertSocket(): (NodeSocket, () => Int) =
+    val socket       = js.Dynamic.literal()
+    var destroys     = 0
+    val returnSocket =
+      ((_: String, _: js.Function) => socket): js.Function2[
+        String,
+        js.Function,
+        js.Dynamic,
+      ]
+    socket.updateDynamic("on")(returnSocket)
+    socket.updateDynamic("once")(returnSocket)
+    socket.updateDynamic("off")(returnSocket)
+    socket.updateDynamic("write")(
+      ((_: String) => true): js.Function1[String, Boolean],
+    )
+    socket.updateDynamic("setEncoding")(
+      ((_: String) => socket): js.Function1[String, js.Dynamic],
+    )
+    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
+    socket.updateDynamic("destroy")(
+      (() => destroys += 1): js.Function0[Unit],
+    )
+    socket.asInstanceOf[NodeSocket] -> (() => destroys)
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)

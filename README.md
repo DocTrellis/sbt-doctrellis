@@ -225,11 +225,17 @@ short hash of the canonical workspace path, never in the project. POSIX
 runtimes verify that this directory is a real directory owned by the current
 UID. A per-workspace file lock serializes ownership and stale cleanup, while
 session-unique socket names keep one cleanup attempt from unlinking another
-session. IPC stays on the Remote SSH or Dev Container extension host; only the
-announced HTTP URL is passed to `asExternalUri`. A second VS Code window may
+session. A random launch ID correlates a spawned process with its metadata and
+ready response, preventing a losing concurrent start from adopting or stopping
+the winner. IPC stays on the Remote SSH or Dev Container extension host; only
+the announced HTTP URL is passed to `asExternalUri`. A second VS Code window may
 reuse the existing URL under a read-only lease after a correlated ready and
 ping response. Only the window that spawned the process stops it on folder
 close or deactivation; the observing window merely releases its connection.
+Restart in an observing window releases and reacquires that read-only lease;
+it does not restart the owner window's process. Announced IPC mode also
+requires `doctrellisHost := "127.0.0.1"`, while direct fixed-port CLI use keeps
+the host configurable.
 
 ## Develop and verify
 
