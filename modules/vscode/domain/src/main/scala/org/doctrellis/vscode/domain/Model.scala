@@ -218,5 +218,6 @@ enum PreviewTerminal:
     case Exited(exit)   => PreviewViewState.Exited(exit)
 
 enum PreviewStatus:
-  case Starting, Ready, Stopping
+  case Starting, Stopping
+  case Ready(url: PreviewUrl)
   case Terminal(value: PreviewTerminal)

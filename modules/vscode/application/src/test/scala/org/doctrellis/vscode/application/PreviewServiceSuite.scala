@@ -119,7 +119,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
             _        <- service.stopAll.timeout(1.second)
             outcome  <- starting.joinWithNever.timeout(1.second)
           yield outcome
-    yield assert(result.left.exists(_.isInstanceOf[PreviewServiceClosed]))
+    yield result match
+      case Left(PreviewServiceClosed()) => ()
+      case other => fail(s"expected PreviewServiceClosed, got $other")
 
   test("explicit stop cancels an in-flight launch for its workspace"):
     for
@@ -150,7 +152,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield outcome
       actual <- states.get
     yield
-      assert(result.left.exists(_.isInstanceOf[PreviewLaunchStopped]))
+      result match
+        case Left(PreviewLaunchStopped(actual)) =>
+          assertEquals(actual, workspace.name)
+        case other => fail(s"expected PreviewLaunchStopped, got $other")
       assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("stop releases a process acquired at the cancellation boundary"):
@@ -187,7 +192,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
             outcome  <- starting.joinWithNever.timeout(1.second)
             _        <- stopping.joinWithNever.timeout(1.second)
           yield outcome
-    yield assert(result.left.exists(_.isInstanceOf[PreviewLaunchStopped]))
+    yield result match
+      case Left(PreviewLaunchStopped(actual)) =>
+        assertEquals(actual, workspace.name)
+      case other => fail(s"expected PreviewLaunchStopped, got $other")
 
   test("cancelling a registered launch does not strand shutdown"):
     for
@@ -693,7 +701,125 @@ class PreviewServiceSuite extends CatsEffectSuite:
             _        <- service.stop(workspace)
             _        <- starting.joinWithNever
           yield external
-    yield assert(result.left.exists(_.isInstanceOf[DynamicPreviewStarting]))
+    yield result match
+      case Left(DynamicPreviewStarting(actual)) =>
+        assertEquals(actual, workspace.name)
+      case other => fail(s"expected DynamicPreviewStarting, got $other")
+
+  test("a ready signal preserves a session that already became terminal"):
+    val exit     = ProcessExit(code = Some(17), signal = None, error = None)
+    val terminal = PreviewStatus.Terminal(PreviewTerminal.Exited(exit))
+    for
+      status     <- Ref.of[IO, PreviewStatus](terminal)
+      ready      <- Deferred[IO, Either[Throwable, PreviewUrl]]
+      acceptance <- PreviewReadyGate.accept(
+        status,
+        ready,
+        command.endpoint.description,
+        urlOf(command),
+      )
+      actualStatus <- status.get
+      completion   <- ready.get
+    yield
+      assertEquals(acceptance, ReadyAcceptance.Rejected)
+      assertEquals(actualStatus, terminal)
+      completion match
+        case Left(PreviewStoppedDuringStartup(actual)) =>
+          assertEquals(actual, command.endpoint.description)
+        case other => fail(s"expected PreviewStoppedDuringStartup, got $other")
+
+  test("openExternal rejects a stopping announced session"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53117"))
+    for
+      releaseEntered  <- Deferred[IO, Unit]
+      continueRelease <- Deferred[IO, Unit]
+      opened          <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            IO.pure(
+              RunningProcess.announced(
+                awaitExit = IO.never,
+                awaitUrl = IO.pure(announced),
+              ),
+            ),
+          )(_ => releaseEntered.complete(()).void *> continueRelease.get),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = url => opened.update(_ :+ url),
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _        <- service.start(workspace)
+            stopping <- service.stop(workspace).start
+            _        <- releaseEntered.get
+            external <- service.openExternal(workspace).attempt
+            _        <- continueRelease.complete(())
+            _        <- stopping.joinWithNever
+          yield external
+        .guarantee(continueRelease.complete(()).void)
+      actualOpened <- opened.get
+    yield
+      result match
+        case Left(DynamicPreviewNotStarted(actual)) =>
+          assertEquals(actual, workspace.name)
+        case other => fail(s"expected DynamicPreviewNotStarted, got $other")
+      assertEquals(actualOpened, Vector.empty)
+
+  test("openExternal rejects a terminal announced session"):
+    val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
+    val announced = right(PreviewUrl.parse("http://127.0.0.1:53118"))
+    val exit      = ProcessExit(code = Some(0), signal = None, error = None)
+    for
+      exited          <- Deferred[IO, ProcessExit]
+      releaseEntered  <- Deferred[IO, Unit]
+      continueRelease <- Deferred[IO, Unit]
+      opened          <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(
+            IO.pure(
+              RunningProcess.announced(
+                awaitExit = exited.get,
+                awaitUrl = IO.pure(announced),
+              ),
+            ),
+          )(_ => releaseEntered.complete(()).void *> continueRelease.get),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = url => opened.update(_ :+ url),
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result <- PreviewService
+        .resource(ports)
+        .use: service =>
+          for
+            _        <- service.start(workspace)
+            _        <- exited.complete(exit)
+            _        <- releaseEntered.get
+            external <- service.openExternal(workspace).attempt
+            _        <- continueRelease.complete(())
+          yield external
+        .guarantee(continueRelease.complete(()).void)
+      actualOpened <- opened.get
+    yield
+      result match
+        case Left(DynamicPreviewNotStarted(actual)) =>
+          assertEquals(actual, workspace.name)
+        case other => fail(s"expected DynamicPreviewNotStarted, got $other")
+      assertEquals(actualOpened, Vector.empty)
 
   test("open without an active session reports a stopped preview"):
     for
@@ -1411,12 +1537,13 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield ()
     yield ()
 
-  test("announced IPC URL is probed and stored as the ready session URL"):
+  test("announced IPC URL is probed, stored, and opened as the ready URL"):
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
     val announced = right(PreviewUrl.parse("http://127.0.0.1:53111"))
     for
       probes <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
       states <- Ref.of[IO, Vector[PreviewViewState]](Vector.empty)
+      opened <- Ref.of[IO, Vector[PreviewUrl]](Vector.empty)
       ports = PreviewPorts[IO](
         load = _ => IO.pure(dynamic),
         policy = _ => IO.pure(policy),
@@ -1430,22 +1557,55 @@ class PreviewServiceSuite extends CatsEffectSuite:
         probe = url => probes.update(_ :+ url).as(true),
         show = (_, state) => states.update(_ :+ state),
         update = (_, state) => states.update(_ :+ state),
-        openExternal = _ => IO.unit,
+        openExternal = url => opened.update(_ :+ url),
         info = _ => IO.unit,
         error = _ => IO.unit,
       )
       actualStates <- PreviewService
         .resource(ports)
         .use(service =>
-          service.start(workspace) *> service.open(workspace) *> states.get,
+          service.start(workspace) *>
+            service.open(workspace) *>
+            service.openExternal(workspace) *>
+            states.get,
         )
       actualProbes <- probes.get
+      actualOpened <- opened.get
     yield
       assertEquals(actualProbes, Vector(announced))
+      assertEquals(actualOpened, Vector(announced))
       assertEquals(
         actualStates.lastOption,
         Some(PreviewViewState.Ready(announced)),
       )
+
+  test("dynamic startup rejects a process without an announcement channel"):
+    val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
+    for
+      releases <- Ref.of[IO, Int](0)
+      ports = PreviewPorts[IO](
+        load = _ => IO.pure(dynamic),
+        policy = _ => IO.pure(policy),
+        launch = (_, _) =>
+          Resource.make(IO.pure(RunningProcess[IO](IO.never)))(_ =>
+            releases.update(_ + 1),
+          ),
+        probe = _ => IO.pure(true),
+        show = (_, _) => IO.unit,
+        update = (_, _) => IO.unit,
+        openExternal = _ => IO.unit,
+        info = _ => IO.unit,
+        error = _ => IO.unit,
+      )
+      result   <- PreviewService.resource(ports).use(_.start(workspace).attempt)
+      released <- releases.get
+    yield
+      result match
+        case Left(DynamicPreviewAnnouncementUnavailable(actual)) =>
+          assertEquals(actual, workspace.name)
+        case other =>
+          fail(s"expected DynamicPreviewAnnouncementUnavailable, got $other")
+      assertEquals(released, 1)
 
   test("dynamic startup reports process exit before ready announcement"):
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
@@ -1646,7 +1806,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
         case PreviewViewState.Failed(reason) => reason.contains("Start")
         case _                               => false)
       assert(actualMessages.exists(_.contains("Start")))
-      assert(external.swap.exists(_.isInstanceOf[DynamicPreviewNotStarted]))
+      external match
+        case Left(DynamicPreviewNotStarted(actual)) =>
+          assertEquals(actual, workspace.name)
+        case other => fail(s"expected DynamicPreviewNotStarted, got $other")
 
   private def healthyPorts(
       launches: Ref[IO, Int],
