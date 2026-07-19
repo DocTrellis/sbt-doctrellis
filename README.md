@@ -267,12 +267,17 @@ sbt --batch doctrellisBuild
 test -f target/doctrellis/site/index.html
 ```
 
-For formatting and static checks, the normal compile uses WartRemover and the
-repository provides Scalafmt:
+For formatting and static checks, the normal compile uses WartRemover, Scalafix
+organizes imports, and Scalafmt handles mechanical formatting:
 
 ```console
-sbt --batch scalafmtCheckAll scalafmtSbtCheck
+sbt --batch 'scalafixAll; scalafmtAll; scalafmtSbt'
+sbt --batch 'scalafmtCheckAll; scalafmtSbtCheck'
 ```
+
+Scalafix merges imports before Scalafmt adds trailing commas, so the two tools
+form one formatting pass. CI runs that pass on a clean checkout and rejects any
+resulting change with `git diff --exit-code`.
 
 ### Build and install a VSIX
 

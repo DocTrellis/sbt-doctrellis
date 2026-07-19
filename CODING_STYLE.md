@@ -15,8 +15,7 @@ optional practices respectively.
 
 - `.scalafmt.conf` is the source of truth for mechanical Scala formatting.
 - `build.sbt` is the source of truth for enabled WartRemover checks.
-- The `OrganizeImports` profile in this guide is the source of truth for import
-  layout until Scalafix is wired into the build and CI.
+- `.scalafix.conf` is the source of truth for import organization.
 - The accepted ADRs under `docs/adr/` are the source of truth for architectural
   decisions.
 - This guide covers design and review choices that formatters and linters
@@ -209,34 +208,7 @@ lexicographic order. Do not turn a large selector list into a wildcard
 automatically; wildcard imports are still limited to the DSL cases described
 above. Removing unused imports is a separate compiler or lint concern.
 
-Until Scalafix performs a repository-wide migration, apply this policy to new
-source files and to existing import blocks only when those blocks are otherwise
-modified. Do not reorder an untouched existing import block solely for style;
-the remaining files must be migrated together when Scalafix is wired into the
-build and CI.
-
-This policy corresponds to the following Scalafix profile and should be used
-when `OrganizeImports` is wired into the build:
-
-```hocon
-OrganizeImports {
-  blankLines = Auto
-  coalesceToWildcardImportThreshold = null
-  expandRelative = false
-  groupedImports = Merge
-  groups = [
-    "re:javax?\\."
-    "scala."
-    "cats."
-    "*"
-    "org.doctrellis."
-  ]
-  importSelectorsOrder = Ascii
-  importsOrder = SymbolsFirst
-  removeUnused = false
-  targetDialect = Scala3
-}
-```
+This policy is enforced by the `OrganizeImports` profile in `.scalafix.conf`.
 
 ## Types, data, and naming
 
@@ -429,9 +401,15 @@ Do not edit or commit generated directories and packages such as `target/`,
 Format changed Scala and sbt sources:
 
 ```console
-sbt --batch 'scalafmtAll; scalafmtSbt'
+sbt --batch 'scalafixAll; scalafmtAll; scalafmtSbt'
 sbt --batch 'scalafmtCheckAll; scalafmtSbtCheck'
 ```
+
+Treat Scalafix followed by Scalafmt as one formatting pass: `OrganizeImports`
+merges imports without trailing commas, then Scalafmt restores the required
+trailing commas. CI runs this pass on a clean checkout and uses
+`git diff --exit-code` instead of `scalafixAll --check` to verify that both
+policies are satisfied together.
 
 Run checks proportional to the change, and run the full suite before a release
 or a cross-module commit:
