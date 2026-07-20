@@ -184,6 +184,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           assertEquals(panel.refreshes.toList, List(revision(2)))
           assertEquals(bridgeResolutions.toList, List(url(4242)))
           assertEquals(panel.channelTokens.size, 1)
+          assertEquals(
+            panel.installedChannelToken,
+            Some(at(panel.channelTokens, 0)),
+          )
           assert(panel.html.contains(at(panel.channelTokens, 0)))
           assertEquals(panel.reveals, 1)
           assert(
@@ -433,6 +437,33 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           `type` = "doctrellis.preview.refresh-accepted",
           refreshId = "attempt-1",
           revision = "7",
+          channelToken = "secret",
+        ),
+      ),
+      None,
+    )
+
+  test("accepts only a channel-bound wrapper-ready message"):
+    val valid = js.Dynamic.literal(
+      protocol = 1,
+      `type` = "doctrellis.preview.ready",
+      channelToken = "secret",
+    )
+    assertEquals(PreviewWebviewMessage.wrapperReady(valid), Some("secret"))
+    assertEquals(
+      PreviewWebviewMessage.wrapperReady(
+        js.Dynamic.literal(
+          protocol = 1,
+          `type` = "doctrellis.preview.ready",
+        ),
+      ),
+      None,
+    )
+    assertEquals(
+      PreviewWebviewMessage.wrapperReady(
+        js.Dynamic.literal(
+          protocol = 2,
+          `type` = "doctrellis.preview.ready",
           channelToken = "secret",
         ),
       ),
@@ -1046,7 +1077,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           new PreviewPanel:
             def isDisposed: Boolean = false
 
-            def setHtml(value: String): IO[Unit] =
+            def setHtml(
+                value: String,
+                channelToken: Option[String],
+            ): IO[Unit] =
               writeEntered.complete(()).void *> IO.never
 
             def reveal: IO[Unit] = IO.unit
@@ -1126,16 +1160,6 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     )
     assert(
       PreviewWebviewHtml.Script.contains(
-        "document.addEventListener(\"visibilitychange\"",
-      ),
-    )
-    assert(
-      PreviewWebviewHtml.Script.contains(
-        "document.visibilityState === \"visible\"",
-      ),
-    )
-    assert(
-      PreviewWebviewHtml.Script.contains(
         "doctrellis.preview.refresh-accepted",
       ),
     )
@@ -1167,16 +1191,22 @@ private final class FakePanel(
   var reveals: Int                                = 0
   var disposed: Boolean                           = false
   var refreshAcknowledged: Boolean                = true
+  var installedChannelToken: Option[String]       = None
   val refreshes: mutable.ListBuffer[SiteRevision] = mutable.ListBuffer.empty
   val channelTokens: mutable.ListBuffer[String]   = mutable.ListBuffer.empty
 
   def isDisposed: Boolean = disposed
 
-  def setHtml(value: String): IO[Unit] =
+  def setHtml(
+      value: String,
+      channelToken: Option[String],
+  ): IO[Unit] =
     IO.delay:
       if disposed then throw PreviewPanelDisposed
       else if failOnSetHtml then throw IllegalStateException("write failed")
-      else html = value
+      else
+        html = value
+        installedChannelToken = channelToken
 
   override def refresh(
       revision: SiteRevision,

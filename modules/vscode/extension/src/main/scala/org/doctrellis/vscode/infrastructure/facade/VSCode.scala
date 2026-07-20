@@ -27,11 +27,19 @@ trait Webview extends js.Object:
 @js.native
 trait WebviewPanel extends Disposable:
   val webview: Webview = js.native
+  val visible: Boolean = js.native
   def reveal(
       viewColumn: js.UndefOr[Int] = js.undefined,
       preserveFocus: Boolean = false,
-  ): Unit                                                    = js.native
+  ): Unit = js.native
+  def onDidChangeViewState(
+      listener: js.Function1[WebviewPanelOnDidChangeViewStateEvent, Unit],
+  ): Disposable = js.native
   def onDidDispose(listener: js.Function0[Unit]): Disposable = js.native
+
+@js.native
+trait WebviewPanelOnDidChangeViewStateEvent extends js.Object:
+  val webviewPanel: WebviewPanel = js.native
 
 @js.native
 trait Uri extends js.Object:

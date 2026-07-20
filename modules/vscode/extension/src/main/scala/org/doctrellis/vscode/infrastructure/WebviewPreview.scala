@@ -14,7 +14,7 @@ private[infrastructure] trait PreviewPanel:
   // Updated synchronously by the backend's disposal callback, before its IO
   // cleanup is dispatched, so a later explicit open can be ordered correctly.
   def isDisposed: Boolean
-  def setHtml(value: String): IO[Unit]
+  def setHtml(value: String, channelToken: Option[String]): IO[Unit]
   // A backend without a message channel reports every refresh as unacknowledged.
   def refresh(
       revision: SiteRevision,
@@ -432,7 +432,10 @@ private[infrastructure] final class PreviewPanelRegistry private (
           .use: panel =>
             rendered.installation.flatMap: installation =>
               val entry   = Entry(token, panel, installation.channel)
-              val install = panel.setHtml(installation.html) *>
+              val install = panel.setHtml(
+                installation.html,
+                installation.channel.map(_.token),
+              ) *>
                 panels.update: current =>
                   current.get(workspace.key) match
                     case Some(actual) if actual.revision.eq(slot.revision) =>
@@ -450,7 +453,10 @@ private[infrastructure] final class PreviewPanelRegistry private (
       rendered: RenderedPanel,
   ): IO[Unit] =
     rendered.installation.flatMap: installation =>
-      entry.panel.setHtml(installation.html) *>
+      entry.panel.setHtml(
+        installation.html,
+        installation.channel.map(_.token),
+      ) *>
         IO.delay(entry.channel = installation.channel)
 
   private def consumeOpenIntent(key: String, intent: Revision): IO[Unit] =
@@ -687,7 +693,19 @@ private[infrastructure] object PreviewWebviewHtml:
       |  let active = false;
       |  let legacy = false;
       |  let pendingRefresh = null;
+      |  let panelVisible = true;
       |  let timeout = null;
+      |  let vscode = null;
+      |  const accept = (pending) => {
+      |    if (!vscode) return;
+      |    vscode.postMessage({
+      |      protocol: 1,
+      |      type: "doctrellis.preview.refresh-accepted",
+      |      refreshId: pending.refreshId,
+      |      revision: pending.revision,
+      |      channelToken
+      |    });
+      |  };
       |  const fallback = () => {
       |    if (legacy) return;
       |    clearTimeout(timeout);
@@ -697,12 +715,17 @@ private[infrastructure] object PreviewWebviewHtml:
       |    frame.setAttribute("sandbox", "");
       |    frame.removeAttribute("data-doctrellis-preview-url");
       |    frame.src = directUrl;
+      |    if (pendingRefresh) {
+      |      accept(pendingRefresh);
+      |      pendingRefresh = null;
+      |    }
       |  };
       |  const armFallback = () => {
       |    clearTimeout(timeout);
       |    timeout = setTimeout(() => {
       |      timeout = null;
-      |      if (document.visibilityState === "visible") fallback();
+      |      if (panelVisible) fallback();
+      |      else armFallback();
       |    }, 2000);
       |  };
       |  const hello = () => {
@@ -714,20 +737,18 @@ private[infrastructure] object PreviewWebviewHtml:
       |    }
       |  };
       |  armFallback();
-      |  let vscode;
       |  try {
       |    vscode = acquireVsCodeApi();
       |  } catch (_) {
       |    fallback();
       |    return;
       |  }
-      |  frame.addEventListener("load", hello);
-      |  document.addEventListener("visibilitychange", () => {
-      |    if (document.visibilityState === "visible" && !active && !legacy) {
-      |      hello();
-      |      armFallback();
-      |    }
+      |  vscode.postMessage({
+      |    protocol: 1,
+      |    type: "doctrellis.preview.ready",
+      |    channelToken
       |  });
+      |  frame.addEventListener("load", hello);
       |  addEventListener("message", (event) => {
       |    const message = event.data;
       |    if (!message || message.protocol !== 1) return;
@@ -744,7 +765,11 @@ private[infrastructure] object PreviewWebviewHtml:
       |        clearTimeout(timeout);
       |        timeout = null;
       |        if (pendingRefresh) {
-      |          frame.contentWindow.postMessage(pendingRefresh, bridgeOrigin);
+      |          frame.contentWindow.postMessage(
+      |            pendingRefresh.refresh,
+      |            bridgeOrigin
+      |          );
+      |          accept(pendingRefresh);
       |          pendingRefresh = null;
       |        }
       |      } else if (message.type === "doctrellis.bridge.rejected") {
@@ -753,24 +778,34 @@ private[infrastructure] object PreviewWebviewHtml:
       |      return;
       |    }
       |    if (event.source !== parent) return;
+      |    if (message.channelToken !== channelToken) return;
+      |    if (message.type === "doctrellis.preview.visibility") {
+      |      if (typeof message.visible !== "boolean") return;
+      |      panelVisible = message.visible;
+      |      if (panelVisible && !active && !legacy) {
+      |        hello();
+      |        armFallback();
+      |      }
+      |      return;
+      |    }
       |    if (message.type !== "doctrellis.preview.refresh" ||
-      |        message.channelToken !== channelToken ||
       |        typeof message.refreshId !== "string") return;
-      |    const refresh = {
-      |      protocol: 1,
-      |      type: "doctrellis.preview.refresh",
+      |    const pending = {
+      |      refresh: {
+      |        protocol: 1,
+      |        type: "doctrellis.preview.refresh",
+      |        revision: message.revision
+      |      },
+      |      refreshId: message.refreshId,
       |      revision: message.revision
       |    };
-      |    if (legacy) frame.src = directUrl;
-      |    else if (active) frame.contentWindow.postMessage(refresh, bridgeOrigin);
-      |    else pendingRefresh = refresh;
-      |    vscode.postMessage({
-      |      protocol: 1,
-      |      type: "doctrellis.preview.refresh-accepted",
-      |      refreshId: message.refreshId,
-      |      revision: message.revision,
-      |      channelToken
-      |    });
+      |    if (legacy) {
+      |      frame.src = directUrl;
+      |      accept(pending);
+      |    } else if (active) {
+      |      frame.contentWindow.postMessage(pending.refresh, bridgeOrigin);
+      |      accept(pending);
+      |    } else pendingRefresh = pending;
       |  });
       |})();""".stripMargin
   private[infrastructure] val ScriptHash =
@@ -911,9 +946,31 @@ private[infrastructure] final class VscodePreviewPanelBackend(
             showOptions,
             PreviewWebviewOptions.value,
           )
-          var disposed                        = false
-          var registrations: List[Disposable] = Nil
-          def releaseRegistrations(): Unit    =
+          var disposed                               = false
+          var installedChannelToken: Option[String] = None
+          var registrations: List[Disposable]        = Nil
+          def postVisibility(expectedToken: String): IO[Unit] =
+            IO.delay:
+              Option.when(
+                !disposed && installedChannelToken.contains(expectedToken),
+              )(panel.visible)
+            .flatMap(
+              _.traverse_(visible =>
+                IO.fromPromise(
+                  IO.delay(
+                    panel.webview.postMessage(
+                      js.Dynamic.literal(
+                        protocol = 1,
+                        `type` = "doctrellis.preview.visibility",
+                        visible = visible,
+                        channelToken = expectedToken,
+                      ),
+                    ),
+                  ),
+                ).attempt.void
+              ),
+            )
+          def releaseRegistrations(): Unit =
             val current = registrations
             registrations = Nil
             current.foreach(_.dispose())
@@ -932,18 +989,44 @@ private[infrastructure] final class VscodePreviewPanelBackend(
                 dispatcher.unsafeRunAndForget(
                   acknowledgements.accept(acknowledgement),
                 )
+            PreviewWebviewMessage
+              .wrapperReady(message)
+              .foreach: channelToken =>
+                dispatcher.unsafeRunAndForget(
+                  postVisibility(channelToken),
+                )
+          val viewStateListener: js.Function1[
+            WebviewPanelOnDidChangeViewStateEvent,
+            Unit,
+          ] = _ =>
+            installedChannelToken.foreach: channelToken =>
+              dispatcher.unsafeRunAndForget(
+                postVisibility(channelToken),
+              )
           val disposeRegistration = panel.onDidDispose(listener)
+          val viewStateRegistration = panel.onDidChangeViewState(
+            viewStateListener,
+          )
           val messageRegistration = panel.webview.onDidReceiveMessage(
             messageListener,
           )
-          registrations = List(messageRegistration, disposeRegistration)
+          registrations = List(
+            messageRegistration,
+            viewStateRegistration,
+            disposeRegistration,
+          )
           new PreviewPanel:
             def isDisposed: Boolean = disposed
 
-            def setHtml(value: String): IO[Unit] =
+            def setHtml(
+                value: String,
+                channelToken: Option[String],
+            ): IO[Unit] =
               IO.delay:
                 if disposed then throw PreviewPanelDisposed
-                else panel.webview.html = value
+                else
+                  installedChannelToken = channelToken
+                  panel.webview.html = value
 
             override def refresh(
                 revision: SiteRevision,
@@ -1066,6 +1149,20 @@ private[infrastructure] object PreviewWebviewMessage:
           if protocol == 1.0 &&
             messageType == "doctrellis.preview.refresh-accepted"
         yield RefreshAcknowledgement(refreshId, revision, channelToken)
+
+  def wrapperReady(value: js.Any): Option[String] =
+    Option
+      .when(
+        value != null && js.typeOf(value) == "object" &&
+          !js.Array.isArray(value),
+      )(value.asInstanceOf[js.Dynamic])
+      .flatMap: message =>
+        for
+          protocol     <- numberField(message, "protocol")
+          messageType  <- stringField(message, "type")
+          channelToken <- stringField(message, "channelToken")
+          if protocol == 1.0 && messageType == "doctrellis.preview.ready"
+        yield channelToken
 
   private def numberField(value: js.Dynamic, name: String): Option[Double] =
     val field = value.selectDynamic(name)
