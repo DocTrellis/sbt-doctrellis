@@ -4,6 +4,7 @@
 - Date: 2026-07-20
 - Amends: ADR 0002
 - Extends: ADR 0005
+- Amended by: ADR 0007
 
 ## Context
 

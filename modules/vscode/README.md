@@ -9,8 +9,12 @@ workspace's panel, while stop, startup failure, and unexpected process exit are
 shown as connection states in the same tab. Multi-root folders have independent
 panels. With a version 2 IPC preview and the current plugin, successful
 documentation rebuilds refresh an existing panel automatically at the same
-stored URL. Events do not reveal the panel or recreate one that the user
-closed.
+page path, including its query and fragment. Events do not reveal the panel or
+recreate one that the user closed. The current plugin exposes a reserved,
+CSP-hashed and explicitly identified bridge for this reload; generated
+documentation remains script-disabled, and older plugins fall back to
+refreshing the preview root. Version 1 fixed-URL previews do not probe or enable
+the bridge.
 
 Use **DocTrellis: Open in External Browser** when the preview should leave VS
 Code. Both the Webview iframe and external command apply VS Code's

@@ -259,9 +259,12 @@ it does not restart the owner window's process. Announced IPC mode also
 requires `doctrellisHost := "127.0.0.1"`, while direct fixed-port CLI use keeps
 the host configurable. With the current plugin, both owner and observer
 connections opt into successful-publication events. An event refreshes an
-existing panel at its stored URL without revealing it; it never recreates a
-panel that the user closed. Older plugins remain compatible because the opt-in
-field is additive and unknown fields are ignored.
+existing panel at its current page path without revealing it; it never
+recreates a panel that the user closed. A fixed, CSP-hashed bridge reloads the
+current document while generated documentation remains script-disabled. Older
+plugins remain compatible because version 2 sessions require an exact bridge
+identification response and otherwise use the original root-refresh behavior.
+Version 1 fixed-URL previews never enable the bridge sandbox.
 
 ## Develop and verify
 
@@ -329,12 +332,13 @@ The build tasks are also available through **Tasks: Run Task**.
 - A normal browser requires a manual page refresh after a rebuild. Version 1
   fixed-URL Webviews have no authenticated event channel and must be closed and
   reopened (or Preview restarted) to load a rebuilt site; only version 2 IPC
-  Webviews refresh automatically.
+  Webviews refresh automatically and preserve the current page path.
 - Preview binds to localhost and is intended for development only. There is no
   GitHub Pages, website deployment, or other remote publishing feature.
-- The Webview uses a script-free wrapper, restrictive content security policy,
-  and sandboxed iframe. A rendered documentation site that requires iframe
-  script permissions is not supported by the initial preview panel.
+- The Webview permits only fixed, hash-authorized bridge scripts under a
+  restrictive content security policy. Rendered documentation stays in a
+  sandboxed, script-disabled iframe, so a site that requires iframe script
+  permissions is not supported by the preview panel.
 - GUI Extension Development Host behavior is a manual smoke test; CI verifies
   compilation, linking, package contents, and the headless preview contract.
 - Neither the sbt plugin nor the extension is published to Maven Central or the
