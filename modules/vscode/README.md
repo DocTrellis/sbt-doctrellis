@@ -16,7 +16,10 @@ CSP-hashed and explicitly identified bridge for this reload; generated
 documentation remains script-disabled, and older plugins fall back to
 refreshing the preview root. Version 1 fixed-URL previews do not probe or enable
 the bridge. A bridge handshake delayed while the preview is hidden is retried
-when its editor tab becomes visible.
+when the extension observes that its editor tab becomes visible. A refresh is
+acknowledged only after bridge delivery or a legacy reload has started; an
+inactive bridge therefore falls back to replacing the wrapper instead of
+silently retaining an undelivered refresh.
 
 Use **DocTrellis: Open in External Browser** when the preview should leave VS
 Code. Both the Webview iframe and external command apply VS Code's
