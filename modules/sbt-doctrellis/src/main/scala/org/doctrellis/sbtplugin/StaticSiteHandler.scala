@@ -5,6 +5,8 @@ import java.nio.ByteBuffer
 import java.nio.channels.{Channels, FileChannel}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, InvalidPathException, Path, StandardOpenOption}
+import java.security.MessageDigest
+import java.util.Base64
 
 import scala.collection.mutable.ArrayBuilder
 import scala.util.Using
@@ -53,6 +55,8 @@ private[sbtplugin] final class StaticSiteHandler private (
         includeBody = true,
         headers = List("Allow" -> "GET, HEAD"),
       )
+    else if requestPath == StaticSiteHandler.WebviewBridgePath then
+      StaticSiteHandler.webviewBridgeResponse(includeBody = method == "GET")
     else
       StaticSiteHandler.resolve(
         normalizedRoot,
@@ -99,6 +103,7 @@ private[sbtplugin] final class StaticSiteHandler private (
       exchange: HttpExchange,
       response: StaticSiteHandler.ResponseSnapshot,
   ): Unit =
+    exchange.getResponseHeaders.set("X-Content-Type-Options", "nosniff")
     response.headers.foreach: (name, value) =>
       exchange.getResponseHeaders.set(name, value)
     response.body match
@@ -120,6 +125,70 @@ private[sbtplugin] final class StaticSiteHandler private (
 
 private[sbtplugin] object StaticSiteHandler:
   private val MaximumInMemoryResponseBytes = 1024L * 1024L
+  // Keep this path and marker synchronized with PreviewWebviewBridge and
+  // NodeHttpBridgeProbe in the VS Code extension infrastructure.
+  private[sbtplugin] val WebviewBridgePath =
+    "/.doctrellis/webview-bridge"
+  private[sbtplugin] val WebviewBridgeHeader      = "X-DocTrellis-Bridge"
+  private[sbtplugin] val WebviewBridgeHeaderValue = "1"
+  private[sbtplugin] val WebviewBridgeStyles      =
+    "html,body,iframe{width:100%;height:100%;margin:0;padding:0;border:0}iframe{display:block;background:white}"
+  private[sbtplugin] val WebviewBridgeScript =
+    """(() => {
+      |  "use strict";
+      |  const documentFrame = document.getElementById("doctrellis-document");
+      |  let initialized = false;
+      |  let parentOrigin = null;
+      |  const emit = (type) => {
+      |    if (parentOrigin) parent.postMessage({ protocol: 1, type }, parentOrigin);
+      |  };
+      |  addEventListener("message", (event) => {
+      |    if (event.source !== parent) return;
+      |    const message = event.data;
+      |    if (!message || message.protocol !== 1) return;
+      |    if (message.type === "doctrellis.bridge.hello") {
+      |      if (parentOrigin && event.origin !== parentOrigin) return;
+      |      parentOrigin = event.origin;
+      |      emit("doctrellis.bridge.ready");
+      |    } else if (event.origin !== parentOrigin) {
+      |      return;
+      |    } else if (message.type === "doctrellis.bridge.initialize") {
+      |      try {
+      |        const target = new URL(message.url);
+      |        if (target.origin !== location.origin) throw new Error("origin mismatch");
+      |        initialized = true;
+      |        documentFrame.src = target.href;
+      |        emit("doctrellis.bridge.active");
+      |      } catch (_) {
+      |        emit("doctrellis.bridge.rejected");
+      |      }
+      |    } else if (message.type === "doctrellis.preview.refresh" && initialized) {
+      |      try {
+      |        documentFrame.contentWindow.location.reload();
+      |      } catch (_) {
+      |        emit("doctrellis.bridge.rejected");
+      |      }
+      |    }
+      |  });
+      |})();""".stripMargin
+  private[sbtplugin] val WebviewBridgeScriptHash =
+    sha256(WebviewBridgeScript)
+  private[sbtplugin] val WebviewBridgeStylesHash =
+    sha256(WebviewBridgeStyles)
+  private val WebviewBridgeHtml =
+    s"""<!DOCTYPE html>
+       |<html lang="en">
+       |<head>
+       |<meta charset="UTF-8">
+       |<meta name="viewport" content="width=device-width, initial-scale=1.0">
+       |<title>DocTrellis Preview Bridge</title>
+       |<style>$WebviewBridgeStyles</style>
+       |</head>
+       |<body>
+       |<iframe id="doctrellis-document" title="DocTrellis document" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>
+       |<script>$WebviewBridgeScript</script>
+       |</body>
+       |</html>""".stripMargin
 
   private trait ResponseBody extends AutoCloseable:
     def length: Long
@@ -177,6 +246,29 @@ private[sbtplugin] object StaticSiteHandler:
       bytes.length.toLong,
       Option.when(includeBody)(new InMemoryBody(bytes)),
     )
+
+  private def webviewBridgeResponse(
+      includeBody: Boolean,
+  ): ResponseSnapshot =
+    val bytes = WebviewBridgeHtml.getBytes(StandardCharsets.UTF_8)
+    ResponseSnapshot(
+      status = 200,
+      headers = List(
+        "Content-Type"            -> "text/html; charset=utf-8",
+        "Cache-Control"           -> "no-store",
+        WebviewBridgeHeader       -> WebviewBridgeHeaderValue,
+        "Content-Security-Policy" ->
+          s"default-src 'none'; frame-src 'self'; script-src $WebviewBridgeScriptHash; style-src $WebviewBridgeStylesHash;",
+      ),
+      contentLength = bytes.length.toLong,
+      body = Option.when(includeBody)(new InMemoryBody(bytes)),
+    )
+
+  private def sha256(value: String): String =
+    val digest = MessageDigest
+      .getInstance("SHA-256")
+      .digest(value.getBytes(StandardCharsets.UTF_8))
+    s"'sha256-${Base64.getEncoder.encodeToString(digest)}'"
 
   private def snapshotBody(
       file: Path,

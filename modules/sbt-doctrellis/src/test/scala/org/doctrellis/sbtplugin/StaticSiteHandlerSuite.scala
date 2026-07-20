@@ -119,6 +119,10 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       StaticSiteHandler(root).handle(existing)
       assertEquals(existing.getResponseCode, 200)
       assertEquals(
+        existing.getResponseHeaders.getFirst("X-Content-Type-Options"),
+        "nosniff",
+      )
+      assertEquals(
         existing.getResponseHeaders.getFirst("Content-Length"),
         body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length.toString,
       )
@@ -160,6 +164,75 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
 
       assertEquals(exchange.getResponseCode, 405)
       assertEquals(exchange.getResponseHeaders.getFirst("Allow"), "GET, HEAD")
+    finally GeneratedDirectory.delete(root)
+
+  test("serves the reserved path-preserving Webview bridge securely"):
+    val root = Files.createTempDirectory("doctrellis-handler-bridge")
+    try
+      assertEquals(
+        StaticSiteHandler.WebviewBridgePath,
+        "/.doctrellis/webview-bridge",
+      )
+      val reserved = Files.createDirectories(root.resolve(".doctrellis"))
+      Files.writeString(reserved.resolve("webview-bridge"), "site collision")
+      val request = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create(StaticSiteHandler.WebviewBridgePath),
+      )
+
+      StaticSiteHandler(root).handle(request)
+
+      val html = String(
+        request.responseBytes,
+        java.nio.charset.StandardCharsets.UTF_8,
+      )
+      val csp = request.getResponseHeaders.getFirst(
+        "Content-Security-Policy",
+      )
+      assertEquals(request.getResponseCode, 200)
+      assertEquals(
+        request.getResponseHeaders.getFirst("Content-Type"),
+        "text/html; charset=utf-8",
+      )
+      assertEquals(
+        request.getResponseHeaders.getFirst("Cache-Control"),
+        "no-store",
+      )
+      assertEquals(
+        request.getResponseHeaders.getFirst(
+          StaticSiteHandler.WebviewBridgeHeader,
+        ),
+        StaticSiteHandler.WebviewBridgeHeaderValue,
+      )
+      assertEquals(
+        request.getResponseHeaders.getFirst("X-Content-Type-Options"),
+        "nosniff",
+      )
+      assert(csp.contains("default-src 'none'"))
+      assert(csp.contains(StaticSiteHandler.WebviewBridgeScriptHash))
+      assert(csp.contains(StaticSiteHandler.WebviewBridgeStylesHash))
+      assert(html.contains("documentFrame.contentWindow.location.reload()"))
+      assert(html.contains("event.origin !== parentOrigin"))
+      assert(html.contains("sandbox=\"allow-same-origin\""))
+      assert(!html.contains("sandbox=\"allow-scripts"))
+      assert(!StaticSiteHandler.WebviewBridgeScript.contains("\"*\""))
+      assert(!html.contains("site collision"))
+
+      val head = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create(StaticSiteHandler.WebviewBridgePath),
+        requestMethod = "HEAD",
+        failOnResponseBody = true,
+      )
+      StaticSiteHandler(root).handle(head)
+      assertEquals(head.getResponseCode, 200)
+      assertEquals(
+        head.getResponseHeaders.getFirst("Content-Length"),
+        request.responseBytes.length.toString,
+      )
+      assert(!head.responseBodyRequested)
     finally GeneratedDirectory.delete(root)
 
   test("empty GET has an exact zero length without opening a response body"):
