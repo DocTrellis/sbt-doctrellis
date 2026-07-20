@@ -36,18 +36,28 @@ extension answers with the current `panel.visible` value and sends each later
 wrapper does not use the Web document visibility API for this decision.
 
 When a bridge handshake timeout expires while the extension reports the panel
-hidden, the wrapper rearms the bounded timeout instead of entering the permanent
+hidden, the wrapper leaves the timer disarmed instead of entering the permanent
 legacy fallback. When the extension reports the panel visible, the wrapper
 sends another bridge hello and starts a fresh timeout. An explicit bridge
 rejection or failure to acquire the VS Code API still selects the legacy
 fallback immediately, and a handshake that times out while the panel is
 reported visible still selects it after the timeout.
 
+Before the first token-matched visibility response arrives, the wrapper treats
+the panel as visible. Failure to synchronize that initial state within the
+bounded timeout therefore selects the legacy fallback even if the panel was
+actually hidden. This fail-safe avoids an indefinitely blank preview when the
+extension-to-WebView message path is unavailable, at the cost of a small
+initial downgrade window.
+
 ADR 0007 allowed the wrapper to acknowledge a refresh as soon as it queued the
 message for an inactive bridge. The wrapper now acknowledges only after it has
 forwarded the refresh to an active bridge or started the legacy frame reload.
 If neither happens within the extension acknowledgement timeout, the extension
 replaces the wrapper HTML through its existing compatibility fallback.
+Only the latest refresh is retained while the bridge is inactive. A newer
+refresh replaces the pending one; the superseded attempt remains
+unacknowledged and follows the same bounded extension fallback.
 
 Closing the preview panel still disposes its context. Status transitions,
 preview-origin changes, and legacy HTML-replacement refreshes may still replace
