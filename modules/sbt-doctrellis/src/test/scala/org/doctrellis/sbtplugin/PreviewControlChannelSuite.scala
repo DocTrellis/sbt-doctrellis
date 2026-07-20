@@ -723,40 +723,42 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       deleteTree(runtime)
 
   test("runtime validation rejects symlinks and a different owner"):
-    if isWindows then ()
-    else
-      val parent = shortTempDirectory("dtc-owner-")
-      val target = Files.createDirectory(parent.resolve("target"))
-      val link   = parent.resolve("link")
-      try
-        Files.createSymbolicLink(link, target)
-        intercept[IllegalStateException](
-          PreviewControlEndpoint.prepare(
-            config = PreviewControlConfig(
-              runtimeDirectory = link,
-              workspaceHash = "4123456789abcdef01234567",
-              launchId = launchId,
-              runtimeOwner = Some(runtimeOwner(target)),
-            ),
-            pid = ProcessHandle.current().pid(),
-            sessionId = "symlink-session",
-            token = "1" * 64,
+    assume(
+      !isWindows,
+      "requires Unix ownership and symbolic-link semantics",
+    )
+    val parent = shortTempDirectory("dtc-owner-")
+    val target = Files.createDirectory(parent.resolve("target"))
+    val link   = parent.resolve("link")
+    try
+      Files.createSymbolicLink(link, target)
+      intercept[IllegalStateException](
+        PreviewControlEndpoint.prepare(
+          config = PreviewControlConfig(
+            runtimeDirectory = link,
+            workspaceHash = "4123456789abcdef01234567",
+            launchId = launchId,
+            runtimeOwner = Some(runtimeOwner(target)),
           ),
-        ): Unit
-        intercept[IllegalStateException](
-          PreviewControlEndpoint.prepare(
-            config = PreviewControlConfig(
-              runtimeDirectory = target,
-              workspaceHash = "5123456789abcdef01234567",
-              launchId = launchId,
-              runtimeOwner = Some(runtimeOwner(target) + 1L),
-            ),
-            pid = ProcessHandle.current().pid(),
-            sessionId = "owner-session",
-            token = "1" * 64,
+          pid = ProcessHandle.current().pid(),
+          sessionId = "symlink-session",
+          token = "1" * 64,
+        ),
+      ): Unit
+      intercept[IllegalStateException](
+        PreviewControlEndpoint.prepare(
+          config = PreviewControlConfig(
+            runtimeDirectory = target,
+            workspaceHash = "5123456789abcdef01234567",
+            launchId = launchId,
+            runtimeOwner = Some(runtimeOwner(target) + 1L),
           ),
-        ): Unit
-      finally deleteTree(parent)
+          pid = ProcessHandle.current().pid(),
+          sessionId = "owner-session",
+          token = "1" * 64,
+        ),
+      ): Unit
+    finally deleteTree(parent)
 
   test("malformed ownership metadata is protected instead of unlinked"):
     val runtime      = shortTempDirectory("dtc-protect-")

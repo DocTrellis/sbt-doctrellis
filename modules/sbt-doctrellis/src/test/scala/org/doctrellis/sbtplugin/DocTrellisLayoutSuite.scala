@@ -88,67 +88,67 @@ class DocTrellisLayoutSuite extends munit.FunSuite:
   test(
     "a symlink alias of the source is rejected where symlinks are supported",
   ):
-    if !isWindows then
-      withFixture: fixture =>
-        val alias = fixture.root.resolve("source-alias")
-        Files.createSymbolicLink(alias, fixture.source)
+    assume(!isWindows, "requires Unix symbolic-link semantics")
+    withFixture: fixture =>
+      val alias = fixture.root.resolve("source-alias")
+      Files.createSymbolicLink(alias, fixture.source)
 
-        val problem = left(fixture.parse(mdoc = alias))
+      val problem = left(fixture.parse(mdoc = alias))
 
-        problem match
-          case DocTrellisLayoutProblem.OverlappingDirectories(
-                DocTrellisDirectoryRole.Mdoc,
-                generated,
-                DocTrellisDirectoryRole.Source,
-                source,
-              ) =>
-            assertEquals(generated, fixture.source.toRealPath())
-            assertEquals(source, fixture.source.toRealPath())
-          case other => fail(s"unexpected layout problem: $other")
+      problem match
+        case DocTrellisLayoutProblem.OverlappingDirectories(
+              DocTrellisDirectoryRole.Mdoc,
+              generated,
+              DocTrellisDirectoryRole.Source,
+              source,
+            ) =>
+          assertEquals(generated, fixture.source.toRealPath())
+          assertEquals(source, fixture.source.toRealPath())
+        case other => fail(s"unexpected layout problem: $other")
 
   test(
     "a lexical source symlink inside the canonical mdoc target is rejected",
   ):
-    if !isWindows then
-      withFixture: fixture =>
-        val generatedTarget = Files.createDirectories(
-          fixture.root.resolve("generated-target"),
-        )
-        val generatedSentinel = generatedTarget.resolve("generated-sentinel")
-        Files.writeString(generatedSentinel, "generated sentinel")
-        val mdocAlias = fixture.root.resolve("mdoc-alias")
-        Files.createSymbolicLink(mdocAlias, generatedTarget)
+    assume(!isWindows, "requires Unix symbolic-link semantics")
+    withFixture: fixture =>
+      val generatedTarget = Files.createDirectories(
+        fixture.root.resolve("generated-target"),
+      )
+      val generatedSentinel = generatedTarget.resolve("generated-sentinel")
+      Files.writeString(generatedSentinel, "generated sentinel")
+      val mdocAlias = fixture.root.resolve("mdoc-alias")
+      Files.createSymbolicLink(mdocAlias, generatedTarget)
 
-        val externalSource = Files.createDirectories(
-          fixture.root.resolve("external-source"),
-        )
-        val sourceSentinel = externalSource.resolve("source-sentinel")
-        Files.writeString(sourceSentinel, "source sentinel")
-        val sourceLink = generatedTarget.resolve("source-link")
-        Files.createSymbolicLink(sourceLink, externalSource)
+      val externalSource = Files.createDirectories(
+        fixture.root.resolve("external-source"),
+      )
+      val sourceSentinel = externalSource.resolve("source-sentinel")
+      Files.writeString(sourceSentinel, "source sentinel")
+      val sourceLink = generatedTarget.resolve("source-link")
+      Files.createSymbolicLink(sourceLink, externalSource)
 
-        val problem = left(
-          fixture.parse(source = sourceLink, mdoc = mdocAlias),
-        )
+      val problem = left(
+        fixture.parse(source = sourceLink, mdoc = mdocAlias),
+      )
 
-        problem match
-          case DocTrellisLayoutProblem.OverlappingDirectories(
-                DocTrellisDirectoryRole.Mdoc,
-                generated,
-                DocTrellisDirectoryRole.Source,
-                source,
-              ) =>
-            assertEquals(generated, generatedTarget.toRealPath())
-            assertEquals(source, externalSource.toRealPath())
-          case other => fail(s"unexpected layout problem: $other")
-        assert(Files.isSymbolicLink(mdocAlias))
-        assert(Files.isSymbolicLink(sourceLink))
-        assertEquals(Files.readString(generatedSentinel), "generated sentinel")
-        assertEquals(Files.readString(sourceSentinel), "source sentinel")
-        assertEquals(
-          Files.readString(sourceLink.resolve("source-sentinel")),
-          "source sentinel",
-        )
+      problem match
+        case DocTrellisLayoutProblem.OverlappingDirectories(
+              DocTrellisDirectoryRole.Mdoc,
+              generated,
+              DocTrellisDirectoryRole.Source,
+              source,
+            ) =>
+          assertEquals(generated, generatedTarget.toRealPath())
+          assertEquals(source, externalSource.toRealPath())
+        case other => fail(s"unexpected layout problem: $other")
+      assert(Files.isSymbolicLink(mdocAlias))
+      assert(Files.isSymbolicLink(sourceLink))
+      assertEquals(Files.readString(generatedSentinel), "generated sentinel")
+      assertEquals(Files.readString(sourceSentinel), "source sentinel")
+      assertEquals(
+        Files.readString(sourceLink.resolve("source-sentinel")),
+        "source sentinel",
+      )
 
   test("a missing source is rejected before a generated directory is changed"):
     withFixture: fixture =>

@@ -75,13 +75,17 @@ holding an exclusive publication lock shared with the static HTTP handler.
 HTTP requests take the corresponding read lock while resolving a path and
 copying the selected file into an immutable response snapshot, so they observe
 either the previous complete site or the next complete site, never a partially
-replaced tree. Release the read lock before sending response headers or body
-bytes to the client. This bounds lock ownership by local filesystem work,
-prevents a stalled client from blocking publication, and closes the file before
-a Windows directory replacement. Use same-filesystem sibling staging and
-backup directories so a failed replacement can restore the last successful
-site. Clean session-owned staging and backup directories during normal shutdown
-and stale-session startup cleanup without deleting user-owned paths.
+replaced tree. Use a 1 MiB in-memory response threshold. Spool larger responses
+into an OS temporary work file opened with `DELETE_ON_CLOSE`, copy the source
+completely, rewind the owned temporary handle, and close every handle that
+refers to the publication tree before releasing the read lock. Release the read
+lock before sending response headers or body bytes to the client. This bounds
+heap usage per request, keeps lock ownership independent of client read speed,
+and lets Windows replace the published directories. Use same-filesystem sibling
+staging and backup directories so a failed replacement can restore the last
+successful site. Clean session-owned staging and backup directories during
+normal shutdown and stale-session startup cleanup without deleting user-owned
+paths.
 
 A rebuild failure is non-terminal: log the diagnostic through sbt, discard the
 failed staging output, keep serving the last successful site, and retry after
@@ -166,10 +170,11 @@ remain supported and are not assumed to implement DocTrellis events.
   interval rather than native FSEvents. Change detection may therefore take
   several seconds and polling work grows with the number of registered
   directories; the debounce quiet period is additional to that platform delay.
-- Each GET buffers the selected preview asset before sending it. Concurrent
-  requests for large assets therefore consume additional heap, accepted for the
-  loopback-only development server in exchange for keeping publication and
-  shutdown independent of client read speed.
+- Small GET response snapshots retain at most 1 MiB of heap each. Larger
+  responses use an OS temporary work file for the lifetime of the response, so
+  concurrent stalled large responses consume temporary-disk space rather than
+  unbounded heap. A large response can delay publication while its local
+  snapshot copy is made, but client read speed cannot extend that lock interval.
 - Recreating the sandboxed iframe returns it to the preview root. Preserving an
   in-frame navigation path would require a trusted navigation protocol or a
   weaker sandbox and is deferred.
@@ -188,11 +193,11 @@ remain supported and are not assumed to implement DocTrellis events.
   permanent traffic, can reload during a build, and provides poorer failure
   semantics than a publication event.
 - Serving immutable generation directories behind an atomic pointer swap would
-  avoid per-request response buffering and shorten the read-side critical
-  section further. It was deferred because generations need leases and cleanup
-  while `doctrellisOutputDirectory` must continue to name the current
-  materialized site on POSIX and Windows. Revisit this if large preview assets
-  make the response-snapshot memory tradeoff observable.
+  avoid per-request response copying and shorten the read-side critical section
+  further. It was deferred because generations need leases and cleanup while
+  `doctrellisOutputDirectory` must continue to name the current materialized
+  site on POSIX and Windows. Revisit this if large preview assets make the
+  response-snapshot disk or copy-time tradeoff observable.
 - sbt continuous execution alone was rejected because the blocking HTTP server
   and extension-owned process lifecycle still need one coordinated foreground
   process.
@@ -202,3 +207,4 @@ remain supported and are not assumed to implement DocTrellis events.
 - [VS Code 1.74 `ExtHostWebview.html` setter](https://github.com/microsoft/vscode/blob/1.74.0/src/vs/workbench/api/common/extHostWebview.ts#L100-L103)
 - [OpenJDK 25 macOS/BSD watch-service selection](https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/macosx/classes/sun/nio/fs/BsdFileSystem.java#L51-L56)
 - [OpenJDK 25 polling watch-service interval](https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/sun/nio/fs/PollingWatchService.java#L62-L63)
+- [Java 25 `StandardOpenOption.DELETE_ON_CLOSE`](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/file/StandardOpenOption.html#DELETE_ON_CLOSE)

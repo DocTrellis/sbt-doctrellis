@@ -10,6 +10,7 @@ import java.net.{InetSocketAddress, URI}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.Files
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
 
 import com.sun.net.httpserver.{
   Headers,
@@ -295,20 +296,210 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       pool.shutdownNow()
       GeneratedDirectory.delete(root)
 
+  test("keeps an exact-threshold response snapshot in memory"):
+    val root     = Files.createTempDirectory("doctrellis-handler-threshold")
+    val exchange = BlockingExchange(CountDownLatch(0), CountDownLatch(0))
+    try
+      Files.writeString(root.resolve("index.html"), "1234")
+      StaticSiteHandler(
+        root,
+        PreviewPublicationLock(),
+        maximumInMemoryResponseBytes = 4L,
+        createTemporaryFile = () =>
+          throw AssertionError("an exact-threshold response must not spill"),
+      ).handle(exchange)
+      assertEquals(
+        String(exchange.responseBytes, java.nio.charset.StandardCharsets.UTF_8),
+        "1234",
+      )
+    finally GeneratedDirectory.delete(root)
+
+  test("spools a large response snapshot and deletes it after streaming"):
+    val root      = Files.createTempDirectory("doctrellis-handler-large")
+    val temporary = Files.createTempDirectory("doctrellis-handler-snapshot")
+    val original  = "large response snapshot"
+    Files.writeString(root.resolve("index.html"), original)
+    val lock         = PreviewPublicationLock()
+    val started      = CountDownLatch(1)
+    val release      = CountDownLatch(1)
+    val snapshotPath = AtomicReference[Option[java.nio.file.Path]](None)
+    val exchange     = BlockingExchange(started, release)
+    val pool         = Executors.newFixedThreadPool(2)
+    try
+      val handler = StaticSiteHandler(
+        root,
+        lock,
+        maximumInMemoryResponseBytes = 1L,
+        createTemporaryFile = () =>
+          val created = Files.createTempFile(
+            temporary,
+            "response-",
+            ".snapshot",
+          )
+          snapshotPath.set(Some(created))
+          created,
+      )
+      val response = pool.submit(
+        new Callable[Unit]:
+          override def call(): Unit = handler.handle(exchange),
+      )
+      assert(started.await(2L, TimeUnit.SECONDS))
+      val snapshot = snapshotPath
+        .get()
+        .getOrElse(fail("the disk snapshot was not created"))
+
+      val publication = pool.submit(
+        new Callable[Unit]:
+          override def call(): Unit =
+            lock.write:
+              Files.writeString(root.resolve("index.html"), "replacement"): Unit,
+      )
+      publication.get(2L, TimeUnit.SECONDS)
+      assert(!response.isDone, "the simulated client should still be stalled")
+
+      release.countDown()
+      response.get(2L, TimeUnit.SECONDS)
+      assertEquals(
+        String(exchange.responseBytes, java.nio.charset.StandardCharsets.UTF_8),
+        original,
+      )
+      assertEquals(Files.readString(root.resolve("index.html")), "replacement")
+      assert(
+        Files.notExists(snapshot),
+        "the response snapshot was not deleted",
+      )
+    finally
+      release.countDown()
+      pool.shutdownNow()
+      val _ = pool.awaitTermination(2L, TimeUnit.SECONDS)
+      GeneratedDirectory.delete(root)
+      GeneratedDirectory.delete(temporary)
+
+  test("closes the exchange when snapshot acquisition fails fatally"):
+    val root     = Files.createTempDirectory("doctrellis-handler-fatal")
+    val exchange = BlockingExchange(CountDownLatch(0), CountDownLatch(0))
+    val failure  = OutOfMemoryError("simulated temporary snapshot failure")
+    try
+      Files.writeString(root.resolve("index.html"), "response")
+      val actual =
+        try
+          StaticSiteHandler(
+            root,
+            PreviewPublicationLock(),
+            maximumInMemoryResponseBytes = 0L,
+            createTemporaryFile = () => throw failure,
+          ).handle(exchange)
+          throw AssertionError("the fatal snapshot failure was not propagated")
+        catch case error: OutOfMemoryError => error
+      assert(actual eq failure)
+      assert(exchange.exchangeClosed)
+    finally GeneratedDirectory.delete(root)
+
+  test("deletes a large response snapshot when the client disconnects"):
+    val root      = Files.createTempDirectory("doctrellis-handler-disconnect")
+    val temporary = Files.createTempDirectory("doctrellis-handler-snapshot")
+    val snapshot  = AtomicReference[Option[java.nio.file.Path]](None)
+    val failure   = java.io.IOException("simulated client disconnect")
+    val exchange  = BlockingExchange(
+      CountDownLatch(0),
+      CountDownLatch(0),
+      responseWriteFailure = Some(failure),
+    )
+    try
+      Files.writeString(root.resolve("index.html"), "large response")
+      val actual = intercept[java.io.IOException]:
+        StaticSiteHandler(
+          root,
+          PreviewPublicationLock(),
+          maximumInMemoryResponseBytes = 1L,
+          createTemporaryFile = () =>
+            val created = Files.createTempFile(
+              temporary,
+              "response-",
+              ".snapshot",
+            )
+            snapshot.set(Some(created))
+            created,
+        ).handle(exchange)
+      assert(actual eq failure)
+      assert(exchange.exchangeClosed)
+      val created = snapshot
+        .get()
+        .getOrElse(fail("the disk snapshot was not created"))
+      assert(Files.notExists(created), "the response snapshot was not deleted")
+    finally
+      GeneratedDirectory.delete(root)
+      GeneratedDirectory.delete(temporary)
+
+  test("preserves a write failure when temporary cleanup also fails"):
+    val root         = Files.createTempDirectory("doctrellis-handler-cleanup")
+    val temporary    = Files.createTempDirectory("doctrellis-handler-snapshot")
+    val writeFailure = java.io.IOException("simulated client disconnect")
+    val cleanupFailure =
+      java.io.IOException("simulated snapshot cleanup failure")
+    val exchange = BlockingExchange(
+      CountDownLatch(0),
+      CountDownLatch(0),
+      responseWriteFailure = Some(writeFailure),
+    )
+    try
+      Files.writeString(root.resolve("index.html"), "large response")
+      val actual = intercept[java.io.IOException]:
+        StaticSiteHandler(
+          root,
+          PreviewPublicationLock(),
+          maximumInMemoryResponseBytes = 1L,
+          createTemporaryFile =
+            () => Files.createTempFile(temporary, "response-", ".snapshot"),
+          deleteTemporaryFile = _ => throw cleanupFailure,
+        ).handle(exchange)
+      assert(actual eq writeFailure)
+      assertEquals(actual.getSuppressed.toList, List(cleanupFailure))
+      assert(exchange.exchangeClosed)
+    finally
+      GeneratedDirectory.delete(root)
+      GeneratedDirectory.delete(temporary)
+
+  test("preserves a write failure when closing the response also fails"):
+    val root         = Files.createTempDirectory("doctrellis-handler-failure")
+    val writeFailure = java.io.IOException("simulated client disconnect")
+    val closeFailure = java.io.IOException("simulated response close failure")
+    val exchange     = BlockingExchange(
+      CountDownLatch(0),
+      CountDownLatch(0),
+      responseWriteFailure = Some(writeFailure),
+      responseCloseFailure = Some(closeFailure),
+    )
+    try
+      Files.writeString(root.resolve("index.html"), "response")
+      val actual = intercept[java.io.IOException]:
+        StaticSiteHandler(root).handle(exchange)
+      assert(actual eq writeFailure)
+      assertEquals(actual.getSuppressed.toList, List(closeFailure))
+      assert(exchange.exchangeClosed)
+    finally GeneratedDirectory.delete(root)
+
   private final class BlockingExchange(
       started: CountDownLatch,
       release: CountDownLatch,
       requestUri: URI = URI.create("/"),
       requestMethod: String = "GET",
       failOnResponseBody: Boolean = false,
+      responseWriteFailure: Option[java.io.IOException] = None,
+      responseCloseFailure: Option[java.io.IOException] = None,
   ) extends HttpExchange:
     private val requestHeaders  = Headers()
     private val responseHeaders = Headers()
-    private val responseBody    = BlockingOutput(started, release)
-    private var responseCode    = -1
-    var sentResponseLength      = Long.MinValue
-    var responseBodyRequested   = false
-    var exchangeClosed          = false
+    private val responseBody    = BlockingOutput(
+      started,
+      release,
+      responseWriteFailure,
+      responseCloseFailure,
+    )
+    private var responseCode  = -1
+    var sentResponseLength    = Long.MinValue
+    var responseBodyRequested = false
+    var exchangeClosed        = false
 
     def responseBytes: Array[Byte] = responseBody.bytes
 
@@ -346,6 +537,8 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
   private final class BlockingOutput(
       started: CountDownLatch,
       release: CountDownLatch,
+      responseWriteFailure: Option[java.io.IOException],
+      responseCloseFailure: Option[java.io.IOException],
   ) extends OutputStream:
     private val received = ByteArrayOutputStream()
 
@@ -353,11 +546,15 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
 
     override def write(value: Int): Unit =
       block()
+      responseWriteFailure.foreach(throw _)
       received.write(value)
 
     override def write(bytes: Array[Byte], offset: Int, length: Int): Unit =
       block()
+      responseWriteFailure.foreach(throw _)
       received.write(bytes, offset, length)
+
+    override def close(): Unit = responseCloseFailure.foreach(throw _)
 
     private def block(): Unit =
       started.countDown()

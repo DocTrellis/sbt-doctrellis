@@ -300,48 +300,48 @@ class PreviewPublicationSuite extends munit.FunSuite:
       finally replacement.close()
 
   test("startup cleanup never follows or publishes owned symlinks"):
-    if !isWindows then
-      withLayout: layout =>
-        Files.createDirectories(layout.siteDirectory)
-        Files.writeString(layout.siteDirectory.resolve("index.html"), "current")
-        val stale = staleTargetPaths(
-          layout.siteDirectory,
-          "index.html",
-          UUID.randomUUID().toString,
-        )
-        val externalStaging = Files.createDirectories(
-          layout.siteDirectory.getParent.resolve("external-staging"),
-        )
-        val externalBackup = Files.createDirectories(
-          layout.siteDirectory.getParent.resolve("external-backup"),
-        )
-        Files.writeString(externalStaging.resolve("sentinel"), "staging")
-        Files.writeString(externalBackup.resolve("index.html"), "external")
-        Files.createSymbolicLink(stale.staging, externalStaging)
-        Files.createSymbolicLink(stale.backup, externalBackup)
-        Files.writeString(
-          stale.marker,
-          ownerContents(stale.destination, stale.sessionId),
-        )
+    assume(!isWindows, "requires Unix symbolic-link semantics")
+    withLayout: layout =>
+      Files.createDirectories(layout.siteDirectory)
+      Files.writeString(layout.siteDirectory.resolve("index.html"), "current")
+      val stale = staleTargetPaths(
+        layout.siteDirectory,
+        "index.html",
+        UUID.randomUUID().toString,
+      )
+      val externalStaging = Files.createDirectories(
+        layout.siteDirectory.getParent.resolve("external-staging"),
+      )
+      val externalBackup = Files.createDirectories(
+        layout.siteDirectory.getParent.resolve("external-backup"),
+      )
+      Files.writeString(externalStaging.resolve("sentinel"), "staging")
+      Files.writeString(externalBackup.resolve("index.html"), "external")
+      Files.createSymbolicLink(stale.staging, externalStaging)
+      Files.createSymbolicLink(stale.backup, externalBackup)
+      Files.writeString(
+        stale.marker,
+        ownerContents(stale.destination, stale.sessionId),
+      )
 
-        val replacement = open(layout)
-        try
-          assert(!Files.isSymbolicLink(layout.siteDirectory))
-          assertEquals(
-            Files.readString(layout.siteDirectory.resolve("index.html")),
-            "current",
-          )
-          assert(!Files.exists(stale.staging))
-          assert(!Files.exists(stale.backup))
-          assertEquals(
-            Files.readString(externalStaging.resolve("sentinel")),
-            "staging",
-          )
-          assertEquals(
-            Files.readString(externalBackup.resolve("index.html")),
-            "external",
-          )
-        finally replacement.close()
+      val replacement = open(layout)
+      try
+        assert(!Files.isSymbolicLink(layout.siteDirectory))
+        assertEquals(
+          Files.readString(layout.siteDirectory.resolve("index.html")),
+          "current",
+        )
+        assert(!Files.exists(stale.staging))
+        assert(!Files.exists(stale.backup))
+        assertEquals(
+          Files.readString(externalStaging.resolve("sentinel")),
+          "staging",
+        )
+        assertEquals(
+          Files.readString(externalBackup.resolve("index.html")),
+          "external",
+        )
+      finally replacement.close()
 
   test("committed stale cleanup preserves the newer destination"):
     withLayout: layout =>

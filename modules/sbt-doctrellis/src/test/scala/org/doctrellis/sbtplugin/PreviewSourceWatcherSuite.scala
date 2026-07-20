@@ -100,23 +100,23 @@ class PreviewSourceWatcherSuite extends munit.FunSuite:
       GeneratedDirectory.delete(parent)
 
   test("does not follow a directory symlink outside the source root"):
-    if !isWindows then
-      val parent   = Files.createTempDirectory("doctrellis-watch-link-")
-      val source   = Files.createDirectory(parent.resolve("docs"))
-      val external = Files.createDirectory(parent.resolve("external"))
-      val mailbox  = BlockingPreviewEventMailbox()
-      val watcher  = PreviewSourceWatcher.open(source.toRealPath(), mailbox)
-      try
-        Files.createSymbolicLink(source.resolve("linked"), external)
-        awaitInvalidationAndDrain(mailbox)
-        Files.writeString(external.resolve("outside.md"), "outside")
-        assertEquals(
-          mailbox.pollBefore(System.nanoTime() + absenceWindowNanos),
-          None,
-        )
-      finally
-        watcher.close()
-        GeneratedDirectory.delete(parent)
+    assume(!isWindows, "requires Unix symbolic-link semantics")
+    val parent   = Files.createTempDirectory("doctrellis-watch-link-")
+    val source   = Files.createDirectory(parent.resolve("docs"))
+    val external = Files.createDirectory(parent.resolve("external"))
+    val mailbox  = BlockingPreviewEventMailbox()
+    val watcher  = PreviewSourceWatcher.open(source.toRealPath(), mailbox)
+    try
+      Files.createSymbolicLink(source.resolve("linked"), external)
+      awaitInvalidationAndDrain(mailbox)
+      Files.writeString(external.resolve("outside.md"), "outside")
+      assertEquals(
+        mailbox.pollBefore(System.nanoTime() + absenceWindowNanos),
+        None,
+      )
+    finally
+      watcher.close()
+      GeneratedDirectory.delete(parent)
 
   test("generated output and publication staging siblings do not invalidate"):
     val parent  = Files.createTempDirectory("doctrellis-watch-output-")

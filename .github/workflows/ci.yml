@@ -43,6 +43,10 @@ jobs:
       - name: Run Scala unit tests
         run: sbt --batch testFull
 
+      - name: Run sbt plugin integration tests on macOS
+        if: runner.os == 'macOS'
+        run: sbt --batch 'sbtDoctrellis / scripted'
+
   unix-verification:
     name: Unix integration and packaging
     runs-on: ubuntu-latest
