@@ -10,6 +10,9 @@ import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
 
 private[infrastructure] trait PreviewPanel:
+  // Updated synchronously by the backend's disposal callback, before its IO
+  // cleanup is dispatched, so a later explicit open can be ordered correctly.
+  def isDisposed: Boolean
   def setHtml(value: String): IO[Unit]
   def reveal: IO[Unit]
   def dispose: IO[Unit]
@@ -108,17 +111,28 @@ private[infrastructure] final class PreviewPanelRegistry private (
         IO.pure(None),
         panels.modify: current =>
           current.get(key) match
+            case Some(slot) if slot.panel.exists(_.panel.isDisposed) =>
+              if open then
+                val revision = new Revision
+                current.updated(
+                  key,
+                  Slot(revision, Some(revision), panel = None),
+                ) -> Some(Reservation(revision, open = true))
+              else current.removed(key) -> None
             case Some(slot) =>
               val revision = new Revision
               val updated  = slot.copy(
                 revision = revision,
-                visible = slot.visible || open,
+                openIntent = Option.when(open)(revision).orElse(slot.openIntent),
               )
               current.updated(key, updated) ->
                 Some(Reservation(revision, open))
             case None if open =>
               val revision = new Revision
-              current.updated(key, Slot(revision, visible = true, None)) ->
+              current.updated(
+                key,
+                Slot(revision, Some(revision), panel = None),
+              ) ->
                 Some(Reservation(revision, open = true))
             case None => current -> None,
       )
@@ -135,26 +149,70 @@ private[infrastructure] final class PreviewPanelRegistry private (
           _.get(workspace.key) match
             case Some(slot) if slot.revision.eq(reservation.revision) =>
               slot.panel match
+                case Some(entry) if entry.panel.isDisposed =>
+                  panels.update(_.removed(workspace.key))
                 case Some(entry) =>
                   val write = entry.panel.setHtml(html) *>
-                    IO.whenA(reservation.open)(entry.panel.reveal)
+                    slot.openIntent.fold(IO.unit)(intent =>
+                      entry.panel.reveal *>
+                        consumeOpenIntent(workspace.key, intent),
+                    )
                   write.handleErrorWith:
                     case PreviewPanelDisposed =>
-                      if reservation.open then
-                        panels.update(
-                          _.updated(workspace.key, slot.copy(panel = None)),
-                        ) *>
-                          create(workspace, slot.copy(panel = None), html)
-                      else panels.update(_.removed(workspace.key))
+                      if entry.panel.isDisposed then
+                        panels.update(_.removed(workspace.key))
+                      else
+                        slot.openIntent match
+                          case Some(intent) =>
+                            val empty = slot.copy(panel = None)
+                            panels.update(
+                              _.updated(workspace.key, empty),
+                            ) *>
+                              create(workspace, empty, html, intent)
+                          case None => panels.update(_.removed(workspace.key))
                     case error => IO.raiseError(error)
-                case None if slot.visible => create(workspace, slot, html)
-                case None                 => IO.unit
-            case Some(slot) if reservation.open =>
-              slot.panel.fold(IO.unit)(entry =>
-                entry.panel.reveal.handleErrorWith:
-                  case PreviewPanelDisposed => IO.unit
-                  case error                => IO.raiseError(error),
-              )
+                case None =>
+                  slot.openIntent.fold(
+                    panels.update(_.removed(workspace.key)),
+                  )(intent => create(workspace, slot, html, intent))
+            case Some(slot)
+                if reservation.open && slot.openIntent.exists(
+                  _.eq(reservation.revision),
+                ) =>
+              slot.panel match
+                case Some(entry) if entry.panel.isDisposed =>
+                  panels.update(_.removed(workspace.key))
+                case Some(entry) =>
+                  entry.panel.reveal
+                    .flatMap(_ =>
+                      consumeOpenIntent(
+                        workspace.key,
+                        reservation.revision,
+                      ),
+                    )
+                    .handleErrorWith:
+                      case PreviewPanelDisposed =>
+                        if entry.panel.isDisposed then
+                          panels.update(_.removed(workspace.key))
+                        else
+                          val empty = slot.copy(panel = None)
+                          panels.update(
+                            _.updated(workspace.key, empty),
+                          ) *>
+                            create(
+                              workspace,
+                              empty,
+                              html,
+                              reservation.revision,
+                            )
+                      case error => IO.raiseError(error)
+                case None =>
+                  create(
+                    workspace,
+                    slot,
+                    html,
+                    reservation.revision,
+                  )
             case _ => IO.unit,
       )
 
@@ -162,6 +220,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
       workspace: Workspace,
       slot: Slot,
       html: String,
+      openIntent: Revision,
   ): IO[Unit] =
     val token  = new Object
     val remove = mutex.lock.surround:
@@ -179,7 +238,13 @@ private[infrastructure] final class PreviewPanelRegistry private (
             current.get(workspace.key) match
               case Some(actual)
                   if actual.panel.exists(entry => entry.token.eq(token)) =>
-                current.removed(workspace.key)
+                if panel.isDisposed || actual.openIntent.isEmpty then
+                  current.removed(workspace.key)
+                else
+                  current.updated(
+                    workspace.key,
+                    actual.copy(panel = None),
+                  )
               case _ => current
           *> panel.dispose.attempt.void
 
@@ -198,7 +263,16 @@ private[infrastructure] final class PreviewPanelRegistry private (
                       actual.copy(panel = Some(entry)),
                     )
                   case _ => current
-            install *> panel.reveal *> keep.set(true)
+            install *> panel.reveal *>
+              consumeOpenIntent(workspace.key, openIntent) *>
+              keep.set(true)
+
+  private def consumeOpenIntent(key: String, intent: Revision): IO[Unit] =
+    panels.update: current =>
+      current.get(key) match
+        case Some(slot) if slot.openIntent.exists(_.eq(intent)) =>
+          current.updated(key, slot.copy(openIntent = None))
+        case _ => current
 
   private def abandon(
       key: String,
@@ -207,9 +281,18 @@ private[infrastructure] final class PreviewPanelRegistry private (
     mutex.lock.surround:
       panels.update: current =>
         current.get(key) match
-          case Some(slot)
-              if slot.revision.eq(reservation.revision) && slot.panel.isEmpty =>
-            current.removed(key)
+          case Some(slot) =>
+            val withoutIntent =
+              if reservation.open && slot.openIntent.exists(
+                  _.eq(reservation.revision),
+                )
+              then slot.copy(openIntent = None)
+              else slot
+            if withoutIntent.revision.eq(reservation.revision) &&
+              withoutIntent.panel.isEmpty &&
+              withoutIntent.openIntent.isEmpty
+            then current.removed(key)
+            else current.updated(key, withoutIntent)
           case _ => current
 
   private def render(
@@ -266,7 +349,7 @@ private[infrastructure] object PreviewPanelRegistry:
   private final case class Entry(token: Object, panel: PreviewPanel)
   private final case class Slot(
       revision: Revision,
-      visible: Boolean,
+      openIntent: Option[Revision],
       panel: Option[Entry],
   )
   private final case class Reservation(revision: Revision, open: Boolean)
@@ -406,6 +489,8 @@ private[infrastructure] final class VscodePreviewPanelBackend(
           dispatcher.unsafeRunAndForget(onDispose)
       val registration = panel.onDidDispose(listener)
       new PreviewPanel:
+        def isDisposed: Boolean = disposed
+
         def setHtml(value: String): IO[Unit] =
           IO.delay:
             if disposed then throw PreviewPanelDisposed

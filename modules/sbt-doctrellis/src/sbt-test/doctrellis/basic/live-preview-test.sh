@@ -14,6 +14,17 @@ fi
 preview_log=live-preview.log
 preview_pid=
 preview_group=
+preview_log_shown=0
+
+show_preview_log_tail() {
+  preview_log_shown=1
+  if [ -f "$preview_log" ]; then
+    echo "last 240 lines of $preview_log:" >&2
+    tail -n 240 "$preview_log" >&2
+  else
+    echo "preview log was not created: $preview_log" >&2
+  fi
+}
 
 preview_group_is_alive() {
   [ -n "$preview_group" ] && kill -0 "-$preview_group" 2>/dev/null
@@ -81,9 +92,25 @@ stop_preview() {
     stop_failed=1
   fi
 
+  if [ "$stop_failed" -ne 0 ] && [ "$preview_log_shown" -eq 0 ]; then
+    show_preview_log_tail
+  fi
+
   preview_pid=
   preview_group=
   [ "$stop_failed" -eq 0 ]
+}
+
+finish() {
+  status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ "$preview_log_shown" -eq 0 ]; then
+    show_preview_log_tail
+  fi
+  if ! stop_preview; then
+    status=1
+  fi
+  exit "$status"
 }
 
 wait_for() {
@@ -93,13 +120,13 @@ wait_for() {
   until "$@"; do
     if ! preview_group_is_alive; then
       echo "preview exited while waiting for $description" >&2
-      sed -n '1,240p' "$preview_log" >&2
+      show_preview_log_tail
       exit 1
     fi
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 120 ]; then
       echo "timed out waiting for $description" >&2
-      sed -n '1,240p' "$preview_log" >&2
+      show_preview_log_tail
       exit 1
     fi
     sleep 1
@@ -130,7 +157,7 @@ start_preview() {
   done
   if ! preview_group_is_alive; then
     echo "preview launcher did not create its owned process group" >&2
-    sed -n '1,120p' "$preview_log" >&2
+    show_preview_log_tail
     kill -TERM "$preview_pid" 2>/dev/null || true
     wait "$preview_pid" 2>/dev/null || true
     preview_pid=
@@ -139,7 +166,7 @@ start_preview() {
   fi
 }
 
-trap stop_preview EXIT
+trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

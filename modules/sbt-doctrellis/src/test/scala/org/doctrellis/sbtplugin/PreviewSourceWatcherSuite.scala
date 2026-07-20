@@ -1,36 +1,46 @@
 package org.doctrellis.sbtplugin
 
 import java.nio.file.{Files, Path, StandardWatchEventKinds}
-import java.util.concurrent.{Callable, Executors, TimeUnit}
+import java.util.concurrent.TimeUnit
 
 class PreviewSourceWatcherSuite extends munit.FunSuite:
   test("parent events filter siblings while overflow invalidates"):
     val parent = Path.of("parent")
     val source = Path.of("docs")
-    assertEquals(
-      PreviewWatchDecision.decide(
-        PreviewWatchScope.Parent(parent),
-        StandardWatchEventKinds.ENTRY_MODIFY,
-        Some(Path.of("sibling")),
-        source,
-      ),
-      PreviewWatchDecision(
-        invalidate = false,
-        registerCreatedDirectory = false,
-      ),
-    )
-    assertEquals(
-      PreviewWatchDecision.decide(
-        PreviewWatchScope.Parent(parent),
-        StandardWatchEventKinds.ENTRY_CREATE,
-        Some(source),
-        source,
-      ),
-      PreviewWatchDecision(
-        invalidate = true,
-        registerCreatedDirectory = true,
-      ),
-    )
+    Vector(
+      StandardWatchEventKinds.ENTRY_CREATE,
+      StandardWatchEventKinds.ENTRY_MODIFY,
+      StandardWatchEventKinds.ENTRY_DELETE,
+    ).foreach: kind =>
+      assertEquals(
+        PreviewWatchDecision.decide(
+          PreviewWatchScope.Parent(parent),
+          kind,
+          Some(Path.of("sibling")),
+          source,
+        ),
+        PreviewWatchDecision(
+          invalidate = false,
+          registerCreatedDirectory = false,
+        ),
+      )
+    Vector(
+      StandardWatchEventKinds.ENTRY_CREATE -> true,
+      StandardWatchEventKinds.ENTRY_MODIFY -> false,
+      StandardWatchEventKinds.ENTRY_DELETE -> false,
+    ).foreach: (kind, registerCreatedDirectory) =>
+      assertEquals(
+        PreviewWatchDecision.decide(
+          PreviewWatchScope.Parent(parent),
+          kind,
+          Some(source),
+          source,
+        ),
+        PreviewWatchDecision(
+          invalidate = true,
+          registerCreatedDirectory = registerCreatedDirectory,
+        ),
+      )
     assert(
       PreviewWatchDecision
         .decide(
@@ -50,15 +60,18 @@ class PreviewSourceWatcherSuite extends munit.FunSuite:
       StandardWatchEventKinds.ENTRY_DELETE,
       StandardWatchEventKinds.OVERFLOW,
     ).foreach: kind =>
-      assert(
-        PreviewWatchDecision
-          .decide(
-            PreviewWatchScope.Source(source),
-            kind,
-            Some(Path.of("guide")),
-            source,
-          )
-          .invalidate,
+      assertEquals(
+        PreviewWatchDecision.decide(
+          PreviewWatchScope.Source(source),
+          kind,
+          Some(Path.of("guide")),
+          source,
+        ),
+        PreviewWatchDecision(
+          invalidate = true,
+          registerCreatedDirectory =
+            kind == StandardWatchEventKinds.ENTRY_CREATE,
+        ),
       )
 
   test("recursively watches new directories and a recreated source root"):
@@ -98,7 +111,7 @@ class PreviewSourceWatcherSuite extends munit.FunSuite:
         awaitInvalidationAndDrain(mailbox)
         Files.writeString(external.resolve("outside.md"), "outside")
         assertEquals(
-          mailbox.pollBefore(System.nanoTime() + TimeUnit.SECONDS.toNanos(3L)),
+          mailbox.pollBefore(System.nanoTime() + absenceWindowNanos),
           None,
         )
       finally
@@ -122,7 +135,7 @@ class PreviewSourceWatcherSuite extends munit.FunSuite:
 
       assertEquals(
         mailbox.pollBefore(
-          System.nanoTime() + TimeUnit.SECONDS.toNanos(3L),
+          System.nanoTime() + absenceWindowNanos,
         ),
         None,
       )
@@ -137,30 +150,38 @@ class PreviewSourceWatcherSuite extends munit.FunSuite:
       mailbox: PreviewEventMailbox,
   ): Unit =
     awaitInvalidation(mailbox)
-    var draining = true
-    while draining do
+    var quietIntervals = 0
+    while quietIntervals < 2 do
       mailbox.pollBefore(
-        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(250L),
+        System.nanoTime() + drainQuietIntervalNanos,
       ) match
-        case Some(PreviewLoopEvent.Invalidated(_)) => ()
+        case Some(PreviewLoopEvent.Invalidated(_)) => quietIntervals = 0
         case Some(other)                           =>
           fail(s"unexpected watcher event while draining: $other")
-        case None => draining = false
+        case None => quietIntervals += 1
 
   private def awaitInvalidation(mailbox: PreviewEventMailbox): Unit =
-    val executor = Executors.newSingleThreadExecutor()
-    try
-      val future = executor.submit(
-        new Callable[PreviewLoopEvent]:
-          override def call(): PreviewLoopEvent = mailbox.take(),
-      )
-      future.get(8L, TimeUnit.SECONDS) match
-        case PreviewLoopEvent.Invalidated(_) => ()
-        case other => fail(s"unexpected watcher event: $other")
-    finally executor.shutdownNow(): Unit
+    mailbox.pollBefore(System.nanoTime() + watchDeliveryTimeoutNanos) match
+      case Some(PreviewLoopEvent.Invalidated(_)) => ()
+      case Some(other) => fail(s"unexpected watcher event: $other")
+      case None        => fail("timed out waiting for a watcher invalidation")
+
+  private def watchDeliveryTimeoutNanos: Long =
+    TimeUnit.SECONDS.toNanos(if isMacOs then 20L else 8L)
+
+  private def drainQuietIntervalNanos: Long =
+    if isMacOs then TimeUnit.SECONDS.toNanos(1L)
+    else TimeUnit.MILLISECONDS.toNanos(125L)
+
+  private def absenceWindowNanos: Long =
+    TimeUnit.SECONDS.toNanos(if isMacOs then 5L else 3L)
 
   private def isWindows: Boolean =
+    operatingSystemName.contains("win")
+
+  private def isMacOs: Boolean = operatingSystemName.contains("mac")
+
+  private def operatingSystemName: String =
     System
       .getProperty("os.name", "")
       .toLowerCase(java.util.Locale.ROOT)
-      .contains("win")

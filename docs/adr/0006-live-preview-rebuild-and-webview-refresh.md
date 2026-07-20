@@ -72,13 +72,16 @@ served site up front.
 
 After a staged build succeeds and contains `index.html`, publish it while
 holding an exclusive publication lock shared with the static HTTP handler.
-HTTP requests take the corresponding read lock, so they observe either the
-previous complete site or the next complete site, never a partially replaced
-tree. A request holds its read lock until its response body has finished
-streaming. Use same-filesystem sibling staging and backup directories so a
-failed replacement can restore the last successful site. Clean session-owned
-staging and backup directories during normal shutdown and stale-session startup
-cleanup without deleting user-owned paths.
+HTTP requests take the corresponding read lock while resolving a path and
+copying the selected file into an immutable response snapshot, so they observe
+either the previous complete site or the next complete site, never a partially
+replaced tree. Release the read lock before sending response headers or body
+bytes to the client. This bounds lock ownership by local filesystem work,
+prevents a stalled client from blocking publication, and closes the file before
+a Windows directory replacement. Use same-filesystem sibling staging and
+backup directories so a failed replacement can restore the last successful
+site. Clean session-owned staging and backup directories during normal shutdown
+and stale-session startup cleanup without deleting user-owned paths.
 
 A rebuild failure is non-terminal: log the diagnostic through sbt, discard the
 failed staging output, keep serving the last successful site, and retry after
@@ -120,9 +123,15 @@ not a durable content version; it resets with each preview session.
 
 Every owner or observer connection may opt in. On `siteChanged`, the extension
 updates an existing panel for that workspace with the already stored ready URL
-without revealing or creating a panel. The extension carries the accepted
-revision into the panel renderer and includes it in inert wrapper markup, such
-as a `data-doctrellis-revision` attribute on the iframe. The rendered HTML must
+without revealing or creating a panel. If that refresh supersedes an explicit
+`Open Preview` operation already in progress, retain the open intent and
+fulfill it exactly once with the newest rendered state; a refresh without such
+an intent must never reopen a panel the user closed. Treat the synchronous
+panel-disposal signal as the ordering point: an open reserved after that signal
+survives its asynchronous cleanup, while a disposal observed after an open
+reservation cancels that intent. The extension carries the accepted revision
+into the panel renderer and includes it in inert wrapper markup, such as a
+`data-doctrellis-revision` attribute on the iframe. The rendered HTML must
 therefore differ for every accepted revision; do not rely on assigning an
 identical string to `webview.html`. VS Code then applies the new HTML and
 recreates the iframe, while the server's existing `Cache-Control: no-store`
@@ -157,10 +166,10 @@ remain supported and are not assumed to implement DocTrellis events.
   interval rather than native FSEvents. Change detection may therefore take
   several seconds and polling work grows with the number of registered
   directories; the debounce quiet period is additional to that platform delay.
-- A slow or stalled HTTP response holds the publication read lock and delays
-  the next site's publication. This is accepted for the loopback-only
-  development server, but means publication latency is not strictly bounded by
-  build time.
+- Each GET buffers the selected preview asset before sending it. Concurrent
+  requests for large assets therefore consume additional heap, accepted for the
+  loopback-only development server in exchange for keeping publication and
+  shutdown independent of client read speed.
 - Recreating the sandboxed iframe returns it to the preview root. Preserving an
   in-frame navigation path would require a trusted navigation protocol or a
   weaker sandbox and is deferred.
@@ -179,11 +188,11 @@ remain supported and are not assumed to implement DocTrellis events.
   permanent traffic, can reload during a build, and provides poorer failure
   semantics than a publication event.
 - Serving immutable generation directories behind an atomic pointer swap would
-  prevent slow HTTP clients from delaying publication. It was deferred because
-  generations need leases and cleanup while
-  `doctrellisOutputDirectory` must continue to name the current materialized
-  site on POSIX and Windows. Revisit this if real preview workloads make the
-  read/write-lock tradeoff observable.
+  avoid per-request response buffering and shorten the read-side critical
+  section further. It was deferred because generations need leases and cleanup
+  while `doctrellisOutputDirectory` must continue to name the current
+  materialized site on POSIX and Windows. Revisit this if large preview assets
+  make the response-snapshot memory tradeoff observable.
 - sbt continuous execution alone was rejected because the blocking HTTP server
   and extension-owned process lifecycle still need one coordinated foreground
   process.

@@ -1,9 +1,12 @@
 package org.doctrellis.sbtplugin
 
+import java.nio.file.{Files, Path}
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters.*
+import scala.util.Using
 
 import sbt.util.LogExchange
 
@@ -89,6 +92,110 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
     assertEquals(builds, 2)
     assertEquals(published.toVector, Vector(1L, 2L))
     assertEquals(mailbox.pollBeforeCalls, 2)
+
+  test(
+    "shutdown queued during a rebuild publishes before loop cleanup",
+  ):
+    withLayout: layout =>
+      val publication = PreviewPublication.open(layout, logger)
+      assertEquals(
+        publication.buildAndPublish(target =>
+          writeGeneration(target, "initial"),
+        ),
+        1L,
+      )
+      val staged          = publication.stagedTarget
+      val mailbox         = BlockingPreviewEventMailbox()
+      val buildStarted    = CountDownLatch(1)
+      val releaseBuild    = CountDownLatch(1)
+      val cleanupFinished = CountDownLatch(1)
+      val serverStopped   = AtomicBoolean(false)
+      val executorStopped = AtomicBoolean(false)
+      val published       = ArrayBuffer.empty[Long]
+      val worker          = Executors.newSingleThreadExecutor()
+      mailbox.invalidate()
+      val loop = worker.submit(
+        new Callable[Unit]:
+          override def call(): Unit =
+            try
+              PreviewRebuildLoop.run(
+                mailbox = mailbox,
+                quietPeriodNanos = 0L,
+                rebuild = () =>
+                  publication.buildAndPublish: target =>
+                    Files.createDirectories(target.mdocDirectory)
+                    Files.createDirectories(target.siteDirectory)
+                    Files.writeString(
+                      target.mdocDirectory.resolve("index.md"),
+                      "rebuilt",
+                    )
+                    buildStarted.countDown()
+                    if !releaseBuild.await(5L, TimeUnit.SECONDS) then
+                      throw AssertionError(
+                        "test did not release the staged rebuild",
+                      )
+                    Files.writeString(
+                      target.siteDirectory.resolve("index.html"),
+                      "rebuilt",
+                    ): Unit
+                ,
+                onPublished = published += _,
+                log = logger,
+              )
+            finally
+              try publication.close()
+              finally cleanupFinished.countDown(),
+      )
+      val shutdown = PreviewServerShutdown(
+        stopServer = () => serverStopped.set(true),
+        stopExecutor = () => executorStopped.set(true),
+        signalStopped = () => mailbox.stop(),
+      )
+
+      try
+        assert(buildStarted.await(5L, TimeUnit.SECONDS))
+        assert(
+          Files.isRegularFile(staged.mdocDirectory.resolve("index.md")),
+        )
+        assert(!Files.exists(staged.siteDirectory.resolve("index.html")))
+        assertEquals(
+          Files.readString(layout.mdocDirectory.resolve("index.md")),
+          "initial",
+        )
+        assertEquals(
+          Files.readString(layout.siteDirectory.resolve("index.html")),
+          "initial",
+        )
+
+        shutdown.stop()
+        assert(serverStopped.get())
+        assert(executorStopped.get())
+        assert(!loop.isDone)
+        assert(
+          !cleanupFinished.await(200L, TimeUnit.MILLISECONDS),
+          "publication cleanup must wait for the in-progress rebuild",
+        )
+
+        releaseBuild.countDown()
+        loop.get(5L, TimeUnit.SECONDS)
+        assert(cleanupFinished.await(1L, TimeUnit.SECONDS))
+        assertEquals(published.toVector, Vector(2L))
+        assertEquals(
+          Files.readString(layout.mdocDirectory.resolve("index.md")),
+          "rebuilt",
+        )
+        assertEquals(
+          Files.readString(layout.siteDirectory.resolve("index.html")),
+          "rebuilt",
+        )
+        assertEquals(ownedTemporaryPaths(layout), Vector.empty)
+      finally
+        releaseBuild.countDown()
+        mailbox.stop()
+        if !loop.isDone then
+          try loop.get(5L, TimeUnit.SECONDS): Unit
+          catch case _: Exception => ()
+        worker.shutdownNow(): Unit
 
   test("events first observed after a build still receive a quiet period"):
     val mailbox = ScriptedMailbox(
@@ -237,3 +344,45 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
       case Nil => fail("scripted mailbox ran out of steps")
 
   private def logger = LogExchange.logger("preview-rebuild-loop-test")
+
+  private def writeGeneration(
+      target: DocTrellisBuildTarget,
+      content: String,
+  ): Unit =
+    Files.createDirectories(target.mdocDirectory)
+    Files.createDirectories(target.siteDirectory)
+    Files.writeString(target.mdocDirectory.resolve("index.md"), content)
+    Files.writeString(target.siteDirectory.resolve("index.html"), content): Unit
+
+  private def ownedTemporaryPaths(layout: DocTrellisLayout): Vector[Path] =
+    Vector(
+      layout.mdocDirectory.getParent,
+      layout.siteDirectory.getParent,
+    ).distinct
+      .flatMap: parent =>
+        Using.resource(Files.list(parent)): paths =>
+          paths
+            .iterator()
+            .asScala
+            .toVector
+            .filter: path =>
+              val name = path.getFileName.toString
+              name.endsWith(".owner") || name.endsWith(".staging") ||
+              name.endsWith(".backup") || name.endsWith(".commit") ||
+              name.endsWith(".owner.tmp") || name.endsWith(".commit.tmp")
+
+  private def withLayout(action: DocTrellisLayout => Unit): Unit =
+    val root      = Files.createTempDirectory("doctrellis-rebuild-shutdown-")
+    val workspace = Files.createDirectories(root.resolve("workspace"))
+    val source    = Files.createDirectories(workspace.resolve("docs"))
+    val output    = Files.createDirectories(root.resolve("output"))
+    val layout    = DocTrellisLayout
+      .parse(
+        workspaceDirectory = workspace,
+        sourceDirectory = source,
+        mdocDirectory = output.resolve("mdoc"),
+        siteDirectory = output.resolve("site"),
+      )
+      .fold(problem => fail(problem.message), identity)
+    try action(layout)
+    finally GeneratedDirectory.delete(root)

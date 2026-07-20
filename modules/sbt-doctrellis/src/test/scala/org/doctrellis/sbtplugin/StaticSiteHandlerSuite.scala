@@ -1,6 +1,11 @@
 package org.doctrellis.sbtplugin
 
-import java.io.{ByteArrayInputStream, InputStream, OutputStream}
+import java.io.{
+  ByteArrayInputStream,
+  ByteArrayOutputStream,
+  InputStream,
+  OutputStream,
+}
 import java.net.{InetSocketAddress, URI}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.nio.file.Files
@@ -249,16 +254,15 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       "text/css; charset=utf-8",
     )
 
-  test("holds the publication read lock until response streaming completes"):
+  test("releases the publication read lock before response streaming"):
     val root = Files.createTempDirectory("doctrellis-handler-lock")
     Files.writeString(root.resolve("index.html"), "streamed response")
-    val lock      = PreviewPublicationLock()
-    val started   = CountDownLatch(1)
-    val release   = CountDownLatch(1)
-    val attempted = CountDownLatch(1)
-    val acquired  = CountDownLatch(1)
-    val exchange  = BlockingExchange(started, release)
-    val pool      = Executors.newFixedThreadPool(2)
+    val lock     = PreviewPublicationLock()
+    val started  = CountDownLatch(1)
+    val release  = CountDownLatch(1)
+    val acquired = CountDownLatch(1)
+    val exchange = BlockingExchange(started, release)
+    val pool     = Executors.newFixedThreadPool(2)
     try
       val response = pool.submit(
         new Callable[Unit]:
@@ -269,15 +273,23 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       val publication = pool.submit(
         new Callable[Unit]:
           override def call(): Unit =
-            attempted.countDown()
-            lock.write(acquired.countDown()),
+            lock.write:
+              Files.writeString(root.resolve("index.html"), "replacement")
+              acquired.countDown(),
       )
-      assert(attempted.await(2L, TimeUnit.SECONDS))
-      assertEquals(acquired.getCount, 1L)
+      assert(
+        acquired.await(2L, TimeUnit.SECONDS),
+        "publication remained blocked by response streaming",
+      )
+      publication.get(2L, TimeUnit.SECONDS)
+      assert(!response.isDone, "the simulated client should still be stalled")
       release.countDown()
       response.get(2L, TimeUnit.SECONDS)
-      publication.get(2L, TimeUnit.SECONDS)
-      assertEquals(acquired.getCount, 0L)
+      assertEquals(
+        String(exchange.responseBytes, java.nio.charset.StandardCharsets.UTF_8),
+        "streamed response",
+      )
+      assertEquals(Files.readString(root.resolve("index.html")), "replacement")
     finally
       release.countDown()
       pool.shutdownNow()
@@ -297,6 +309,8 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
     var sentResponseLength      = Long.MinValue
     var responseBodyRequested   = false
     var exchangeClosed          = false
+
+    def responseBytes: Array[Byte] = responseBody.bytes
 
     override def getRequestHeaders(): Headers  = requestHeaders
     override def getResponseHeaders(): Headers = responseHeaders
@@ -333,15 +347,25 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       started: CountDownLatch,
       release: CountDownLatch,
   ) extends OutputStream:
-    override def write(value: Int): Unit = block()
+    private val received = ByteArrayOutputStream()
+
+    def bytes: Array[Byte] = received.toByteArray
+
+    override def write(value: Int): Unit =
+      block()
+      received.write(value)
 
     override def write(bytes: Array[Byte], offset: Int, length: Int): Unit =
-      val _ = bytes
-      val _ = offset
-      val _ = length
       block()
+      received.write(bytes, offset, length)
 
     private def block(): Unit =
       started.countDown()
-      if !release.await(2L, TimeUnit.SECONDS) then
-        throw java.io.IOException("test response stream was not released")
+      try release.await()
+      catch
+        case error: InterruptedException =>
+          Thread.currentThread().interrupt()
+          throw java.io.IOException(
+            "test response stream was interrupted",
+            error,
+          )

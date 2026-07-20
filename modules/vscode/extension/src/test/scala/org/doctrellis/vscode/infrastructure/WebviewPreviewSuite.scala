@@ -354,6 +354,131 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             assert(at(backend.created, 0).html.contains("Preview disconnected"))
     yield ()
 
+  test("a refresh preserves a show reserved after synchronous disposal"):
+    for
+      resolving <- Deferred[IO, Unit]
+      continue  <- Deferred[IO, Unit]
+      backend = new FakeBackend:
+        override def resolve(actual: PreviewUrl): IO[String] =
+          if actual == WebviewPreviewSuite.this.url(4242) then
+            resolving.complete(()).void *>
+              continue.get.as("https://forwarded.example:4242/preview")
+          else super.resolve(actual)
+      _ <- PreviewPanelRegistry
+        .resource(backend)
+        .use: registry =>
+          for
+            _ <- registry.show(first, PreviewViewState.Starting)
+            old = at(backend.created, 0)
+            _    <- old.markDisposed
+            open <- registry
+              .show(first, PreviewViewState.Ready(url(4242)))
+              .start
+            _ <- resolving.get
+            _ <- old.notifyDisposed
+            _ <- registry.update(
+              first,
+              PreviewViewState.Refreshed(url(5252), revision(2)),
+            )
+            _           = assertEquals(backend.created.size, 2)
+            replacement = at(backend.created, 1)
+            _           = assertEquals(replacement.reveals, 1)
+            _ = assert(replacement.html.contains("forwarded.example:5252"))
+            _ = assert(
+              replacement.html.contains("data-doctrellis-revision=\"2\""),
+            )
+            _ <- continue.complete(())
+            _ <- open.joinWithNever
+            _ <- registry.update(
+              first,
+              PreviewViewState.Refreshed(url(5252), revision(3)),
+            )
+          yield
+            assertEquals(backend.created.size, 2)
+            assertEquals(replacement.reveals, 1)
+            assert(
+              replacement.html.contains("data-doctrellis-revision=\"3\""),
+            )
+    yield ()
+
+  test("a background refresh does not reopen a disposed panel"):
+    val backend = FakeBackend()
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(first, PreviewViewState.Starting)
+          old = at(backend.created, 0)
+          _ <- old.markDisposed
+          resolvedBefore = backend.resolved.size
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(2)),
+          )
+          _ <- old.notifyDisposed
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(3)),
+          )
+        yield
+          assertEquals(backend.created.size, 1)
+          assertEquals(backend.resolved.size, resolvedBefore)
+          assertEquals(old.reveals, 1)
+
+  test("a canceled refresh creation preserves another pending show"):
+    for
+      resolving         <- Deferred[IO, Unit]
+      continue          <- Deferred[IO, Unit]
+      replacementReveal <- Deferred[IO, Unit]
+      backend = new FakeBackend:
+        override def resolve(actual: PreviewUrl): IO[String] =
+          if actual == WebviewPreviewSuite.this.url(4242) then
+            resolving.complete(()).void *>
+              continue.get.as("https://forwarded.example:4242/preview")
+          else super.resolve(actual)
+
+        override def create(
+            workspace: Workspace,
+            onDispose: IO[Unit],
+        ): IO[PreviewPanel] =
+          IO.delay:
+            val beforeReveal =
+              if created.size == 1 then
+                replacementReveal.complete(()).void *> IO.never
+              else IO.unit
+            val panel = FakePanel(onDispose, beforeReveal = beforeReveal)
+            created += panel
+            panel
+      _ <- PreviewPanelRegistry
+        .resource(backend)
+        .use: registry =>
+          for
+            _ <- registry.show(first, PreviewViewState.Starting)
+            old = at(backend.created, 0)
+            _    <- old.markDisposed
+            open <- registry
+              .show(first, PreviewViewState.Ready(url(4242)))
+              .start
+            _       <- resolving.get
+            _       <- old.notifyDisposed
+            refresh <- registry
+              .update(
+                first,
+                PreviewViewState.Refreshed(url(5252), revision(2)),
+              )
+              .start
+            _ <- replacementReveal.get
+            _ <- refresh.cancel
+            _ = assert(at(backend.created, 1).disposed)
+            _ <- continue.complete(())
+            _ <- open.joinWithNever
+          yield
+            assertEquals(backend.created.size, 3)
+            val replacement = at(backend.created, 2)
+            assertEquals(replacement.reveals, 1)
+            assert(replacement.html.contains("forwarded.example:4242"))
+    yield ()
+
   test("a user disposal after a pending open wins over that open"):
     for
       resolving <- Deferred[IO, Unit]
@@ -372,9 +497,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
               .show(first, PreviewViewState.Ready(url(4242)))
               .start
             _ <- resolving.get
-            _ <- old.disposeFromUser
+            _ <- old.markDisposed
             _ <- continue.complete(())
             _ <- open.joinWithNever
+            _ <- old.notifyDisposed
             _ = assertEquals(backend.created.size, 1)
             _ <- registry.show(first, PreviewViewState.Stopped)
           yield assertEquals(backend.created.size, 2)
@@ -514,6 +640,8 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             onDispose: IO[Unit],
         ): IO[PreviewPanel] = IO.pure:
           new PreviewPanel:
+            def isDisposed: Boolean = false
+
             def setHtml(value: String): IO[Unit] =
               writeEntered.complete(()).void *> IO.never
 
@@ -585,10 +713,13 @@ private final class FakePanel(
     val onDispose: IO[Unit],
     failOnDispose: Boolean = false,
     failOnSetHtml: Boolean = false,
+    beforeReveal: IO[Unit] = IO.unit,
 ) extends PreviewPanel:
   var html: String      = ""
   var reveals: Int      = 0
   var disposed: Boolean = false
+
+  def isDisposed: Boolean = disposed
 
   def setHtml(value: String): IO[Unit] =
     IO.delay:
@@ -597,9 +728,10 @@ private final class FakePanel(
       else html = value
 
   def reveal: IO[Unit] =
-    IO.delay:
-      if disposed then throw PreviewPanelDisposed
-      else reveals += 1
+    beforeReveal *>
+      IO.delay:
+        if disposed then throw PreviewPanelDisposed
+        else reveals += 1
 
   def dispose: IO[Unit] =
     IO.delay:

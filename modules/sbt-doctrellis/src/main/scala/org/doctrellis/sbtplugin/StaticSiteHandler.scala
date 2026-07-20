@@ -16,58 +16,88 @@ private[sbtplugin] final class StaticSiteHandler private (
   private val normalizedRoot = root.toAbsolutePath.normalize()
 
   override def handle(exchange: HttpExchange): Unit =
-    publicationLock.read(handleLocked(exchange))
+    val method   = exchange.getRequestMethod
+    val response = publicationLock.read(
+      snapshot(method, exchange.getRequestURI.getRawPath),
+    )
+    send(exchange, response)
 
-  private def handleLocked(exchange: HttpExchange): Unit =
-    val method = exchange.getRequestMethod
+  private def snapshot(
+      method: String,
+      requestPath: String,
+  ): StaticSiteHandler.ResponseSnapshot =
     if method != "GET" && method != "HEAD" then
-      exchange.getResponseHeaders.set("Allow", "GET, HEAD")
-      sendText(exchange, 405, "Method Not Allowed")
+      StaticSiteHandler.textResponse(
+        405,
+        "Method Not Allowed",
+        includeBody = true,
+        headers = List("Allow" -> "GET, HEAD"),
+      )
     else
       StaticSiteHandler.resolve(
         normalizedRoot,
-        exchange.getRequestURI.getRawPath,
+        requestPath,
       ) match
         case Some(file) if Files.isRegularFile(file) =>
-          val size = Files.size(file)
-          exchange.getResponseHeaders.set(
-            "Content-Type",
-            StaticSiteHandler.contentType(file),
+          val body = Option.when(method == "GET")(Files.readAllBytes(file))
+          StaticSiteHandler.ResponseSnapshot(
+            status = 200,
+            headers = List(
+              "Content-Type"  -> StaticSiteHandler.contentType(file),
+              "Cache-Control" -> "no-store",
+            ),
+            contentLength = body.fold(Files.size(file))(_.length.toLong),
+            body = body,
           )
-          exchange.getResponseHeaders.set("Cache-Control", "no-store")
-          if method == "HEAD" then
-            exchange.getResponseHeaders.set("Content-Length", size.toString)
-            exchange.sendResponseHeaders(200, -1)
-            exchange.close()
-          else if size == 0L then
-            exchange.getResponseHeaders.set("Content-Length", "0")
-            exchange.sendResponseHeaders(200, -1)
-            exchange.close()
-          else
-            exchange.sendResponseHeaders(200, size)
-            val output = exchange.getResponseBody
-            try Files.copy(file, output): Unit
-            finally output.close()
-        case _ => sendText(exchange, 404, "Not Found")
+        case _ =>
+          StaticSiteHandler.textResponse(
+            404,
+            "Not Found",
+            includeBody = method == "GET",
+          )
 
-  private def sendText(
+  private def send(
       exchange: HttpExchange,
-      status: Int,
-      message: String,
+      response: StaticSiteHandler.ResponseSnapshot,
   ): Unit =
-    val bytes = message.getBytes(StandardCharsets.UTF_8)
-    exchange.getResponseHeaders.set("Content-Type", "text/plain; charset=utf-8")
-    if exchange.getRequestMethod == "HEAD" then
-      exchange.getResponseHeaders.set("Content-Length", bytes.length.toString)
-      exchange.sendResponseHeaders(status, -1)
-      exchange.close()
-    else
-      exchange.sendResponseHeaders(status, bytes.length)
-      val output = exchange.getResponseBody
-      try output.write(bytes)
-      finally output.close()
+    response.headers.foreach: (name, value) =>
+      exchange.getResponseHeaders.set(name, value)
+    response.body match
+      case Some(body) if body.nonEmpty =>
+        exchange.sendResponseHeaders(response.status, response.contentLength)
+        val output = exchange.getResponseBody
+        try output.write(body)
+        finally output.close()
+      case _ =>
+        exchange.getResponseHeaders.set(
+          "Content-Length",
+          response.contentLength.toString,
+        )
+        exchange.sendResponseHeaders(response.status, -1)
+        exchange.close()
 
 private[sbtplugin] object StaticSiteHandler:
+  private final case class ResponseSnapshot(
+      status: Int,
+      headers: List[(String, String)],
+      contentLength: Long,
+      body: Option[Array[Byte]],
+  )
+
+  private def textResponse(
+      status: Int,
+      message: String,
+      includeBody: Boolean,
+      headers: List[(String, String)] = Nil,
+  ): ResponseSnapshot =
+    val bytes = message.getBytes(StandardCharsets.UTF_8)
+    ResponseSnapshot(
+      status,
+      "Content-Type" -> "text/plain; charset=utf-8" :: headers,
+      bytes.length.toLong,
+      Option.when(includeBody)(bytes),
+    )
+
   def apply(root: Path): StaticSiteHandler =
     new StaticSiteHandler(root, PreviewPublicationLock())
 
