@@ -725,7 +725,6 @@ private[infrastructure] object PreviewWebviewHtml:
       |    timeout = setTimeout(() => {
       |      timeout = null;
       |      if (panelVisible) fallback();
-      |      else armFallback();
       |    }, 2000);
       |  };
       |  const hello = () => {
@@ -946,30 +945,31 @@ private[infrastructure] final class VscodePreviewPanelBackend(
             showOptions,
             PreviewWebviewOptions.value,
           )
-          var disposed                               = false
-          var installedChannelToken: Option[String] = None
-          var registrations: List[Disposable]        = Nil
+          var disposed                                        = false
+          var installedChannelToken: Option[String]           = None
+          var registrations: List[Disposable]                 = Nil
           def postVisibility(expectedToken: String): IO[Unit] =
             IO.delay:
               Option.when(
                 !disposed && installedChannelToken.contains(expectedToken),
               )(panel.visible)
             .flatMap(
-              _.traverse_(visible =>
-                IO.fromPromise(
-                  IO.delay(
-                    panel.webview.postMessage(
-                      js.Dynamic.literal(
-                        protocol = 1,
-                        `type` = "doctrellis.preview.visibility",
-                        visible = visible,
-                        channelToken = expectedToken,
+                _.traverse_(visible =>
+                  IO.fromPromise(
+                    IO.delay(
+                      panel.webview.postMessage(
+                        js.Dynamic.literal(
+                          protocol = 1,
+                          `type` = "doctrellis.preview.visibility",
+                          visible = visible,
+                          channelToken = expectedToken,
+                        ),
                       ),
                     ),
-                  ),
-                ).attempt.void
-              ),
-            )
+                  ).attempt
+                    .void,
+                ),
+              )
           def releaseRegistrations(): Unit =
             val current = registrations
             registrations = Nil
@@ -1003,7 +1003,7 @@ private[infrastructure] final class VscodePreviewPanelBackend(
               dispatcher.unsafeRunAndForget(
                 postVisibility(channelToken),
               )
-          val disposeRegistration = panel.onDidDispose(listener)
+          val disposeRegistration   = panel.onDidDispose(listener)
           val viewStateRegistration = panel.onDidChangeViewState(
             viewStateListener,
           )

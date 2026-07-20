@@ -6,6 +6,15 @@ import scala.scalajs.js
 import munit.FunSuite
 
 class PreviewWebviewScriptSuite extends FunSuite:
+  test("announces wrapper readiness with its channel token"):
+    val harness = WrapperScriptHarness()
+
+    assertEquals(
+      harness.vscodeMessageTypes,
+      List("doctrellis.preview.ready"),
+    )
+    assertEquals(harness.wrapperReadyTokens, List("channel-secret"))
+
   test("retries a hidden bridge handshake when the panel becomes visible"):
     val harness = WrapperScriptHarness()
 
@@ -18,13 +27,14 @@ class PreviewWebviewScriptSuite extends FunSuite:
 
     assertEquals(harness.frameUrl, harness.bridgeUrl)
     assertEquals(harness.refreshAcknowledgements, Nil)
-    assertEquals(harness.pendingTimerCount, 1)
+    assertEquals(harness.pendingTimerCount, 0)
 
     harness.sendVisibility(visible = true)
     assertEquals(
       harness.bridgeMessageTypes,
       List("doctrellis.bridge.hello", "doctrellis.bridge.hello"),
     )
+    assertEquals(harness.pendingTimerCount, 1)
 
     harness.sendBridgeActive()
     assertEquals(
@@ -59,21 +69,23 @@ private final class WrapperScriptHarness:
   val directUrl = "https://preview.example/guide/current.html"
   val bridgeUrl = "https://preview.example/.doctrellis/webview-bridge"
 
-  private val bridgeOrigin = "https://preview.example"
+  private val bridgeOrigin          = "https://preview.example"
   private val installedChannelToken = "channel-secret"
-  private val bridgeMessages = mutable.ListBuffer.empty[js.Dynamic]
-  private val vscodeMessages = mutable.ListBuffer.empty[js.Dynamic]
-  private val timers = mutable.LinkedHashMap.empty[Int, js.Function0[Unit]]
+  private val bridgeMessages        = mutable.ListBuffer.empty[js.Dynamic]
+  private val vscodeMessages        = mutable.ListBuffer.empty[js.Dynamic]
+  private val timers    = mutable.LinkedHashMap.empty[Int, js.Function0[Unit]]
   private var nextTimer = 0
   private var frameLoadListener = Option.empty[js.Function0[Unit]]
-  private var messageListener = Option.empty[js.Function1[js.Dynamic, Unit]]
+  private var messageListener   = Option.empty[js.Function1[js.Dynamic, Unit]]
 
-  private val parentWindow = js.Dynamic.literal()
+  private val parentWindow  = js.Dynamic.literal()
   private val contentWindow = js.Dynamic.literal()
   contentWindow.updateDynamic("postMessage")(
-    ((message: js.Dynamic, _: String) =>
-      bridgeMessages += message
-      ()): js.Function2[js.Dynamic, String, Unit],
+    (
+        (message: js.Dynamic, _: String) =>
+          bridgeMessages += message
+          (),
+    ): js.Function2[js.Dynamic, String, Unit],
   )
 
   private val frame = js.Dynamic.literal(
@@ -86,10 +98,12 @@ private final class WrapperScriptHarness:
     src = bridgeUrl,
   )
   frame.updateDynamic("addEventListener")(
-    ((eventType: String, listener: js.Function) =>
-      if eventType == "load" then
-        frameLoadListener = Some(listener.asInstanceOf[js.Function0[Unit]])
-      ()): js.Function2[String, js.Function, Unit],
+    (
+        (eventType: String, listener: js.Function) =>
+          if eventType == "load" then
+            frameLoadListener = Some(listener.asInstanceOf[js.Function0[Unit]])
+          (),
+    ): js.Function2[String, js.Function, Unit],
   )
   frame.updateDynamic("setAttribute")(
     ((_: String, _: String) => ()): js.Function2[String, String, Unit],
@@ -107,28 +121,34 @@ private final class WrapperScriptHarness:
   vscode.updateDynamic("postMessage")(
     ((message: js.Dynamic) =>
       vscodeMessages += message
-      ()): js.Function1[js.Dynamic, Unit],
+      (),
+    ): js.Function1[js.Dynamic, Unit],
   )
 
   private val acquireVsCodeApi =
     (() => vscode): js.Function0[js.Dynamic]
   private val setTimeout =
-    ((callback: js.Function0[Unit], _: Double) =>
-      nextTimer += 1
-      timers.update(nextTimer, callback)
-      nextTimer): js.Function2[js.Function0[Unit], Double, Int]
+    (
+        (callback: js.Function0[Unit], _: Double) =>
+          nextTimer += 1
+          timers.update(nextTimer, callback)
+          nextTimer,
+    ): js.Function2[js.Function0[Unit], Double, Int]
   private val clearTimeout =
     ((value: js.Any) =>
       if value != null && js.typeOf(value) == "number" then
         val _ = timers.remove(value.asInstanceOf[Int])
-      ()): js.Function1[js.Any, Unit]
+      (),
+    ): js.Function1[js.Any, Unit]
   private val addEventListener =
-    ((eventType: String, listener: js.Function) =>
-      if eventType == "message" then
-        messageListener = Some(
-          listener.asInstanceOf[js.Function1[js.Dynamic, Unit]],
-        )
-      ()): js.Function2[String, js.Function, Unit]
+    (
+        (eventType: String, listener: js.Function) =>
+          if eventType == "message" then
+            messageListener = Some(
+              listener.asInstanceOf[js.Function1[js.Dynamic, Unit]],
+            )
+          (),
+    ): js.Function2[String, js.Function, Unit]
 
   private val script = js.Dynamic
     .newInstance(js.Dynamic.global.Function)(
@@ -155,6 +175,14 @@ private final class WrapperScriptHarness:
   def frameUrl: String = frame.src.asInstanceOf[String]
 
   def bridgeMessageTypes: List[String] = messageTypes(bridgeMessages)
+
+  def vscodeMessageTypes: List[String] = messageTypes(vscodeMessages)
+
+  def wrapperReadyTokens: List[String] =
+    vscodeMessages.toList.collect:
+      case message
+          if stringField(message, "type") == "doctrellis.preview.ready" =>
+        stringField(message, "channelToken")
 
   def refreshAcknowledgements: List[String] =
     vscodeMessages.toList.collect:

@@ -34,7 +34,7 @@ trait WebviewPanel extends Disposable:
   ): Unit = js.native
   def onDidChangeViewState(
       listener: js.Function1[WebviewPanelOnDidChangeViewStateEvent, Unit],
-  ): Disposable = js.native
+  ): Disposable                                              = js.native
   def onDidDispose(listener: js.Function0[Unit]): Disposable = js.native
 
 @js.native
