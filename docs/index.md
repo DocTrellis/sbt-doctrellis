@@ -16,3 +16,4 @@ This site documents the architecture and operating contracts of DocTrellis.
 - [Workspace IPC and dynamically bound preview ports](adr/0005-workspace-ipc-dynamic-port.md)
 - [Live preview rebuild and WebView refresh](adr/0006-live-preview-rebuild-and-webview-refresh.md)
 - [Path-preserving WebView refresh](adr/0007-path-preserving-webview-refresh.md)
+- [Retain hidden preview context](adr/0008-retain-hidden-preview-context.md)

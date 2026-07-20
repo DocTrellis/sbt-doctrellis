@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-20
 - Amends: ADR 0003, ADR 0006
+- Amended by: ADR 0008
 
 ## Context
 
@@ -85,10 +86,9 @@ trusted bridge.
 
 Lifecycle states continue to replace preview content with escaped status
 markup. Path preservation applies to successful in-session publications, not
-to a stopped process, a changed preview origin, a panel the user closed, or a
-hidden panel whose WebView context VS Code discarded. The extension keeps
-`retainContextWhenHidden` disabled to avoid retaining every hidden preview's
-document and bridge frames in memory.
+to a stopped process, a changed preview origin, or a panel the user closed.
+ADR 0008 subsequently extends path preservation to editor-tab switches by
+retaining hidden-panel context.
 
 ## Consequences
 
