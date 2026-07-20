@@ -687,29 +687,45 @@ private[infrastructure] object PreviewWebviewHtml:
       |  let active = false;
       |  let legacy = false;
       |  let pendingRefresh = null;
+      |  let timeout = null;
       |  const fallback = () => {
       |    if (legacy) return;
+      |    clearTimeout(timeout);
+      |    timeout = null;
       |    active = false;
       |    legacy = true;
       |    frame.setAttribute("sandbox", "");
       |    frame.removeAttribute("data-doctrellis-preview-url");
       |    frame.src = directUrl;
       |  };
-      |  const timeout = setTimeout(fallback, 2000);
-      |  let vscode;
-      |  try {
-      |    vscode = acquireVsCodeApi();
-      |  } catch (_) {
+      |  const armFallback = () => {
       |    clearTimeout(timeout);
-      |    fallback();
-      |    return;
-      |  }
-      |  frame.addEventListener("load", () => {
-      |    if (!legacy) {
+      |    timeout = setTimeout(() => {
+      |      timeout = null;
+      |      if (document.visibilityState === "visible") fallback();
+      |    }, 2000);
+      |  };
+      |  const hello = () => {
+      |    if (!legacy && !active && frame.contentWindow) {
       |      frame.contentWindow.postMessage({
       |        protocol: 1,
       |        type: "doctrellis.bridge.hello"
       |      }, bridgeOrigin);
+      |    }
+      |  };
+      |  armFallback();
+      |  let vscode;
+      |  try {
+      |    vscode = acquireVsCodeApi();
+      |  } catch (_) {
+      |    fallback();
+      |    return;
+      |  }
+      |  frame.addEventListener("load", hello);
+      |  document.addEventListener("visibilitychange", () => {
+      |    if (document.visibilityState === "visible" && !active && !legacy) {
+      |      hello();
+      |      armFallback();
       |    }
       |  });
       |  addEventListener("message", (event) => {
@@ -726,12 +742,12 @@ private[infrastructure] object PreviewWebviewHtml:
       |      } else if (message.type === "doctrellis.bridge.active") {
       |        active = true;
       |        clearTimeout(timeout);
+      |        timeout = null;
       |        if (pendingRefresh) {
       |          frame.contentWindow.postMessage(pendingRefresh, bridgeOrigin);
       |          pendingRefresh = null;
       |        }
       |      } else if (message.type === "doctrellis.bridge.rejected") {
-      |        clearTimeout(timeout);
       |        fallback();
       |      }
       |      return;
@@ -1067,7 +1083,7 @@ private[infrastructure] object PreviewWebviewOptions:
       enableScripts = true,
       enableCommandUris = false,
       localResourceRoots = js.Array(),
-      retainContextWhenHidden = false,
+      retainContextWhenHidden = true,
     )
 
 private[infrastructure] object VscodeExternalPreview:

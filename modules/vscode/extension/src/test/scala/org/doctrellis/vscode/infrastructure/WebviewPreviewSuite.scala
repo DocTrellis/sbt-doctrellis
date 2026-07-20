@@ -1089,7 +1089,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       assertEquals(backend.created.size, 1)
       assert(at(backend.created, 0).disposed)
 
-  test("enables the trusted wrapper script but keeps other capabilities off"):
+  test("retains hidden context and enables only the trusted wrapper script"):
     val options = PreviewWebviewOptions.value.asInstanceOf[js.Dynamic]
     assertEquals(options.enableScripts.asInstanceOf[Boolean], true)
     assertEquals(options.enableCommandUris.asInstanceOf[Boolean], false)
@@ -1099,7 +1099,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     )
     assertEquals(
       options.retainContextWhenHidden.asInstanceOf[Boolean],
-      false,
+      true,
     )
 
   test("keeps the CSP style hash synchronized with the rendered styles"):
@@ -1121,8 +1121,18 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     )
     assert(PreviewWebviewHtml.Script.contains("acquireVsCodeApi()"))
     assert(
-      PreviewWebviewHtml.Script.indexOf("const timeout = setTimeout") <
+      PreviewWebviewHtml.Script.indexOf("armFallback();") <
         PreviewWebviewHtml.Script.indexOf("vscode = acquireVsCodeApi()"),
+    )
+    assert(
+      PreviewWebviewHtml.Script.contains(
+        "document.addEventListener(\"visibilitychange\"",
+      ),
+    )
+    assert(
+      PreviewWebviewHtml.Script.contains(
+        "document.visibilityState === \"visible\"",
+      ),
     )
     assert(
       PreviewWebviewHtml.Script.contains(
