@@ -222,7 +222,7 @@ final case class ProcessExit(
 
 enum PreviewViewState:
   case Starting
-  case Ready(url: PreviewUrl)
+  case Ready(url: PreviewUrl, supportsLiveRefresh: Boolean)
   case Refreshed(url: PreviewUrl, revision: SiteRevision)
   case Stopped
   case Failed(reason: String)

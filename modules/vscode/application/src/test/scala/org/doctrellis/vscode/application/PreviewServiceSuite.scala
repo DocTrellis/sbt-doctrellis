@@ -593,7 +593,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(count, 2)
       assertEquals(
         afterStart.lastOption,
-        Some(PreviewViewState.Ready(urlOf(command))),
+        Some(
+          PreviewViewState.Ready(urlOf(command), supportsLiveRefresh = false),
+        ),
       )
 
   test("open passes the workspace and session URL to the preview view"):
@@ -612,7 +614,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
       actual <- shown.get
     yield assertEquals(
       actual.lastOption,
-      Some(workspace -> PreviewViewState.Ready(urlOf(command))),
+      Some(
+        workspace -> PreviewViewState.Ready(
+          urlOf(command),
+          supportsLiveRefresh = false,
+        ),
+      ),
     )
 
   test("openExternal uses the active session URL or loads the configured URL"):
@@ -927,7 +934,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       algebra = base.copy(
         show = (_, state) =>
           state match
-            case PreviewViewState.Ready(_) =>
+            case PreviewViewState.Ready(_, _) =>
               states.update(_ :+ state) *>
                 showEntered.complete(()).void *>
                 continueShow.get *>
@@ -974,7 +981,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
             case _ => states.update(_ :+ state),
         update = (_, state) =>
           state match
-            case PreviewViewState.Ready(_) =>
+            case PreviewViewState.Ready(_, _) =>
               readyUpdates
                 .modify(count => (count + 1) -> count)
                 .flatMap:
@@ -1031,13 +1038,14 @@ class PreviewServiceSuite extends CatsEffectSuite:
         show = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == urlOf(command) =>
+              case PreviewViewState.Ready(url, _) if url == urlOf(command) =>
                 showEntered.complete(()).void *> continueShow.get
               case _ => IO.unit),
         update = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == urlOf(replacement) =>
+              case PreviewViewState.Ready(url, _)
+                  if url == urlOf(replacement) =>
                 replacementReady.complete(()).void
               case _ => IO.unit),
         openExternal = _ => IO.unit,
@@ -1060,7 +1068,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield current
     yield assertEquals(
       actual.lastOption,
-      Some(PreviewViewState.Ready(urlOf(replacement))),
+      Some(
+        PreviewViewState.Ready(urlOf(replacement), supportsLiveRefresh = false),
+      ),
     )
 
   test("open-when-ready shows the ready session in its workspace panel"):
@@ -1077,7 +1087,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
       actual <- shown.get
     yield assertEquals(
       actual.lastOption,
-      Some(workspace -> PreviewViewState.Ready(urlOf(command))),
+      Some(
+        workspace -> PreviewViewState.Ready(
+          urlOf(command),
+          supportsLiveRefresh = false,
+        ),
+      ),
     )
 
   test("configuration or launch failure updates an existing workspace panel"):
@@ -1197,7 +1212,8 @@ class PreviewServiceSuite extends CatsEffectSuite:
         update = (_, state) =>
           states.update(_ :+ state) *>
             (state match
-              case PreviewViewState.Ready(url) if url == urlOf(replacement) =>
+              case PreviewViewState.Ready(url, _)
+                  if url == urlOf(replacement) =>
                 replacementReady.complete(()).void
               case _ => IO.unit),
         openExternal = _ => IO.unit,
@@ -1225,7 +1241,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
           yield current
     yield assertEquals(
       actual.lastOption,
-      Some(PreviewViewState.Ready(urlOf(replacement))),
+      Some(
+        PreviewViewState.Ready(urlOf(replacement), supportsLiveRefresh = false),
+      ),
     )
 
   test("stop racing a startup failure converges the panel to stopped"):
@@ -1358,7 +1376,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(actualOrdering, Vector("old-exited", "new-start"))
       assertEquals(
         actualStates.lastOption,
-        Some(PreviewViewState.Ready(urlOf(command))),
+        Some(
+          PreviewViewState.Ready(urlOf(command), supportsLiveRefresh = false),
+        ),
       )
 
   test("stop suppresses an await-exit observation failure after readiness"):
@@ -1579,7 +1599,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(actualOpened, Vector(announced))
       assertEquals(
         actualStates.lastOption,
-        Some(PreviewViewState.Ready(announced)),
+        Some(PreviewViewState.Ready(announced, supportsLiveRefresh = false)),
       )
 
   test("an announced site revision refreshes the ready session URL"):
@@ -1761,7 +1781,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         probe = _ => IO.pure(true),
         show = (_, state) =>
           state match
-            case PreviewViewState.Ready(_) =>
+            case PreviewViewState.Ready(_, _) =>
               showEntered.complete(()).void *> releaseShow.get
             case _ => IO.unit,
         update = (_, state) =>
@@ -1819,7 +1839,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         probe = _ => IO.pure(true),
         show = (_, state) =>
           state match
-            case PreviewViewState.Ready(_) =>
+            case PreviewViewState.Ready(_, _) =>
               showEntered.complete(()).void *> releaseShow.get
             case _ => IO.unit,
         update = (_, state) =>
@@ -1924,7 +1944,10 @@ class PreviewServiceSuite extends CatsEffectSuite:
             result <- states.get
           yield result
     yield
-      assertEquals(actual.lastOption, Some(PreviewViewState.Ready(second)))
+      assertEquals(
+        actual.lastOption,
+        Some(PreviewViewState.Ready(second, supportsLiveRefresh = true)),
+      )
       assert(!actual.contains(PreviewViewState.Refreshed(first, stale)))
 
   test("a stopped session ignores a late site revision"):
@@ -2090,7 +2113,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
         .use(service => service.start(workspace) *> states.get)
     yield assertEquals(
       actual.lastOption,
-      Some(PreviewViewState.Ready(announced)),
+      Some(PreviewViewState.Ready(announced, supportsLiveRefresh = false)),
     )
 
   test("dynamic startup rejects a process without an announcement channel"):
@@ -2243,8 +2266,15 @@ class PreviewServiceSuite extends CatsEffectSuite:
           service.start(workspace) *> service.restart(workspace) *> states.get,
         )
     yield
-      assert(actual.contains(PreviewViewState.Ready(first)))
-      assertEquals(actual.lastOption, Some(PreviewViewState.Ready(second)))
+      assert(
+        actual.contains(
+          PreviewViewState.Ready(first, supportsLiveRefresh = false),
+        ),
+      )
+      assertEquals(
+        actual.lastOption,
+        Some(PreviewViewState.Ready(second, supportsLiveRefresh = false)),
+      )
 
   test("two dynamic workspaces keep independently announced URLs"):
     val dynamic         = command.copy(endpoint = PreviewEndpoint.Announced)
@@ -2286,9 +2316,21 @@ class PreviewServiceSuite extends CatsEffectSuite:
           ).parTupled.void
       actual <- states.get
     yield
-      assert(actual.contains(workspace -> PreviewViewState.Ready(firstUrl)))
       assert(
-        actual.contains(secondWorkspace -> PreviewViewState.Ready(secondUrl)),
+        actual.contains(
+          workspace -> PreviewViewState.Ready(
+            firstUrl,
+            supportsLiveRefresh = false,
+          ),
+        ),
+      )
+      assert(
+        actual.contains(
+          secondWorkspace -> PreviewViewState.Ready(
+            secondUrl,
+            supportsLiveRefresh = false,
+          ),
+        ),
       )
 
   test(

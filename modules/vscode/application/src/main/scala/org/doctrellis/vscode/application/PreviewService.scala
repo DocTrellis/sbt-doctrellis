@@ -164,7 +164,11 @@ final class PreviewService[F[_]] private (
                     .probe(url)
                     .flatMap: ready =>
                       val state =
-                        if ready then PreviewViewState.Ready(url)
+                        if ready then
+                          PreviewViewState.Ready(
+                            url,
+                            supportsLiveRefresh = false,
+                          )
                         else PreviewViewState.Stopped
                       showView(workspace, state)
                 case PreviewEndpoint.Announced =>
@@ -782,7 +786,11 @@ private final case class PreviewSession[F[_]](
   def view(status: PreviewStatus): PreviewViewState =
     status match
       case PreviewStatus.Starting         => PreviewViewState.Starting
-      case PreviewStatus.Ready(url, None) => PreviewViewState.Ready(url)
+      case PreviewStatus.Ready(url, None) =>
+        PreviewViewState.Ready(
+          url,
+          supportsLiveRefresh = running.nextSiteRevision.nonEmpty,
+        )
       case PreviewStatus.Ready(url, Some(revision)) =>
         PreviewViewState.Refreshed(url, revision)
       case PreviewStatus.Stopping           => PreviewViewState.Stopped

@@ -18,7 +18,11 @@ trait OutputChannel extends Disposable:
 
 @js.native
 trait Webview extends js.Object:
-  var html: String = js.native
+  var html: String                                      = js.native
+  def postMessage(message: js.Any): js.Promise[Boolean] = js.native
+  def onDidReceiveMessage(
+      listener: js.Function1[js.Any, Unit],
+  ): Disposable = js.native
 
 @js.native
 trait WebviewPanel extends Disposable:

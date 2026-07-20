@@ -21,8 +21,9 @@ trait ChildProcess extends js.Object:
 
 @js.native
 trait IncomingMessage extends js.Object:
-  val statusCode: js.UndefOr[Int] = js.native
-  def resume(): Unit              = js.native
+  val statusCode: js.UndefOr[Int]                       = js.native
+  val headers: js.Dictionary[String | js.Array[String]] = js.native
+  def resume(): Unit                                    = js.native
 
 @js.native
 trait ClientRequest extends js.Object:

@@ -482,14 +482,11 @@ private final case class ProcessHandle(
       child.off("error", errorListener): Unit
       child.off("close", closeListener): Unit
 
-private[infrastructure] object NodeHttpProbe:
-  def ready(url: PreviewUrl): IO[Boolean] =
-    request(url)
-      .timeoutTo(2.seconds, IO.pure(false))
-      .handleError(_ => false)
-
-  private def request(url: PreviewUrl): IO[Boolean] =
-    IO.async[Boolean]: complete =>
+private object NodeHttpBooleanProbe:
+  def apply(
+      url: PreviewUrl,
+  )(accept: IncomingMessage => Boolean): IO[Boolean] =
+    val request = IO.async[Boolean]: complete =>
       IO.delay:
         var completed = false
 
@@ -500,8 +497,7 @@ private[infrastructure] object NodeHttpProbe:
 
         val responseListener: js.Function1[IncomingMessage, Unit] = response =>
           response.resume()
-          val status = response.statusCode.toOption.getOrElse(0)
-          finish(status >= 200 && status < 400)
+          finish(accept(response))
         val errorListener: js.Function1[js.Any, Unit] = _ => finish(false)
 
         val active =
@@ -520,3 +516,33 @@ private[infrastructure] object NodeHttpProbe:
               active.off("response", responseListener): Unit
               active.destroy()
             .handleError(_ => ())
+    request
+      .timeoutTo(2.seconds, IO.pure(false))
+      .handleError(_ => false)
+
+private[infrastructure] object NodeHttpProbe:
+  def ready(url: PreviewUrl): IO[Boolean] =
+    NodeHttpBooleanProbe(url): response =>
+      val status = response.statusCode.toOption.getOrElse(0)
+      status >= 200 && status < 400
+
+private[infrastructure] object NodeHttpBridgeProbe:
+  // Keep this marker synchronized with StaticSiteHandler.WebviewBridgeHeader
+  // in the sbt plugin. Node normalizes incoming header names to lowercase.
+  private val HeaderName  = "x-doctrellis-bridge"
+  private val HeaderValue = "1"
+
+  def available(url: PreviewUrl): IO[Boolean] =
+    NodeHttpBooleanProbe(url): response =>
+      val status = response.statusCode.toOption.getOrElse(0)
+      val marker = response.headers
+        .get(HeaderName)
+        .flatMap: value =>
+          Option.when(js.typeOf(value.asInstanceOf[js.Any]) == "string"):
+            value.asInstanceOf[String]
+      accepts(status, marker)
+
+  private[infrastructure] def accepts(
+      status: Int,
+      marker: Option[String],
+  ): Boolean = status == 200 && marker.contains(HeaderValue)

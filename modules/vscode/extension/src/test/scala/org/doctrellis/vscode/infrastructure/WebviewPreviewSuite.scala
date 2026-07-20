@@ -1,6 +1,7 @@
 package org.doctrellis.vscode.infrastructure
 
 import scala.collection.mutable
+import scala.concurrent.duration.*
 import scala.scalajs.js
 import scala.scalajs.js.annotation.JSImport
 
@@ -29,9 +30,18 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .resource(backend)
       .use: registry =>
         for
-          _ <- registry.show(first, PreviewViewState.Ready(url(4242)))
-          _ <- registry.show(first, PreviewViewState.Ready(url(5252)))
-          _ <- registry.show(second, PreviewViewState.Ready(url(6262)))
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+          )
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(5252), supportsLiveRefresh = false),
+          )
+          _ <- registry.show(
+            second,
+            PreviewViewState.Ready(url(6262), supportsLiveRefresh = false),
+          )
         yield
           assertEquals(backend.created.size, 2)
           assertEquals(at(backend.created, 0).reveals, 2)
@@ -44,7 +54,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .resource(backend)
       .use: registry =>
         for
-          _ <- registry.show(first, PreviewViewState.Ready(url(4242)))
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+          )
           panel = at(backend.created, 0)
           _ <- registry.update(
             first,
@@ -108,7 +121,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .resource(backend)
       .use: registry =>
         registry
-          .show(first, PreviewViewState.Ready(url(4242)))
+          .show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+          )
           .map: _ =>
             assertEquals(backend.resolved.toList, List("http://127.0.0.1:4242"))
             assert(
@@ -117,11 +133,362 @@ class WebviewPreviewSuite extends CatsEffectSuite:
               ),
             )
 
-  test("escapes dynamic content and emits a restrictive script-free CSP"):
+  test("does not probe or enable the bridge for a fixed-URL ready state"):
+    val bridgeResolutions = mutable.ListBuffer.empty[PreviewUrl]
+    val backend           = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.delay:
+          bridgeResolutions += url
+          Some(
+            "https://forwarded.example:4242/.doctrellis/webview-bridge",
+          )
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        registry
+          .show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+          )
+          .map: _ =>
+            val panel = at(backend.created, 0)
+            assertEquals(bridgeResolutions.toList, Nil)
+            assert(panel.html.contains("sandbox=\"\""))
+            assert(!panel.html.contains("allow-scripts allow-same-origin"))
+
+  test("refreshes through the bridge without replacing the current frame"):
+    val bridgeResolutions = mutable.ListBuffer.empty[PreviewUrl]
+    val backend           = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.delay:
+          bridgeResolutions += url
+          Some(
+            "https://forwarded.example:4242/.doctrellis/webview-bridge",
+          )
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+          panel       = at(backend.created, 0)
+          initialHtml = panel.html
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(2)),
+          )
+        yield
+          assertEquals(panel.html, initialHtml)
+          assertEquals(panel.refreshes.toList, List(revision(2)))
+          assertEquals(bridgeResolutions.toList, List(url(4242)))
+          assertEquals(panel.channelTokens.size, 1)
+          assert(panel.html.contains(at(panel.channelTokens, 0)))
+          assertEquals(panel.reveals, 1)
+          assert(
+            panel.html.contains(
+              "src=\"https://forwarded.example:4242/.doctrellis/webview-bridge\"",
+            ),
+          )
+          assert(
+            panel.html.contains(
+              "data-doctrellis-preview-url=\"https://forwarded.example:4242/preview?remote=1&amp;view=full\"",
+            ),
+          )
+          assert(
+            panel.html.contains(
+              "sandbox=\"allow-scripts allow-same-origin\"",
+            ),
+          )
+          assert(
+            panel.html.contains(
+              "data-doctrellis-bridge-origin=\"https://forwarded.example:4242\"",
+            ),
+          )
+
+  test("falls back to replacing HTML without a wrapper acknowledgement"):
+    val backend = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.pure(url)
+          .as(
+            Some(
+              "https://forwarded.example:4242/.doctrellis/webview-bridge",
+            ),
+          )
+
+      override def create(
+          workspace: Workspace,
+          onDispose: IO[Unit],
+      ): IO[PreviewPanel] =
+        IO.pure(workspace)
+          .flatMap: _ =>
+            IO.delay:
+              val panel = FakePanel(onDispose)
+              panel.refreshAcknowledged = false
+              created += panel
+              panel
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+          panel       = at(backend.created, 0)
+          initialHtml = panel.html
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(2)),
+          )
+        yield
+          assertNotEquals(panel.html, initialHtml)
+          assert(panel.html.contains("data-doctrellis-revision=\"2\""))
+          assertEquals(panel.refreshes.toList, List(revision(2)))
+
+  test(
+    "does not hold the registry mutex while awaiting refresh acknowledgement",
+  ):
+    for
+      refreshEntered <- Deferred[IO, Unit]
+      releaseRefresh <- Deferred[IO, Unit]
+      backend = new FakeBackend:
+        override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+          IO.pure(
+            Some(
+              "https://forwarded.example:4242/.doctrellis/webview-bridge",
+            ),
+          )
+
+        override def create(
+            workspace: Workspace,
+            onDispose: IO[Unit],
+        ): IO[PreviewPanel] =
+          IO.pure(workspace)
+            .flatMap: _ =>
+              IO.delay:
+                val panel = FakePanel(
+                  onDispose,
+                  refreshBehavior = Some: siteRevision =>
+                    if siteRevision == revision(2) then
+                      refreshEntered.complete(()).void *>
+                        releaseRefresh.get.as(false)
+                    else IO.pure(true),
+                )
+                created += panel
+                panel
+      _ <- PreviewPanelRegistry
+        .resource(backend)
+        .use: registry =>
+          for
+            _ <- registry.show(
+              first,
+              PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+            )
+            panel       = at(backend.created, 0)
+            initialHtml = panel.html
+            older <- registry
+              .show(
+                first,
+                PreviewViewState.Refreshed(url(4242), revision(2)),
+              )
+              .start
+            _     <- refreshEntered.get
+            _     <- IO(assertEquals(panel.reveals, 2))
+            newer <- registry
+              .update(
+                first,
+                PreviewViewState.Refreshed(url(4242), revision(3)),
+              )
+              .timeout(1.second)
+              .attempt
+            _ <- releaseRefresh.complete(()).void
+            _ <- older.joinWithNever
+            _ <- IO.fromEither(newer)
+          yield
+            assertEquals(panel.html, initialHtml)
+            assertEquals(
+              panel.refreshes.toList,
+              List(revision(2), revision(3)),
+            )
+    yield ()
+
+  test("replaces the frame when a refresh state changes its resolved URLs"):
+    val bridgeResolutions = mutable.ListBuffer.empty[PreviewUrl]
+    val backend           = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.delay:
+          bridgeResolutions += url
+          val port = url.value.stripPrefix("http://127.0.0.1:")
+          Some(
+            s"https://forwarded.example:$port/.doctrellis/webview-bridge",
+          )
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+          panel       = at(backend.created, 0)
+          initialHtml = panel.html
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(5252), revision(2)),
+          )
+        yield
+          assertNotEquals(panel.html, initialHtml)
+          assert(panel.html.contains("forwarded.example:5252"))
+          assert(panel.html.contains("data-doctrellis-revision=\"2\""))
+          assertEquals(panel.refreshes.toList, Nil)
+          assertEquals(
+            bridgeResolutions.toList,
+            List(url(4242), url(5252)),
+          )
+
+  test("invalidates the bridge cache for a new session without a panel"):
+    val bridgeResolutions = mutable.ListBuffer.empty[PreviewUrl]
+    val backend           = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.delay:
+          bridgeResolutions += url
+          Some(
+            "https://forwarded.example:4242/.doctrellis/webview-bridge",
+          )
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+          _ <- at(backend.created, 0).disposeFromUser
+          _ <- registry.update(first, PreviewViewState.Starting)
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+        yield assertEquals(
+          bridgeResolutions.toList,
+          List(url(4242), url(4242)),
+        )
+
+  test("builds the bridge URL from the preview origin"):
+    val preview = right(
+      PreviewUrl.parse("https://docs.example:7443/base/?remote=1#section"),
+    )
+    assertEquals(
+      PreviewWebviewBridge.url(preview).map(_.value),
+      Right("https://docs.example:7443/.doctrellis/webview-bridge"),
+    )
+
+  test("accepts only an exact bridge response marker on status 200"):
+    assert(NodeHttpBridgeProbe.accepts(200, Some("1")))
+    assert(!NodeHttpBridgeProbe.accepts(200, None))
+    assert(!NodeHttpBridgeProbe.accepts(200, Some("true")))
+    assert(!NodeHttpBridgeProbe.accepts(204, Some("1")))
+    assert(!NodeHttpBridgeProbe.accepts(302, Some("1")))
+
+  test("accepts only a complete wrapper refresh acknowledgement"):
+    val valid = js.Dynamic.literal(
+      protocol = 1,
+      `type` = "doctrellis.preview.refresh-accepted",
+      refreshId = "attempt-1",
+      revision = "7",
+      channelToken = "secret",
+    )
+    assertEquals(
+      PreviewWebviewMessage.refreshAcknowledgement(valid),
+      Some(RefreshAcknowledgement("attempt-1", "7", "secret")),
+    )
+    assertEquals(
+      PreviewWebviewMessage.refreshAcknowledgement(
+        js.Dynamic.literal(
+          protocol = 1,
+          `type` = "doctrellis.preview.refresh-accepted",
+          revision = "7",
+          channelToken = "secret",
+        ),
+      ),
+      None,
+    )
+    assertEquals(
+      PreviewWebviewMessage.refreshAcknowledgement(
+        js.Dynamic.literal(
+          protocol = 1,
+          `type` = "doctrellis.preview.refresh-accepted",
+          refreshId = "attempt-1",
+          revision = "7",
+        ),
+      ),
+      None,
+    )
+    assertEquals(
+      PreviewWebviewMessage.refreshAcknowledgement(
+        js.Dynamic.literal(
+          protocol = 2,
+          `type` = "doctrellis.preview.refresh-accepted",
+          refreshId = "attempt-1",
+          revision = "7",
+          channelToken = "secret",
+        ),
+      ),
+      None,
+    )
+
+  test("requires an acknowledgement after Webview transport delivery"):
+    val expected = RefreshAcknowledgement("attempt-1", "7", "secret")
+    RefreshAcknowledgements
+      .create(20.millis)
+      .flatMap: acknowledgements =>
+        for
+          missing  <- acknowledgements.await(expected)(IO.pure(true))
+          rejected <- acknowledgements.await(expected)(IO.pure(false))
+          sent     <- Deferred[IO, Unit]
+          accepted <- acknowledgements
+            .await(expected)(sent.complete(()).void.as(true))
+            .start
+          _       <- sent.get
+          _       <- acknowledgements.accept(expected)
+          handled <- accepted.joinWithNever
+        yield
+          assert(!missing)
+          assert(!rejected)
+          assert(handled)
+
+  test("tracks overlapping acknowledgements independently"):
+    val firstAck  = RefreshAcknowledgement("attempt-1", "7", "secret")
+    val secondAck = RefreshAcknowledgement("attempt-2", "7", "secret")
+    RefreshAcknowledgements
+      .create(1.second)
+      .flatMap: acknowledgements =>
+        for
+          firstSent  <- Deferred[IO, Unit]
+          secondSent <- Deferred[IO, Unit]
+          firstWait  <- acknowledgements
+            .await(firstAck)(firstSent.complete(()).void.as(true))
+            .start
+          _          <- firstSent.get
+          secondWait <- acknowledgements
+            .await(secondAck)(secondSent.complete(()).void.as(true))
+            .start
+          _             <- secondSent.get
+          _             <- acknowledgements.accept(secondAck)
+          _             <- acknowledgements.accept(firstAck)
+          firstHandled  <- firstWait.joinWithNever
+          secondHandled <- secondWait.joinWithNever
+        yield
+          assert(firstHandled)
+          assert(secondHandled)
+
+  test("escapes dynamic content and permits only the trusted bridge script"):
     val hostile = first.copy(name = "<docs> & \"team\" '")
     val ready   = PreviewWebviewHtml.render(
       hostile,
-      PreviewViewState.Ready(url(4242)),
+      PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
       Some(
         resolved("https://forwarded.example:4242/preview?one=1&two=2"),
       ),
@@ -141,11 +508,13 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     )
     assert(!ready.contains("unsafe-inline"))
     assert(ready.contains("sandbox=\"\""))
-    assert(!ready.contains("<script"))
+    assert(ready.contains(s"script-src ${PreviewWebviewHtml.ScriptHash}"))
+    assert(ready.contains(s"<script>${PreviewWebviewHtml.Script}</script>"))
+    assert(ready.indexOf("<script>") < ready.indexOf("</body>"))
     assert(!ready.contains("<docs>"))
     assert(ready.contains("&lt;docs&gt; &amp; &quot;team&quot; &#39;"))
     assert(ready.contains("one=1&amp;two=2"))
-    assert(!failed.contains("<script>"))
+    assertEquals(failed.sliding("<script>".length).count(_ == "<script>"), 1)
     assert(
       failed.contains("bad &lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
     )
@@ -171,7 +540,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     List(second, third).foreach: html =>
       assert(html.contains("default-src 'none'"))
       assert(html.contains("sandbox=\"\""))
-      assert(!html.contains("<script"))
+      assert(html.contains(s"script-src ${PreviewWebviewHtml.ScriptHash}"))
 
   test("shows an unavailable state for a resolved URI with userinfo"):
     val actual = resolved(
@@ -179,7 +548,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     )
     val html = PreviewWebviewHtml.render(
       first,
-      PreviewViewState.Ready(url(4242)),
+      PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
       Some(actual),
     )
     assertEquals(actual.cspOrigin, None)
@@ -191,7 +560,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     val external = resolved("http://[::1]:4242/preview")
     val html     = PreviewWebviewHtml.render(
       first,
-      PreviewViewState.Ready(url(4242)),
+      PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
       Some(external),
     )
     assertEquals(external.cspOrigin, None)
@@ -207,7 +576,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     val remote = resolved("http://host.docker.internal:4242/preview")
     val html   = PreviewWebviewHtml.render(
       first,
-      PreviewViewState.Ready(url(4242)),
+      PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
       Some(remote),
     )
     assertEquals(remote.cspOrigin, None)
@@ -267,7 +636,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         .use: registry =>
           for
             ready <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _       <- resolving.get
             stopped <- registry.update(first, PreviewViewState.Stopped).start
@@ -295,11 +667,17 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           for
             _     <- registry.show(first, PreviewViewState.Starting)
             stale <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _      <- resolving.get
             failed <- registry
-              .show(first, PreviewViewState.Ready(url(5252)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(5252), supportsLiveRefresh = false),
+              )
               .attempt
             _ <- IO.delay(assert(failed.isLeft))
             _ <- IO.delay:
@@ -325,7 +703,12 @@ class WebviewPreviewSuite extends CatsEffectSuite:
 
     PreviewPanelRegistry
       .resource(backend)
-      .use(_.show(first, PreviewViewState.Ready(url(4242))).attempt)
+      .use(
+        _.show(
+          first,
+          PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+        ).attempt,
+      )
       .map(assertEquals(_, Left(primary)))
 
   test("preserves reveal intent when a newer background state wins"):
@@ -342,7 +725,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
           for
             _    <- registry.show(first, PreviewViewState.Starting)
             open <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _ <- resolving.get
             exit = ProcessExit(Some(1), None, None)
@@ -372,7 +758,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             old = at(backend.created, 0)
             _    <- old.markDisposed
             open <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _ <- resolving.get
             _ <- old.notifyDisposed
@@ -457,7 +846,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             old = at(backend.created, 0)
             _    <- old.markDisposed
             open <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _       <- resolving.get
             _       <- old.notifyDisposed
@@ -494,7 +886,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             _ <- registry.show(first, PreviewViewState.Starting)
             old = at(backend.created, 0)
             open <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _ <- resolving.get
             _ <- old.markDisposed
@@ -519,7 +914,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         .use: registry =>
           for
             stale <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _ <- resolving.get
             _ <- registry.show(first, PreviewViewState.Starting)
@@ -542,7 +940,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .use: registry =>
         for
           failed <- registry
-            .show(first, PreviewViewState.Ready(url(4242)))
+            .show(
+              first,
+              PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+            )
             .attempt
           _ <- registry.update(first, PreviewViewState.Stopped)
           _ <- registry.show(first, PreviewViewState.Stopped)
@@ -620,7 +1021,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         .use: registry =>
           for
             display <- registry
-              .show(first, PreviewViewState.Ready(url(4242)))
+              .show(
+                first,
+                PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+              )
               .start
             _ <- resolving.get
             _ <- display.cancel
@@ -671,7 +1075,10 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       (registry, release) = allocated
       _       <- registry.show(first, PreviewViewState.Starting)
       display <- registry
-        .show(first, PreviewViewState.Ready(url(4242)))
+        .show(
+          first,
+          PreviewViewState.Ready(url(4242), supportsLiveRefresh = false),
+        )
         .start
       _ <- resolving.get
       _ <- release
@@ -682,13 +1089,17 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       assertEquals(backend.created.size, 1)
       assert(at(backend.created, 0).disposed)
 
-  test("disables scripts, command URIs, and local resource roots"):
+  test("enables the trusted wrapper script but keeps other capabilities off"):
     val options = PreviewWebviewOptions.value.asInstanceOf[js.Dynamic]
-    assertEquals(options.enableScripts.asInstanceOf[Boolean], false)
+    assertEquals(options.enableScripts.asInstanceOf[Boolean], true)
     assertEquals(options.enableCommandUris.asInstanceOf[Boolean], false)
     assertEquals(
       options.localResourceRoots.asInstanceOf[js.Array[js.Any]].length,
       0,
+    )
+    assertEquals(
+      options.retainContextWhenHidden.asInstanceOf[Boolean],
+      false,
     )
 
   test("keeps the CSP style hash synchronized with the rendered styles"):
@@ -696,6 +1107,32 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       .update(PreviewWebviewHtml.Styles)
       .digest("base64")
     assertEquals(PreviewWebviewHtml.StylesHash, s"'sha256-$digest'")
+
+  test("keeps the CSP script hash synchronized with the trusted script"):
+    val digest = TestNodeCrypto("sha256")
+      .update(PreviewWebviewHtml.Script)
+      .digest("base64")
+    assertEquals(PreviewWebviewHtml.ScriptHash, s"'sha256-$digest'")
+    assert(PreviewWebviewHtml.Script.contains("doctrellis.preview.refresh"))
+    assert(PreviewWebviewHtml.Script.contains("event.origin !== bridgeOrigin"))
+    assert(PreviewWebviewHtml.Script.contains("event.source !== parent"))
+    assert(
+      !PreviewWebviewHtml.Script.contains("event.origin !== location.origin"),
+    )
+    assert(PreviewWebviewHtml.Script.contains("acquireVsCodeApi()"))
+    assert(
+      PreviewWebviewHtml.Script.indexOf("const timeout = setTimeout") <
+        PreviewWebviewHtml.Script.indexOf("vscode = acquireVsCodeApi()"),
+    )
+    assert(
+      PreviewWebviewHtml.Script.contains(
+        "doctrellis.preview.refresh-accepted",
+      ),
+    )
+    assert(PreviewWebviewHtml.Script.contains("message.refreshId"))
+    assert(PreviewWebviewHtml.Script.contains("message.channelToken"))
+    assert(!PreviewWebviewHtml.Script.contains("\"*\""))
+    assert(!PreviewWebviewHtml.Script.contains("eval("))
 
   private def url(port: Int): PreviewUrl =
     right(PreviewUrl.parse(s"http://127.0.0.1:$port"))
@@ -714,10 +1151,14 @@ private final class FakePanel(
     failOnDispose: Boolean = false,
     failOnSetHtml: Boolean = false,
     beforeReveal: IO[Unit] = IO.unit,
+    refreshBehavior: Option[SiteRevision => IO[Boolean]] = None,
 ) extends PreviewPanel:
-  var html: String      = ""
-  var reveals: Int      = 0
-  var disposed: Boolean = false
+  var html: String                                = ""
+  var reveals: Int                                = 0
+  var disposed: Boolean                           = false
+  var refreshAcknowledged: Boolean                = true
+  val refreshes: mutable.ListBuffer[SiteRevision] = mutable.ListBuffer.empty
+  val channelTokens: mutable.ListBuffer[String]   = mutable.ListBuffer.empty
 
   def isDisposed: Boolean = disposed
 
@@ -726,6 +1167,18 @@ private final class FakePanel(
       if disposed then throw PreviewPanelDisposed
       else if failOnSetHtml then throw IllegalStateException("write failed")
       else html = value
+
+  override def refresh(
+      revision: SiteRevision,
+      channelToken: String,
+  ): IO[Boolean] =
+    IO.delay:
+      if disposed then throw PreviewPanelDisposed
+      else
+        refreshes += revision
+        channelTokens += channelToken
+    *> refreshBehavior
+      .fold(IO.pure(refreshAcknowledged))(_(revision))
 
   def reveal: IO[Unit] =
     beforeReveal *>
