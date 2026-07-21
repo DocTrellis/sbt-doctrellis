@@ -73,12 +73,103 @@ class PreviewWebviewScriptSuite extends FunSuite:
 
     assertEquals(harness.frameUrl, harness.directUrl)
 
+  test("accepts a token-bound host refresh without assuming its source"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendBridgeActive()
+    harness.sendRefresh(
+      "attempt-1",
+      "2",
+    )
+
+    assertEquals(
+      harness.bridgeMessageTypes,
+      List("doctrellis.preview.refresh"),
+    )
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
+    assertEquals(harness.frameUrl, harness.bridgeUrl)
+    assertEquals(harness.pendingTimerCount, 0)
+
+  test("rejects a host refresh with another channel token"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendBridgeActive()
+    harness.sendRefresh(
+      "attempt-1",
+      "2",
+      channelToken = "other",
+    )
+
+    assertEquals(harness.bridgeMessageTypes, Nil)
+    assertEquals(harness.refreshAcknowledgements, Nil)
+
+  test("rejects a token-bound refresh from the preview origin"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendBridgeActive()
+    harness.sendRefresh(
+      "attempt-1",
+      "2",
+      origin = harness.bridgeOrigin,
+    )
+
+    assertEquals(harness.bridgeMessageTypes, Nil)
+    assertEquals(harness.refreshAcknowledgements, Nil)
+
+  test("rejects a refresh message with another protocol"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendBridgeActive()
+    harness.sendRefresh(
+      "attempt-1",
+      "2",
+      protocol = 2,
+    )
+
+    assertEquals(harness.bridgeMessageTypes, Nil)
+    assertEquals(harness.refreshAcknowledgements, Nil)
+
+  test("accepts bridge messages only from the bridge frame and origin"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendRefresh(
+      "attempt-1",
+      "2",
+    )
+    harness.sendBridgeActive(origin = "https://attacker.example")
+    harness.sendBridgeActive(source = js.Dynamic.literal())
+
+    assertEquals(harness.bridgeMessageTypes, Nil)
+    assertEquals(harness.refreshAcknowledgements, Nil)
+
+    harness.sendBridgeActive()
+
+    assertEquals(
+      harness.bridgeMessageTypes,
+      List("doctrellis.preview.refresh"),
+    )
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
+
+  test("accepts token-bound host visibility without assuming its source"):
+    val harness = WrapperScriptHarness()
+
+    harness.sendVisibility(visible = false)
+    harness.fireNextTimeout()
+
+    assertEquals(harness.frameUrl, harness.bridgeUrl)
+    assertEquals(harness.pendingTimerCount, 0)
+    assertEquals(
+      harness.wrapperReadyTokens,
+      List("channel-secret", "channel-secret"),
+    )
+
 private final class WrapperScriptHarness:
   val directUrl = "https://preview.example/guide/current.html"
   val bridgeUrl = "https://preview.example/.doctrellis/webview-bridge"
 
-  private val bridgeOrigin          = "https://preview.example"
+  val bridgeOrigin                  = "https://preview.example"
   private val installedChannelToken = "channel-secret"
+  private val extensionHostOrigin   = "vscode-webview://doctrellis-preview"
   private val bridgeMessages        = mutable.ListBuffer.empty[js.Dynamic]
   private val vscodeMessages        = mutable.ListBuffer.empty[js.Dynamic]
   private val timers    = mutable.LinkedHashMap.empty[Int, js.Function0[Unit]]
@@ -86,8 +177,8 @@ private final class WrapperScriptHarness:
   private var frameLoadListener = Option.empty[js.Function0[Unit]]
   private var messageListener   = Option.empty[js.Function1[js.Dynamic, Unit]]
 
-  private val parentWindow  = js.Dynamic.literal()
-  private val contentWindow = js.Dynamic.literal()
+  private val extensionHostMessageSource = js.Dynamic.literal()
+  private val contentWindow              = js.Dynamic.literal()
   contentWindow.updateDynamic("postMessage")(
     (
         (message: js.Dynamic, _: String) =>
@@ -165,7 +256,6 @@ private final class WrapperScriptHarness:
       "setTimeout",
       "clearTimeout",
       "addEventListener",
-      "parent",
       PreviewWebviewHtml.Script,
     )
     .asInstanceOf[js.Dynamic]
@@ -177,7 +267,6 @@ private final class WrapperScriptHarness:
     setTimeout,
     clearTimeout,
     addEventListener,
-    parentWindow,
   )
 
   def frameUrl: String = frame.src.asInstanceOf[String]
@@ -216,43 +305,52 @@ private final class WrapperScriptHarness:
       visible: Boolean,
       channelToken: String = installedChannelToken,
   ): Unit =
-    sendParent(
+    sendMessage(
       js.Dynamic.literal(
-        protocol = 1,
-        `type` = "doctrellis.preview.visibility",
-        visible = visible,
-        channelToken = channelToken,
+        data = js.Dynamic.literal(
+          protocol = 1,
+          `type` = "doctrellis.preview.visibility",
+          visible = visible,
+          channelToken = channelToken,
+        ),
+        source = extensionHostMessageSource,
+        origin = extensionHostOrigin,
       ),
     )
 
-  def sendRefresh(refreshId: String, revision: String): Unit =
-    sendParent(
+  def sendRefresh(
+      refreshId: String,
+      revision: String,
+      channelToken: String = installedChannelToken,
+      protocol: Int = 1,
+      origin: String = extensionHostOrigin,
+  ): Unit =
+    sendMessage(
       js.Dynamic.literal(
-        protocol = 1,
-        `type` = "doctrellis.preview.refresh",
-        refreshId = refreshId,
-        revision = revision,
-        channelToken = installedChannelToken,
+        data = js.Dynamic.literal(
+          protocol = protocol,
+          `type` = "doctrellis.preview.refresh",
+          refreshId = refreshId,
+          revision = revision,
+          channelToken = channelToken,
+        ),
+        source = extensionHostMessageSource,
+        origin = origin,
       ),
     )
 
-  def sendBridgeActive(): Unit =
+  def sendBridgeActive(
+      source: js.Any = contentWindow,
+      origin: String = bridgeOrigin,
+  ): Unit =
     sendMessage(
       js.Dynamic.literal(
         data = js.Dynamic.literal(
           protocol = 1,
           `type` = "doctrellis.bridge.active",
         ),
-        source = contentWindow,
-        origin = bridgeOrigin,
-      ),
-    )
-
-  private def sendParent(message: js.Dynamic): Unit =
-    sendMessage(
-      js.Dynamic.literal(
-        data = message,
-        source = parentWindow,
+        source = source,
+        origin = origin,
       ),
     )
 
