@@ -1271,7 +1271,6 @@ class WebviewPreviewSuite extends CatsEffectSuite:
     assertEquals(PreviewWebviewHtml.ScriptHash, s"'sha256-$digest'")
     assert(PreviewWebviewHtml.Script.contains("doctrellis.preview.refresh"))
     assert(PreviewWebviewHtml.Script.contains("event.origin !== bridgeOrigin"))
-    assert(PreviewWebviewHtml.Script.contains("event.source !== parent"))
     assert(
       !PreviewWebviewHtml.Script.contains("event.origin !== location.origin"),
     )

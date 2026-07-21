@@ -781,7 +781,7 @@ private[infrastructure] object PreviewWebviewHtml:
       |      }
       |      return;
       |    }
-      |    if (event.source !== parent) return;
+      |    if (event.origin === bridgeOrigin) return;
       |    if (message.channelToken !== channelToken) return;
       |    if (message.type === "doctrellis.preview.visibility") {
       |      if (typeof message.visible !== "boolean") return;
@@ -793,7 +793,8 @@ private[infrastructure] object PreviewWebviewHtml:
       |      return;
       |    }
       |    if (message.type !== "doctrellis.preview.refresh" ||
-      |        typeof message.refreshId !== "string") return;
+      |        typeof message.refreshId !== "string" ||
+      |        typeof message.revision !== "string") return;
       |    const pending = {
       |      refresh: {
       |        protocol: 1,
