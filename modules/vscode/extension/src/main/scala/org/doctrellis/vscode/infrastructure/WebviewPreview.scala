@@ -919,36 +919,81 @@ private[infrastructure] object PreviewVisibilityDelivery:
   def post(
       snapshot: IO[Option[Boolean]],
       send: Boolean => IO[Boolean],
+      shouldLog: IO[Boolean],
       log: String => IO[Unit],
-  ): IO[Unit] =
+  ): IO[Option[Boolean]] =
     snapshot.attempt.flatMap:
-      case Right(None)          => IO.unit
+      case Right(None)          => IO.none
       case Right(Some(visible)) =>
         send(visible).attempt.flatMap:
-          case Right(true)  => IO.unit
+          case Right(true)  => IO.pure(Some(visible))
           case Right(false) =>
             safelyLog(
+              shouldLog,
               log,
               "DocTrellis preview visibility update was not delivered by VS Code.\n",
-            )
+            ).as(None)
           case Left(error) =>
             safelyLog(
+              shouldLog,
               log,
               s"Failed to deliver DocTrellis preview visibility: ${message(error)}\n",
-            )
+            ).as(None)
       case Left(error) =>
         safelyLog(
+          shouldLog,
           log,
           s"Failed to read DocTrellis preview visibility: ${message(error)}\n",
-        )
+        ).as(None)
 
   private def safelyLog(
+      shouldLog: IO[Boolean],
       log: String => IO[Unit],
       value: String,
-  ): IO[Unit] = log(value).handleError(_ => ())
+  ): IO[Unit] =
+    shouldLog.attempt.flatMap:
+      case Right(true)            => log(value).handleError(_ => ())
+      case Right(false) | Left(_) => IO.unit
 
   private def message(error: Throwable): String =
     Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
+
+private[infrastructure] final class PreviewVisibilityRelay private (
+    mutex: Mutex[IO],
+    lastDelivered: Ref[IO, Option[(String, Boolean)]],
+):
+  def post(
+      channelToken: String,
+      force: Boolean,
+      snapshot: IO[Option[Boolean]],
+      send: Boolean => IO[Boolean],
+      shouldLog: IO[Boolean],
+      log: String => IO[Unit],
+  ): IO[Unit] =
+    mutex.lock.surround:
+      PreviewVisibilityDelivery
+        .post(
+          snapshot,
+          visible =>
+            lastDelivered.get.flatMap:
+              case Some((token, previous))
+                  if !force && token == channelToken && previous == visible =>
+                IO.pure(true)
+              case _ => send(visible),
+          shouldLog,
+          log,
+        )
+        .flatMap(
+          _.traverse_(visible =>
+            lastDelivered.set(Some(channelToken -> visible)),
+          ),
+        )
+
+private[infrastructure] object PreviewVisibilityRelay:
+  def create: IO[PreviewVisibilityRelay] =
+    (Mutex[IO], Ref.of[IO, Option[(String, Boolean)]](None)).mapN(
+      new PreviewVisibilityRelay(_, _),
+    )
 
 private[infrastructure] final class VscodePreviewPanelBackend(
     dispatcher: Dispatcher[IO],
@@ -972,9 +1017,11 @@ private[infrastructure] final class VscodePreviewPanelBackend(
       workspace: Workspace,
       onDispose: IO[Unit],
   ): IO[PreviewPanel] =
-    RefreshAcknowledgements
-      .create()
-      .flatMap: acknowledgements =>
+    (
+      RefreshAcknowledgements.create(),
+      PreviewVisibilityRelay.create,
+    ).tupled
+      .flatMap: (acknowledgements, visibilityRelay) =>
         IO.delay:
           val showOptions = js.Dynamic.literal(
             viewColumn = -1,
@@ -986,11 +1033,16 @@ private[infrastructure] final class VscodePreviewPanelBackend(
             showOptions,
             PreviewWebviewOptions.value,
           )
-          var disposed                                        = false
-          var installedChannelToken: Option[String]           = None
-          var registrations: List[Disposable]                 = Nil
-          def postVisibility(expectedToken: String): IO[Unit] =
-            PreviewVisibilityDelivery.post(
+          var disposed                              = false
+          var installedChannelToken: Option[String] = None
+          var registrations: List[Disposable]       = Nil
+          def postVisibility(
+              expectedToken: String,
+              force: Boolean,
+          ): IO[Unit] =
+            visibilityRelay.post(
+              channelToken = expectedToken,
+              force = force,
               snapshot = IO.delay(
                 Option.when(
                   !disposed && installedChannelToken.contains(expectedToken),
@@ -1009,6 +1061,9 @@ private[infrastructure] final class VscodePreviewPanelBackend(
                     ),
                   ),
                 ),
+              shouldLog = IO.delay(
+                !disposed && installedChannelToken.contains(expectedToken),
+              ),
               log = log,
             )
           def releaseRegistrations(): Unit =
@@ -1034,7 +1089,7 @@ private[infrastructure] final class VscodePreviewPanelBackend(
               .wrapperReady(message)
               .foreach: channelToken =>
                 dispatcher.unsafeRunAndForget(
-                  postVisibility(channelToken),
+                  postVisibility(channelToken, force = true),
                 )
           val viewStateListener: js.Function1[
             WebviewPanelOnDidChangeViewStateEvent,
@@ -1042,7 +1097,7 @@ private[infrastructure] final class VscodePreviewPanelBackend(
           ] = _ =>
             installedChannelToken.foreach: channelToken =>
               dispatcher.unsafeRunAndForget(
-                postVisibility(channelToken),
+                postVisibility(channelToken, force = false),
               )
           val disposeRegistration   = panel.onDidDispose(listener)
           val viewStateRegistration = panel.onDidChangeViewState(

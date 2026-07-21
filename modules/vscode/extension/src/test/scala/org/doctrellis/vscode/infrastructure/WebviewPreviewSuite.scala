@@ -481,34 +481,98 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       _ <- PreviewVisibilityDelivery.post(
         IO.pure(Option.empty[Boolean]),
         send(IO.pure(true)),
+        IO.pure(true),
         log,
       )
       _ <- PreviewVisibilityDelivery.post(
         IO.pure(Some(false)),
         send(IO.pure(true)),
+        IO.pure(true),
         log,
       )
       _ <- PreviewVisibilityDelivery.post(
         IO.pure(Some(true)),
         send(IO.pure(false)),
+        IO.pure(true),
         log,
       )
       _ <- PreviewVisibilityDelivery.post(
         IO.pure(Some(true)),
         send(IO.raiseError(IllegalStateException("transport failed"))),
+        IO.pure(true),
         log,
       )
       _ <- PreviewVisibilityDelivery.post(
         IO.raiseError(IllegalStateException("visibility failed")),
         send(IO.pure(true)),
+        IO.pure(true),
+        log,
+      )
+      _ <- PreviewVisibilityDelivery.post(
+        IO.pure(Some(false)),
+        send(IO.pure(false)),
+        IO.pure(false),
         log,
       )
     yield
-      assertEquals(deliveries.toList, List(false, true, true))
+      assertEquals(deliveries.toList, List(false, true, true, false))
       assertEquals(logs.size, 3)
       assert(logs.exists(_.contains("was not delivered")))
       assert(logs.exists(_.contains("transport failed")))
       assert(logs.exists(_.contains("visibility failed")))
+
+  test("suppresses unchanged visibility events but forces ready responses"):
+    val deliveries                   = mutable.ListBuffer.empty[Boolean]
+    val logs                         = mutable.ListBuffer.empty[String]
+    val send: Boolean => IO[Boolean] =
+      visible => IO.delay(deliveries += visible).as(true)
+    val log: String => IO[Unit] = value => IO.delay(logs += value).void
+
+    for
+      relay <- PreviewVisibilityRelay.create
+      _     <- relay.post(
+        "secret",
+        force = false,
+        IO.pure(Some(false)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "secret",
+        force = false,
+        IO.pure(Some(false)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "secret",
+        force = true,
+        IO.pure(Some(false)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "secret",
+        force = false,
+        IO.pure(Some(true)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "secret",
+        force = false,
+        IO.pure(Some(true)),
+        send,
+        IO.pure(true),
+        log,
+      )
+    yield
+      assertEquals(deliveries.toList, List(false, false, true))
+      assertEquals(logs.toList, Nil)
 
   test("requires an acknowledgement after Webview transport delivery"):
     val expected = RefreshAcknowledgement("attempt-1", "7", "secret")
