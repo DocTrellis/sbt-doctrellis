@@ -43,8 +43,12 @@ without leaving an idle timer running. When the extension reports the panel
 visible, the wrapper sends another bridge hello and starts a fresh timeout. An
 explicit bridge rejection or failure to acquire the VS Code API still selects
 the legacy fallback immediately, and a handshake that times out while the panel
-is reported visible still selects it after the timeout. The extension records
-a rejected or failed visibility delivery in the DocTrellis output channel.
+is reported visible still selects it after the timeout. The extension remembers
+the last successfully delivered value for each channel and suppresses unchanged
+view-state events. A ready announcement always forces a response so
+resynchronization is not suppressed. The extension records a rejected or failed
+visibility delivery in the DocTrellis output channel unless the panel was
+disposed or its installation token changed before the failure was observed.
 
 Before the first token-matched visibility response arrives, the wrapper treats
 the panel as visible. Failure to synchronize that initial state within the
