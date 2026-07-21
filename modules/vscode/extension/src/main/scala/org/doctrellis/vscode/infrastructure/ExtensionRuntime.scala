@@ -12,7 +12,7 @@ private[vscode] object ExtensionRuntime:
       output     <- VscodeOutput.resource
       dispatcher <- Dispatcher.parallel[IO](await = false)
       panels     <- PreviewPanelRegistry.resource(
-        VscodePreviewPanelBackend(dispatcher),
+        VscodePreviewPanelBackend(dispatcher, output.append),
       )
       algebra = PreviewAlgebra[IO](
         load = NodeConfig.load,

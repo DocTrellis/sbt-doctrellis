@@ -470,6 +470,46 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       None,
     )
 
+  test("reports visibility delivery refusals and errors"):
+    val deliveries = mutable.ListBuffer.empty[Boolean]
+    val logs       = mutable.ListBuffer.empty[String]
+    def send(result: IO[Boolean])(visible: Boolean): IO[Boolean] =
+      IO.delay(deliveries += visible) *> result
+    val log: String => IO[Unit] = value => IO.delay(logs += value).void
+
+    for
+      _ <- PreviewVisibilityDelivery.post(
+        IO.pure(Option.empty[Boolean]),
+        send(IO.pure(true)),
+        log,
+      )
+      _ <- PreviewVisibilityDelivery.post(
+        IO.pure(Some(false)),
+        send(IO.pure(true)),
+        log,
+      )
+      _ <- PreviewVisibilityDelivery.post(
+        IO.pure(Some(true)),
+        send(IO.pure(false)),
+        log,
+      )
+      _ <- PreviewVisibilityDelivery.post(
+        IO.pure(Some(true)),
+        send(IO.raiseError(IllegalStateException("transport failed"))),
+        log,
+      )
+      _ <- PreviewVisibilityDelivery.post(
+        IO.raiseError(IllegalStateException("visibility failed")),
+        send(IO.pure(true)),
+        log,
+      )
+    yield
+      assertEquals(deliveries.toList, List(false, true, true))
+      assertEquals(logs.size, 3)
+      assert(logs.exists(_.contains("was not delivered")))
+      assert(logs.exists(_.contains("transport failed")))
+      assert(logs.exists(_.contains("visibility failed")))
+
   test("requires an acknowledgement after Webview transport delivery"):
     val expected = RefreshAcknowledgement("attempt-1", "7", "secret")
     RefreshAcknowledgements

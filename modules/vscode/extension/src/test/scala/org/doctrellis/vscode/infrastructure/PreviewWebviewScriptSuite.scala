@@ -28,6 +28,14 @@ class PreviewWebviewScriptSuite extends FunSuite:
     assertEquals(harness.frameUrl, harness.bridgeUrl)
     assertEquals(harness.refreshAcknowledgements, Nil)
     assertEquals(harness.pendingTimerCount, 0)
+    assertEquals(
+      harness.vscodeMessageTypes,
+      List("doctrellis.preview.ready", "doctrellis.preview.ready"),
+    )
+    assertEquals(
+      harness.wrapperReadyTokens,
+      List("channel-secret", "channel-secret"),
+    )
 
     harness.sendVisibility(visible = true)
     assertEquals(

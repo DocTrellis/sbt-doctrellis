@@ -696,6 +696,14 @@ private[infrastructure] object PreviewWebviewHtml:
       |  let panelVisible = true;
       |  let timeout = null;
       |  let vscode = null;
+      |  const announceReady = () => {
+      |    if (!vscode) return;
+      |    vscode.postMessage({
+      |      protocol: 1,
+      |      type: "doctrellis.preview.ready",
+      |      channelToken
+      |    });
+      |  };
       |  const accept = (pending) => {
       |    if (!vscode) return;
       |    vscode.postMessage({
@@ -725,6 +733,7 @@ private[infrastructure] object PreviewWebviewHtml:
       |    timeout = setTimeout(() => {
       |      timeout = null;
       |      if (panelVisible) fallback();
+      |      else announceReady();
       |    }, 2000);
       |  };
       |  const hello = () => {
@@ -742,11 +751,7 @@ private[infrastructure] object PreviewWebviewHtml:
       |    fallback();
       |    return;
       |  }
-      |  vscode.postMessage({
-      |    protocol: 1,
-      |    type: "doctrellis.preview.ready",
-      |    channelToken
-      |  });
+      |  announceReady();
       |  frame.addEventListener("load", hello);
       |  addEventListener("message", (event) => {
       |    const message = event.data;
@@ -910,8 +915,44 @@ private[infrastructure] object PreviewWebviewHtml:
       .replace("\"", "&quot;")
       .replace("'", "&#39;")
 
+private[infrastructure] object PreviewVisibilityDelivery:
+  def post(
+      snapshot: IO[Option[Boolean]],
+      send: Boolean => IO[Boolean],
+      log: String => IO[Unit],
+  ): IO[Unit] =
+    snapshot.attempt.flatMap:
+      case Right(None)          => IO.unit
+      case Right(Some(visible)) =>
+        send(visible).attempt.flatMap:
+          case Right(true)  => IO.unit
+          case Right(false) =>
+            safelyLog(
+              log,
+              "DocTrellis preview visibility update was not delivered by VS Code.\n",
+            )
+          case Left(error) =>
+            safelyLog(
+              log,
+              s"Failed to deliver DocTrellis preview visibility: ${message(error)}\n",
+            )
+      case Left(error) =>
+        safelyLog(
+          log,
+          s"Failed to read DocTrellis preview visibility: ${message(error)}\n",
+        )
+
+  private def safelyLog(
+      log: String => IO[Unit],
+      value: String,
+  ): IO[Unit] = log(value).handleError(_ => ())
+
+  private def message(error: Throwable): String =
+    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
+
 private[infrastructure] final class VscodePreviewPanelBackend(
     dispatcher: Dispatcher[IO],
+    log: String => IO[Unit],
 ) extends PreviewPanelBackend:
   def resolve(url: PreviewUrl): IO[String] =
     IO.fromPromise(IO.delay(VSEnv.asExternalUri(VSUri.parse(url.value))))
@@ -949,27 +990,27 @@ private[infrastructure] final class VscodePreviewPanelBackend(
           var installedChannelToken: Option[String]           = None
           var registrations: List[Disposable]                 = Nil
           def postVisibility(expectedToken: String): IO[Unit] =
-            IO.delay:
-              Option.when(
-                !disposed && installedChannelToken.contains(expectedToken),
-              )(panel.visible)
-            .flatMap(
-                _.traverse_(visible =>
-                  IO.fromPromise(
-                    IO.delay(
-                      panel.webview.postMessage(
-                        js.Dynamic.literal(
-                          protocol = 1,
-                          `type` = "doctrellis.preview.visibility",
-                          visible = visible,
-                          channelToken = expectedToken,
-                        ),
+            PreviewVisibilityDelivery.post(
+              snapshot = IO.delay(
+                Option.when(
+                  !disposed && installedChannelToken.contains(expectedToken),
+                )(panel.visible),
+              ),
+              send = visible =>
+                IO.fromPromise(
+                  IO.delay(
+                    panel.webview.postMessage(
+                      js.Dynamic.literal(
+                        protocol = 1,
+                        `type` = "doctrellis.preview.visibility",
+                        visible = visible,
+                        channelToken = expectedToken,
                       ),
                     ),
-                  ).attempt
-                    .void,
+                  ),
                 ),
-              )
+              log = log,
+            )
           def releaseRegistrations(): Unit =
             val current = registrations
             registrations = Nil
