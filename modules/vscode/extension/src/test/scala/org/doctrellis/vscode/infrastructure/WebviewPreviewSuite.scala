@@ -521,7 +521,9 @@ class WebviewPreviewSuite extends CatsEffectSuite:
       assert(logs.exists(_.contains("transport failed")))
       assert(logs.exists(_.contains("visibility failed")))
 
-  test("suppresses unchanged visibility events but forces ready responses"):
+  test(
+    "resets visibility deduplication for new channels and forces ready responses",
+  ):
     val deliveries                   = mutable.ListBuffer.empty[Boolean]
     val logs                         = mutable.ListBuffer.empty[String]
     val send: Boolean => IO[Boolean] =
@@ -547,7 +549,23 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         log,
       )
       _ <- relay.post(
-        "secret",
+        "replacement",
+        force = false,
+        IO.pure(Some(false)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "replacement",
+        force = false,
+        IO.pure(Some(false)),
+        send,
+        IO.pure(true),
+        log,
+      )
+      _ <- relay.post(
+        "replacement",
         force = true,
         IO.pure(Some(false)),
         send,
@@ -555,7 +573,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         log,
       )
       _ <- relay.post(
-        "secret",
+        "replacement",
         force = false,
         IO.pure(Some(true)),
         send,
@@ -563,7 +581,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         log,
       )
       _ <- relay.post(
-        "secret",
+        "replacement",
         force = false,
         IO.pure(Some(true)),
         send,
@@ -571,7 +589,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
         log,
       )
     yield
-      assertEquals(deliveries.toList, List(false, false, true))
+      assertEquals(deliveries.toList, List(false, false, false, true))
       assertEquals(logs.toList, Nil)
 
   test("requires an acknowledgement after Webview transport delivery"):
