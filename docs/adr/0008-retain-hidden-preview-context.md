@@ -36,12 +36,15 @@ extension answers with the current `panel.visible` value and sends each later
 wrapper does not use the Web document visibility API for this decision.
 
 When a bridge handshake timeout expires while the extension reports the panel
-hidden, the wrapper leaves the timer disarmed instead of entering the permanent
-legacy fallback. When the extension reports the panel visible, the wrapper
-sends another bridge hello and starts a fresh timeout. An explicit bridge
-rejection or failure to acquire the VS Code API still selects the legacy
-fallback immediately, and a handshake that times out while the panel is
-reported visible still selects it after the timeout.
+hidden, the wrapper sends one more ready announcement and then leaves the timer
+disarmed instead of entering the permanent legacy fallback. The extension
+answers with its current visibility, which repairs a lost earlier update
+without leaving an idle timer running. When the extension reports the panel
+visible, the wrapper sends another bridge hello and starts a fresh timeout. An
+explicit bridge rejection or failure to acquire the VS Code API still selects
+the legacy fallback immediately, and a handshake that times out while the panel
+is reported visible still selects it after the timeout. The extension records
+a rejected or failed visibility delivery in the DocTrellis output channel.
 
 Before the first token-matched visibility response arrives, the wrapper treats
 the panel as visible. Failure to synchronize that initial state within the
@@ -70,6 +73,8 @@ the document as described by ADR 0007.
   extension is deactivated.
 - A handshake delayed while the panel is hidden gets a fresh attempt when the
   panel becomes visible instead of permanently downgrading that panel.
+- A hidden handshake performs one visibility resynchronization without
+  periodically waking the retained WebView.
 - A refresh cannot remain indefinitely queued behind an inactive bridge while
   being reported to the extension as accepted.
 - The preview does not need to observe or persist the generated document's URL.
