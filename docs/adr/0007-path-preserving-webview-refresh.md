@@ -54,9 +54,14 @@ therefore survive a successful rebuild. The server still sends
 The wrapper targets messages at the verified bridge origin and accepts bridge
 responses only from that frame and origin. The bridge learns the WebView parent
 origin from an origin-bound hello and replies only to that origin. The wrapper
-accepts extension refresh messages only from its exact VS Code parent; those
-messages additionally carry a per-installation random channel token that is
-not forwarded to the bridge. Each attempt also carries a random refresh ID.
+handles that exact bridge source first and rejects all other messages from the
+bridge origin. It then authenticates extension messages with a per-installation
+random channel token that is not forwarded to the bridge. VS Code documents the
+extension message as the WebView `message` event's `event.data`, but does not
+specify a particular source window. Not relying on `MessageEvent.source` for
+extension messages is a compatibility inference from that documented contract,
+not a claim that every VS Code runtime uses a non-parent source. Each refresh
+attempt also carries a random refresh ID.
 After accepting and scheduling a refresh, the wrapper acknowledges the
 matching refresh ID, revision, and token through the VS Code API.
 The extension treats transport delivery without that acknowledgement as a
