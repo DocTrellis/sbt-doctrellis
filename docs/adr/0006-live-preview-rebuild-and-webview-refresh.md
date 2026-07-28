@@ -5,6 +5,7 @@
 - Amends: ADR 0002
 - Extends: ADR 0005
 - Amended by: ADR 0007
+- Related: ADR 0003
 
 ## Context
 

@@ -26,6 +26,20 @@ build definitions, and supporting scripts.
 When these sources appear to disagree, do not work around an automated check.
 Clarify the rule or update the relevant decision explicitly.
 
+ADR headers record `Status` and the original `Date`. Add `Updated` for a later
+substantive factual or editorial revision that does not change the decision.
+Use `Amends`/`Amended by` when a later decision changes an earlier one,
+`Extends`/`Extended by` when it adds compatible scope, and `Related` for a
+non-changing contextual link. Record every relation in both ADRs: pair
+`Amends` with `Amended by`, pair `Extends` with `Extended by`, and repeat
+`Related` on both sides. Put explanations in the ADR body rather than in the
+relation field.
+
+A body reference requires a header relation when the current decision depends
+on another ADR's operative behavior or constrains its scope. A citation that
+only supplies background without making the other decision part of the current
+contract does not.
+
 ## Functional architecture in DocTrellis
 
 The VS Code extension realizes the domain, algebra, program, interpreter, and
