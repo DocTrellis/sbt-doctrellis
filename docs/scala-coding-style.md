@@ -325,6 +325,54 @@ unsafe methods are allowed only at an outer runtime boundary, such as:
 Do not start raw threads or futures when a Cats Effect primitive expresses the
 same ownership and cancellation semantics.
 
+## Shared HTTP API contracts
+
+These rules apply to structured request/response HTTP APIs whose server and
+client contracts are owned together. They do not require an endpoint library
+for static file serving, a single-purpose local health or callback endpoint, or
+non-HTTP IPC. A project-specific guide or ADR must define the precise scope and
+select any server and client implementations.
+
+When a project uses Tapir, define the transport contract once as shared
+`Endpoint` values. Derive server endpoints, client requests, and API
+documentation from those same values; do not independently repeat methods,
+paths, parameters, headers, bodies, status codes, or codecs.
+
+Treat an endpoint description as a transport contract, not a domain algebra or
+program:
+
+- Keep Tapir out of domain and program layers. A shared contract module may own
+  endpoint descriptions, transport models, API error ADTs, codecs, schemas, and
+  metadata, but not server logic or interpreter selection.
+- Share `Endpoint` or `PublicEndpoint` descriptions, not `ServerEndpoint`
+  values with attached logic.
+- Give each endpoint a stable, unique name and export one complete endpoint
+  list for serving, documentation, and verification.
+- Translate transport models into parsed domain values before invoking a
+  program, and translate decoded client responses before returning them from a
+  domain algebra.
+- Prefer codecs that parse path, query, and header inputs into domain types
+  that encode the parsed guarantee. Validation that returns the original raw
+  type does not establish a guarantee for inner code.
+- Keep effectful or state-dependent checks in programs. Represent expected
+  rejections with a closed API error ADT and describe every public status and
+  body variant in the endpoint.
+- Define credentials as security inputs and use the client interpreter's secure
+  path for secure endpoints.
+- Derive schemas explicitly at the contract boundary. Avoid broad automatic
+  derivation imports that can silently change a public schema after an
+  unrelated model edit.
+- Generate OpenAPI from the exported endpoint list. If the server and client
+  cannot share a Scala artifact, publish that document as the exchange contract
+  and verify both sides against it.
+
+Run `EndpointVerifier` over the complete endpoint list, exercise interpreted
+clients against `ServerEndpoint` logic without a network where possible, and
+pin externally observable requests and responses with integration tests. A
+round trip derived from one shared endpoint cannot detect an unintended
+simultaneous contract change, so published APIs also require compatibility
+checks against their released OpenAPI baseline.
+
 ## Errors and logging
 
 - Domain parsing failures should be structured values.
@@ -455,6 +503,8 @@ Before requesting review, confirm that:
 - raw input is parsed once into a type that represents its guarantees, and
   inner functions do not reintroduce the uncertainty eliminated by parsing;
 - dependencies still point toward the domain;
+- structured HTTP server, client, and documentation representations derive from
+  one contract where the project owns them together;
 - new capabilities are no broader than the program needs;
 - acquisition, cancellation, failure, and release paths are all explicit;
 - platform-specific and mutable code stays at the outer boundary;
@@ -470,6 +520,8 @@ Before requesting review, confirm that:
 - [Parse, don't validate](https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/)
 - [Iron: refined types for Scala](https://github.com/Iltotore/iron)
 - [Cats Effect documentation](https://typelevel.org/cats-effect/docs/getting-started)
+- [Tapir documentation](https://tapir.softwaremill.com/en/latest/)
+- [Tapir testing and contract verification](https://tapir.softwaremill.com/en/latest/testing.html)
 - [MUnit Cats Effect](https://github.com/typelevel/munit-cats-effect)
 - [Hedgehog for Scala](https://hedgehogqa.github.io/scala-hedgehog/)
 - [Hedgehog integration with MUnit](https://hedgehogqa.github.io/scala-hedgehog/docs/integration-munit/)
