@@ -18,3 +18,4 @@ This site documents the architecture and operating contracts of DocTrellis.
 - [Live preview rebuild and WebView refresh](adr/0006-live-preview-rebuild-and-webview-refresh.md)
 - [Path-preserving WebView refresh](adr/0007-path-preserving-webview-refresh.md)
 - [Retain hidden preview context](adr/0008-retain-hidden-preview-context.md)
+- [Tapir contracts with Armeria for structured HTTP APIs](adr/0009-tapir-armeria-http-api.md)

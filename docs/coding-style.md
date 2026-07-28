@@ -20,8 +20,8 @@ build definitions, and supporting scripts.
 - `.scalafix.conf` is the source of truth for import organization.
 - The accepted ADRs under `docs/adr/` are the source of truth for architectural
   decisions.
-- This guide and the base guide cover design and review choices that automated
-  tools cannot enforce.
+- This guide, the base guide, and the specialized guides linked from this guide
+  cover design and review choices that automated tools cannot enforce.
 
 When these sources appear to disagree, do not work around an automated check.
 Clarify the rule or update the relevant decision explicitly.
@@ -106,6 +106,36 @@ boundaries:
 - a Node or VS Code callback being transferred into the selected `IO` runtime.
 
 Keep these operations out of the domain and application modules.
+
+## Structured HTTP APIs
+
+For a structured request/response HTTP API owned on both its Scala server and
+client sides, follow the
+[Tapir HTTP Contract Guide](tapir-http-contracts.md) and
+[ADR 0009](adr/0009-tapir-armeria-http-api.md). Shared Tapir endpoints are the
+contract source of truth, the server uses the Armeria Cats Effect interpreter,
+and JVM clients use the sttp v4 client interpreter with an Armeria backend. The
+Tapir guide is the specialized source of truth for that stack's capability,
+lifecycle, Unix-domain-socket operating, and verification rules.
+
+DocTrellis applies that stack only to jointly owned structured APIs. It does
+not apply to:
+
+- static documentation serving by the sbt plugin;
+- a single-purpose local health, callback, or bridge endpoint; or
+- the non-HTTP `doctrellis-preview-v1` control protocol.
+
+The preview server remains the JDK `HttpServer`. The control channel remains
+newline-delimited JSON over a Unix domain socket or Windows loopback TCP under
+ADR 0005. Do not add Armeria to the sbt plugin merely to replace either
+boundary.
+
+ADR 0009 records the stack selection. Replacing an existing transport,
+selecting another server or JVM client interpreter, or adding a WebSocket
+exception requires an ADR that supersedes or narrowly amends that decision.
+The Tapir guide's Unix-domain-socket checklist applies only to a future
+JVM-to-JVM local HTTP API approved by such a decision, not to the current
+control protocol.
 
 ## Scala.js and VS Code boundaries
 
