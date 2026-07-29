@@ -421,6 +421,11 @@ private[infrastructure] enum WorkspaceChannelMessage:
   case Stopped
   case Error(message: String)
 
+private[infrastructure] enum ChannelState:
+  case Running
+  case Stopping
+  case Terminated
+
 private[infrastructure] enum WorkspaceSiteRevision:
   case Published(revision: SiteRevision)
   case Failed(error: Throwable)
@@ -671,6 +676,7 @@ private[infrastructure] final class WorkspaceChannelConnection private (
     siteRevisions: Queue[IO, WorkspaceSiteRevision],
     pingRequest: Ref[IO, Option[String]],
     stopRequest: Ref[IO, Option[String]],
+    channelState: Ref[IO, ChannelState],
     closed: Ref[IO, Boolean],
     releaseDispatcher: IO[Unit],
     listeners: WorkspaceChannelListeners,
@@ -772,8 +778,8 @@ private[infrastructure] final class WorkspaceChannelConnection private (
                   ),
                 )
                 .void
-          (cleanup.attempt
-            .flatMap(result => settle *> result.liftTo[IO]))
+          (channelState.set(ChannelState.Terminated) *>
+            cleanup.attempt.flatMap(result => settle *> result.liftTo[IO]))
             .guarantee(releaseDispatcher)
 
 private[infrastructure] final case class WorkspaceChannelListeners(
@@ -817,6 +823,7 @@ private[infrastructure] object WorkspaceChannelConnection:
       siteRevisions <- Queue.unbounded[IO, WorkspaceSiteRevision]
       pingRequest   <- Ref.of[IO, Option[String]](None)
       stopRequest   <- Ref.of[IO, Option[String]](None)
+      channelState  <- Ref.of[IO, ChannelState](ChannelState.Running)
       closed        <- Ref.of[IO, Boolean](false)
       clientId       = NodeCrypto.randomUUID()
       helloRequestId = NodeCrypto.randomUUID()
@@ -826,7 +833,8 @@ private[infrastructure] object WorkspaceChannelConnection:
       lastError <- Ref.of[IO, Option[String]](None)
       fail = (problem: String) =>
         val error = IllegalStateException(problem)
-        ready.complete(Left(error)).void *>
+        channelState.set(ChannelState.Terminated) *>
+          ready.complete(Left(error)).void *>
           pong.complete(Left(error)).void *>
           siteRevisions.offer(WorkspaceSiteRevision.Failed(error)) *>
           terminal.complete(Left(error)).void *>
@@ -873,16 +881,42 @@ private[infrastructure] object WorkspaceChannelConnection:
                       )
                     case Left(problem) => fail(problem)
               case Right(WorkspaceChannelMessage.Pong) =>
-                pong.complete(Right(())).void
-              case Right(WorkspaceChannelMessage.Stopping) => IO.unit
-              case Right(WorkspaceChannelMessage.Stopped)  =>
-                terminal
-                  .complete(
-                    Right(
-                      ProcessExit(code = Some(0), signal = None, error = None),
-                    ),
-                  )
-                  .void
+                pong
+                  .complete(Right(()))
+                  .flatMap: accepted =>
+                    if accepted then IO.unit
+                    else fail("duplicate or late pong response")
+              case Right(WorkspaceChannelMessage.Stopping) =>
+                channelState
+                  .modify:
+                    case ChannelState.Running =>
+                      ChannelState.Stopping -> true
+                    case current => current -> false
+                  .flatMap: accepted =>
+                    if accepted then IO.unit
+                    else fail("duplicate or late stopping response")
+              case Right(WorkspaceChannelMessage.Stopped) =>
+                channelState
+                  .modify:
+                    case ChannelState.Terminated =>
+                      ChannelState.Terminated -> false
+                    case _ => ChannelState.Terminated -> true
+                  .flatMap:
+                    case false => fail("duplicate or late stopped response")
+                    case true  =>
+                      terminal
+                        .complete(
+                          Right(
+                            ProcessExit(
+                              code = Some(0),
+                              signal = None,
+                              error = None,
+                            ),
+                          ),
+                        )
+                        .flatMap: accepted =>
+                          if accepted then IO.unit
+                          else fail("duplicate or late stopped response")
               case Right(WorkspaceChannelMessage.Error(message)) =>
                 fail(message)
       data = (
@@ -903,32 +937,33 @@ private[infrastructure] object WorkspaceChannelConnection:
       close = (
           () =>
             dispatcher.unsafeRunAndForget(
-              lastError.get.flatMap:
-                case Some(problem) =>
-                  val error = IllegalStateException(problem)
-                  ready.complete(Left(error)).void *>
-                    pong.complete(Left(error)).void *>
-                    siteRevisions.offer(
-                      WorkspaceSiteRevision.Failed(error),
-                    ) *>
-                    terminal.complete(Left(error)).void
-                case None =>
-                  val problem = "workspace IPC connection ended"
-                  val error   = IllegalStateException(problem)
-                  ready.complete(Left(error)).void *>
-                    pong.complete(Left(error)).void *>
-                    siteRevisions.offer(WorkspaceSiteRevision.Ended) *>
-                    terminal
-                      .complete(
-                        Right(
-                          ProcessExit(
-                            code = None,
-                            signal = None,
-                            error = Some(problem),
+              channelState.set(ChannelState.Terminated) *> lastError.get
+                .flatMap:
+                  case Some(problem) =>
+                    val error = IllegalStateException(problem)
+                    ready.complete(Left(error)).void *>
+                      pong.complete(Left(error)).void *>
+                      siteRevisions.offer(
+                        WorkspaceSiteRevision.Failed(error),
+                      ) *>
+                      terminal.complete(Left(error)).void
+                  case None =>
+                    val problem = "workspace IPC connection ended"
+                    val error   = IllegalStateException(problem)
+                    ready.complete(Left(error)).void *>
+                      pong.complete(Left(error)).void *>
+                      siteRevisions.offer(WorkspaceSiteRevision.Ended) *>
+                      terminal
+                        .complete(
+                          Right(
+                            ProcessExit(
+                              code = None,
+                              signal = None,
+                              error = Some(problem),
+                            ),
                           ),
-                        ),
-                      )
-                      .void,
+                        )
+                        .void,
             ),
       ): js.Function0[Unit]
       listeners = WorkspaceChannelListeners(
@@ -947,6 +982,7 @@ private[infrastructure] object WorkspaceChannelConnection:
       siteRevisions = siteRevisions,
       pingRequest = pingRequest,
       stopRequest = stopRequest,
+      channelState = channelState,
       closed = closed,
       releaseDispatcher = releaseDispatcher,
       listeners = listeners,

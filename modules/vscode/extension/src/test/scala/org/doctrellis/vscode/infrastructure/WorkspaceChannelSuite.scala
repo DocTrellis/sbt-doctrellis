@@ -514,6 +514,209 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           assert(exit.left.exists(_.getMessage.contains("must be greater"))),
       )(_.close)
 
+  test("a connection rejects a duplicate pong response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          ping      <- connection.ping.start
+          _         <- IO.cede
+          pingFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"ping\"")),
+          )(IllegalStateException("the ping request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(pingFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          pongFrame =
+            s"""{"version":1,"type":"pong","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(pongFrame))
+          _      <- ping.joinWithNever.timeout(1.second)
+          _      <- IO.delay(emitData(pongFrame))
+          result <- connection.awaitExit.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late pong response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection rejects a duplicate stopped response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          stoppedFrame =
+            s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(stoppedFrame))
+          _      <- stop.joinWithNever.timeout(1.second)
+          _      <- IO.delay(emitData(stoppedFrame))
+          result <- connection.nextSiteRevision.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopped response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection completes a stopping then stopped sequence"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n""",
+            ),
+          )
+          _ <- IO.cede
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n""",
+            ),
+          )
+          result <- stop.joinWithNever.attempt.timeout(1.second)
+          exit   <- connection.awaitExit.timeout(1.second)
+        yield
+          assertEquals(result, Right(()))
+          assertEquals(
+            exit,
+            ProcessExit(code = Some(0), signal = None, error = None),
+          ),
+      )(_.close)
+
+  test("a connection rejects a duplicate stopping response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          stoppingFrame =
+            s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(stoppingFrame))
+          _      <- IO.delay(emitData(stoppingFrame))
+          result <- stop.joinWithNever.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopping response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection rejects a stopping response after stopped"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n""",
+            ),
+          )
+          _ <- stop.joinWithNever.timeout(1.second)
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n""",
+            ),
+          )
+          result <- connection.nextSiteRevision.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopping response"),
+          ),
+        ),
+      )(_.close)
+
   test("a transport error fails both site events and connection exit"):
     val metadata = WorkspaceChannelMetadata(
       transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
