@@ -187,6 +187,9 @@ private[infrastructure] object ConfigParser:
     if parent == "$" then child else s"$parent.$child"
 
 private[infrastructure] object NodeConfig:
+  private val pathSemantics =
+    new PathSemantics(NodePath.sep, NodePath.isAbsolute)
+
   def load(workspace: Workspace): IO[PreviewCommand] =
     for
       text <- promise(
@@ -215,8 +218,7 @@ private[infrastructure] object NodeConfig:
           .parseResolved(
             candidate,
             relative,
-            NodePath.sep,
-            NodePath.isAbsolute(relative),
+            pathSemantics,
           )
           .leftMap(problem => IllegalArgumentException(problem.message)),
       )

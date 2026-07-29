@@ -11,14 +11,21 @@ import munit.CatsEffectSuite
 import org.doctrellis.vscode.domain.*
 
 class PreviewServiceSuite extends CatsEffectSuite:
-  private val workspace =
+  private val posixPaths = new PathSemantics("/", _.startsWith("/"))
+  private val workspace  =
     Workspace("file:///workspace", "example", "/workspace", "file:///workspace")
 
   private val command =
     PreviewCommand(
       right(Executable.parse("sbt")),
       Vector(right(ProcessArgument.parse("doctrellisPreview", 0))),
-      right(WorkingDirectory.parseResolved("/workspace", "", "/", false)),
+      right(
+        WorkingDirectory.parseResolved(
+          "/workspace",
+          "",
+          posixPaths,
+        ),
+      ),
       PreviewEndpoint.Fixed(
         right(PreviewUrl.parse("http://127.0.0.1:4242")),
       ),

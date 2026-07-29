@@ -67,25 +67,29 @@ object RelativeDirectory:
 
   extension (value: RelativeDirectory) def value: String = value
 
+final class PathSemantics(
+    val separator: String,
+    val isAbsolute: String => Boolean,
+)
+
 opaque type WorkingDirectory = String
 
 object WorkingDirectory:
   def parseResolved(
       resolved: String,
       relativeFromRoot: String,
-      separator: String,
-      relativeIsAbsolute: Boolean,
+      paths: PathSemantics,
   ): Either[ConfigProblem, WorkingDirectory] =
     val escapes =
       relativeFromRoot == ".." ||
-        relativeFromRoot.startsWith(".." + separator) ||
-        relativeIsAbsolute
+        relativeFromRoot.startsWith(".." + paths.separator) ||
+        paths.isAbsolute(relativeFromRoot)
     Either.cond(
-      resolved.nonEmpty && !escapes,
+      resolved.nonEmpty && paths.isAbsolute(resolved) && !escapes,
       resolved,
       ConfigProblem.InvalidValue(
         "preview.workingDirectory",
-        "must resolve inside the workspace folder",
+        "must resolve to an absolute path inside the workspace folder",
       ),
     )
 

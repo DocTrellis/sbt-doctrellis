@@ -22,6 +22,9 @@ import org.doctrellis.vscode.infrastructure.facade.{
 }
 
 class NodeProcessSuite extends CatsEffectSuite:
+  private val nodePathSemantics =
+    new PathSemantics(NodePath.sep, NodePath.isAbsolute)
+
   private val workspace = Workspace(
     key = "file:///node-process-suite",
     name = "node-process-suite",
@@ -661,8 +664,7 @@ class NodeProcessSuite extends CatsEffectSuite:
         WorkingDirectory.parseResolved(
           resolved = directory,
           relativeFromRoot = "",
-          separator = NodePath.sep,
-          relativeIsAbsolute = false,
+          paths = nodePathSemantics,
         ),
       ),
     )
@@ -806,8 +808,7 @@ class NodeProcessSuite extends CatsEffectSuite:
         WorkingDirectory.parseResolved(
           resolved = TestNodeRuntime.cwd(),
           relativeFromRoot = "",
-          separator = NodePath.sep,
-          relativeIsAbsolute = false,
+          paths = nodePathSemantics,
         ),
       ),
       endpoint = PreviewEndpoint.Fixed(
@@ -832,8 +833,7 @@ class NodeProcessSuite extends CatsEffectSuite:
         WorkingDirectory.parseResolved(
           resolved = directory,
           relativeFromRoot = "examples/basic",
-          separator = NodePath.sep,
-          relativeIsAbsolute = false,
+          paths = nodePathSemantics,
         ),
       ),
       endpoint = PreviewEndpoint.Announced,
@@ -865,8 +865,7 @@ class NodeProcessSuite extends CatsEffectSuite:
         WorkingDirectory.parseResolved(
           resolved = TestNodeRuntime.cwd(),
           relativeFromRoot = "",
-          separator = NodePath.sep,
-          relativeIsAbsolute = false,
+          paths = nodePathSemantics,
         ),
       ),
       endpoint = PreviewEndpoint.Fixed(exampleUrl),

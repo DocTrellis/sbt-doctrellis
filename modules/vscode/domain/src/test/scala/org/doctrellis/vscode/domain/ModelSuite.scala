@@ -1,6 +1,8 @@
 package org.doctrellis.vscode.domain
 
 class ModelSuite extends munit.FunSuite:
+  private val posixPaths = new PathSemantics("/", _.startsWith("/"))
+
   test("parses values into types that retain their invariants"):
     assertEquals(Executable.parse("sbt").map(_.value), Right("sbt"))
     assertEquals(
@@ -24,11 +26,26 @@ class ModelSuite extends munit.FunSuite:
 
   test("only creates a working directory contained by the workspace"):
     val contained =
-      WorkingDirectory.parseResolved("/workspace/docs", "docs", "/", false)
+      WorkingDirectory.parseResolved(
+        "/workspace/docs",
+        "docs",
+        posixPaths,
+      )
     val escaped =
-      WorkingDirectory.parseResolved("/outside", "../outside", "/", false)
+      WorkingDirectory.parseResolved(
+        "/outside",
+        "../outside",
+        posixPaths,
+      )
+    val unresolved =
+      WorkingDirectory.parseResolved(
+        "workspace/docs",
+        "docs",
+        posixPaths,
+      )
     assertEquals(contained.map(_.value), Right("/workspace/docs"))
     assert(escaped.isLeft)
+    assert(unresolved.isLeft)
 
   test("renders a synthesized process error before generic exit status"):
     val exit = ProcessExit(
