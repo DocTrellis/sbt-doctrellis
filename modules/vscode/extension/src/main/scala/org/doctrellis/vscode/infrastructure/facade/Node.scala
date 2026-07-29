@@ -1,7 +1,9 @@
 package org.doctrellis.vscode.infrastructure.facade
 
+import scala.annotation.unused
 import scala.scalajs.js
 import scala.scalajs.js.annotation.*
+import scala.scalajs.js.typedarray.Uint8Array
 
 @js.native
 trait ReadableStream extends js.Object:
@@ -104,13 +106,21 @@ object NodeBuffer extends js.Object:
   val Buffer: NodeBufferConstructor = js.native
 
 @js.native
+@JSImport("node:util", "TextDecoder")
+// JavaScript consumes these native constructor arguments; Scala cannot observe
+// that use, so mark only the boundary parameters as intentionally unused.
+class NodeTextDecoder(
+    @unused label: String,
+    @unused options: js.Object,
+) extends js.Object:
+  def decode(input: Uint8Array, options: js.Object): String = js.native
+
+@js.native
 trait NodeSocket extends js.Object:
   def on(event: String, listener: js.Function): NodeSocket   = js.native
   def once(event: String, listener: js.Function): NodeSocket = js.native
   def off(event: String, listener: js.Function): NodeSocket  = js.native
   def write(value: String): Boolean                          = js.native
-  def setEncoding(encoding: String): NodeSocket              = js.native
-  def end(): Unit                                            = js.native
   def destroy(): Unit                                        = js.native
 
 @js.native

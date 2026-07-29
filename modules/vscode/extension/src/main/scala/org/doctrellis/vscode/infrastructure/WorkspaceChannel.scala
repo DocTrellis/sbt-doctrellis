@@ -2,6 +2,7 @@ package org.doctrellis.vscode.infrastructure
 
 import scala.concurrent.duration.*
 import scala.scalajs.js
+import scala.scalajs.js.typedarray.Uint8Array
 
 import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.effect.std.{Dispatcher, Queue}
@@ -397,6 +398,21 @@ private[infrastructure] final class NdjsonFrameDecoder(maxFrameBytes: Int):
   private def frameTooLarge: Left[String, Nothing] =
     Left(s"IPC frame exceeds $maxFrameBytes bytes")
 
+private[infrastructure] final class Utf8NdjsonFrameDecoder(
+    maxFrameBytes: Int,
+):
+  private val decoder =
+    new NodeTextDecoder("utf-8", js.Dynamic.literal(fatal = true))
+  private val frames = NdjsonFrameDecoder(maxFrameBytes)
+
+  def offer(chunk: Uint8Array): Either[String, Vector[String]] =
+    val decoded: Either[String, String] =
+      try Right(decoder.decode(chunk, js.Dynamic.literal(stream = true)))
+      catch
+        case _: js.JavaScriptException =>
+          Left("IPC frame must contain valid UTF-8")
+    decoded.flatMap(frames.offer)
+
 private[infrastructure] enum WorkspaceChannelMessage:
   case Ready(url: PreviewUrl)
   case SiteChanged(revision: SiteRevision)
@@ -639,7 +655,6 @@ private[infrastructure] final class WorkspaceChannelConnection private (
 ):
   private def activate: IO[Unit] =
     IO.delay:
-      socket.setEncoding("utf8"): Unit
       socket.on("data", listeners.data): Unit
       socket.on("error", listeners.error): Unit
       socket.once("close", listeners.close): Unit
@@ -740,7 +755,7 @@ private[infrastructure] final class WorkspaceChannelConnection private (
             .guarantee(releaseDispatcher)
 
 private[infrastructure] final case class WorkspaceChannelListeners(
-    data: js.Function1[String, Unit],
+    data: js.Function1[Uint8Array, Unit],
     error: js.Function1[js.Any, Unit],
     close: js.Function0[Unit],
 )
@@ -783,7 +798,7 @@ private[infrastructure] object WorkspaceChannelConnection:
       closed        <- Ref.of[IO, Boolean](false)
       clientId       = NodeCrypto.randomUUID()
       helloRequestId = NodeCrypto.randomUUID()
-      decoder        = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+      decoder        = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
       announced <- Ref.of[IO, Option[PreviewUrl]](None)
       revision  <- Ref.of[IO, Option[SiteRevision]](None)
       lastError <- Ref.of[IO, Option[String]](None)
@@ -849,14 +864,14 @@ private[infrastructure] object WorkspaceChannelConnection:
               case Right(WorkspaceChannelMessage.Error(message)) =>
                 fail(message)
       data = (
-          (chunk: String) =>
+          (chunk: Uint8Array) =>
             dispatcher.unsafeRunAndForget(
               IO.delay(decoder.offer(chunk))
                 .flatMap:
                   case Left(problem) => fail(problem)
                   case Right(frames) => frames.traverse_(handle),
             ),
-      ): js.Function1[String, Unit]
+      ): js.Function1[Uint8Array, Unit]
       error = (
           (raw: js.Any) =>
             dispatcher.unsafeRunAndForget(

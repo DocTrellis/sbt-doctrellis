@@ -3,6 +3,7 @@ package org.doctrellis.vscode.infrastructure
 import scala.collection.mutable
 import scala.concurrent.duration.*
 import scala.scalajs.js
+import scala.scalajs.js.typedarray.Uint8Array
 
 import cats.effect.{Deferred, IO, Ref}
 
@@ -71,6 +72,21 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     assertEquals(
       afterCarriageReturn.offer("x"),
       Left("IPC frame exceeds 4 bytes"),
+    )
+
+  test(
+    "NDJSON framing rejects malformed UTF-8 without losing split characters",
+  ):
+    val valid  = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+    val first  = bytes(0x22, 0xc3)
+    val second = bytes(0xa9, 0x22, 0x0a)
+    assertEquals(valid.offer(first), Right(Vector.empty))
+    assertEquals(valid.offer(second), Right(Vector("\"é\"")))
+
+    val malformed = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+    assertEquals(
+      malformed.offer(bytes(0x22, 0xc3, 0x28, 0x22, 0x0a)),
+      Left("IPC frame must contain valid UTF-8"),
     )
 
   test("server protocol rejects malformed, unknown, and conflicting identity"):
@@ -691,10 +707,6 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     socket.updateDynamic("write")(
       ((_: String) => true): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")(
       (() => destroys += 1): js.Function0[Unit],
     )
@@ -709,7 +721,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
   ) =
     val socket   = js.Dynamic.literal()
     val writes   = mutable.ListBuffer.empty[String]
-    var data     = Option.empty[js.Function1[String, Unit]]
+    var data     = Option.empty[js.Function1[Uint8Array, Unit]]
     var error    = Option.empty[js.Function1[js.Any, Unit]]
     var close    = Option.empty[js.Function0[Unit]]
     val register =
@@ -717,7 +729,9 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           (event: String, listener: js.Function) =>
             event match
               case "data" =>
-                data = Some(listener.asInstanceOf[js.Function1[String, Unit]])
+                data = Some(
+                  listener.asInstanceOf[js.Function1[Uint8Array, Unit]],
+                )
               case "error" =>
                 error = Some(listener.asInstanceOf[js.Function1[js.Any, Unit]])
               case "close" =>
@@ -740,14 +754,10 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         true,
       ): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")((() => ()): js.Function0[Unit])
     (
       socket.asInstanceOf[NodeSocket],
-      chunk => data.foreach(callback => callback(chunk)),
+      chunk => data.foreach(callback => callback(asciiBytes(chunk))),
       value => error.foreach(callback => callback(value)),
       () => close.foreach(callback => callback()),
       () => writes.toVector,
@@ -784,10 +794,6 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         throw IllegalStateException("write failed"),
       ): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")(
       (() =>
         events += "destroy"
@@ -799,6 +805,19 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       ): js.Function0[Unit],
     )
     socket.asInstanceOf[NodeSocket] -> (() => events.toVector)
+
+  private def bytes(values: Int*): Uint8Array =
+    val result = new Uint8Array(values.length)
+    values.zipWithIndex.foreach: (value, index) =>
+      result(index) = value.toShort
+    result
+
+  private def asciiBytes(value: String): Uint8Array =
+    require(
+      value.forall(_ <= '\u007f'),
+      "ASCII test fixture contained a non-ASCII character",
+    )
+    bytes(value.iterator.map(_.toInt).toSeq*)
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)
