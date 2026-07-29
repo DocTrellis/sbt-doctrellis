@@ -204,6 +204,56 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     assertEquals(valid, Right(WorkspaceChannelMessage.Pong))
     assert(unknown.isLeft)
 
+  test("error responses require their complete wire shape"):
+    val correlated = WorkspaceChannelProtocol.decodeServer(
+      frame =
+        """{"version":1,"type":"error","requestId":"hello","code":"authenticationFailed","message":"denied"}""",
+      helloRequestId = "hello",
+      pingRequestId = None,
+      stopRequestId = None,
+      expectedSessionId = "session",
+      expectedPid = 42,
+      expectedLaunchId = "launch",
+    )
+    val uncorrelated = WorkspaceChannelProtocol.decodeServer(
+      frame =
+        """{"version":1,"type":"error","requestId":"","code":"invalidFrame","message":"IPC frame exceeds 8192 bytes"}""",
+      helloRequestId = "hello",
+      pingRequestId = None,
+      stopRequestId = None,
+      expectedSessionId = "session",
+      expectedPid = 42,
+      expectedLaunchId = "launch",
+    )
+    assertEquals(correlated, Right(WorkspaceChannelMessage.Error("denied")))
+    assertEquals(
+      uncorrelated,
+      Right(WorkspaceChannelMessage.Error("IPC frame exceeds 8192 bytes")),
+    )
+
+    val invalid = Vector(
+      """{"version":1,"type":"error","requestId":"other","code":"authenticationFailed","message":"denied"}""",
+      """{"version":1,"type":"error","code":"authenticationFailed","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","code":"","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","code":"authenticationFailed","message":""}""",
+    )
+    invalid.foreach: frame =>
+      assert(
+        WorkspaceChannelProtocol
+          .decodeServer(
+            frame = frame,
+            helloRequestId = "hello",
+            pingRequestId = None,
+            stopRequestId = None,
+            expectedSessionId = "session",
+            expectedPid = 42,
+            expectedLaunchId = "launch",
+          )
+          .isLeft,
+        clues(frame),
+      )
+
   test("site change messages parse a matching session and safe revision"):
     val valid = WorkspaceChannelProtocol.decodeServer(
       frame = siteChangedFrame("session", 2),
@@ -399,6 +449,33 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       assert(events.contains("off:close"))
       assert(!events.contains("emit:close"))
       assert(events.indexOf("off:close") < events.indexOf("destroy"))
+
+  test("a connection preserves an uncorrelated protocol error diagnostic"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, _) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          _ <- IO.delay(
+            emitData(
+              """{"version":1,"type":"error","requestId":"","code":"invalidFrame","message":"IPC frame exceeds 8192 bytes"}
+                |""".stripMargin,
+            ),
+          )
+          result <- connection.awaitExit.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage == "IPC frame exceeds 8192 bytes",
+          ),
+        ),
+      )(_.close)
 
   test("a connection preserves event order and rejects a duplicate revision"):
     val metadata = WorkspaceChannelMetadata(

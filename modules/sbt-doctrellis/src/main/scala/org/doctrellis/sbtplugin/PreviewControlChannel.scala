@@ -1293,12 +1293,16 @@ private[sbtplugin] object PreviewControlProtocol:
     ) + "\n"
 
   def error(code: String, message: String, requestId: String): String =
+    val encodedCode =
+      Option(code).filter(_.nonEmpty).getOrElse("internal")
+    val encodedMessage =
+      Option(message).filter(_.nonEmpty).getOrElse("unspecified IPC error")
     response(
       kind = "error",
-      requestId = requestId,
+      requestId = Option(requestId).getOrElse(""),
       extra = Vector(
-        "code"    -> PreviewControlJson.quoted(code),
-        "message" -> PreviewControlJson.quoted(message),
+        "code"    -> PreviewControlJson.quoted(encodedCode),
+        "message" -> PreviewControlJson.quoted(encodedMessage),
       ),
     )
 

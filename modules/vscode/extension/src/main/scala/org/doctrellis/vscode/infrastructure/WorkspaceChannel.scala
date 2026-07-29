@@ -524,7 +524,18 @@ private[infrastructure] object WorkspaceChannelProtocol:
             validateStopRequest(raw, stopRequestId)
               .as(WorkspaceChannelMessage.Stopped)
           case "error" =>
-            string(raw, "message").map(WorkspaceChannelMessage.Error(_))
+            for
+              requestId <- string(raw, "requestId")
+              _         <- require(
+                requestId.isEmpty ||
+                  requestId == helloRequestId ||
+                  pingRequestId.contains(requestId) ||
+                  stopRequestId.contains(requestId),
+                "error response has an unknown request id",
+              )
+              _       <- nonEmpty(raw, "code")
+              message <- nonEmpty(raw, "message")
+            yield WorkspaceChannelMessage.Error(message)
           case other => Left(s"unknown IPC message type '$other'")
       yield message
 
@@ -567,6 +578,17 @@ private[infrastructure] object WorkspaceChannelProtocol:
       field.asInstanceOf[String],
       s"IPC field '$name' must be a string",
     )
+
+  private def nonEmpty(
+      value: js.Dynamic,
+      name: String,
+  ): Either[String, String] =
+    string(value, name).flatMap: result =>
+      Either.cond(
+        result.nonEmpty,
+        result,
+        s"IPC field '$name' must not be empty",
+      )
 
   private def integer(value: js.Dynamic, name: String): Either[String, Int] =
     val field = value.selectDynamic(name)

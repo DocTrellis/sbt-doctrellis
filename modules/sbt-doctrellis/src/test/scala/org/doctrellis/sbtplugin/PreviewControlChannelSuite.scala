@@ -107,6 +107,47 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     assert(decoder.offer(bytes, bytes.length + 1).isLeft)
     assertEquals(decoder.offer(bytes, bytes.length), Right(Vector(hello)))
 
+  test("error responses always encode non-empty code and message fields"):
+    val fields = right(
+      PreviewControlJson.parse(
+        PreviewControlProtocol.error(
+          code = "invalidFrame",
+          message = "IPC frame exceeds 8192 bytes",
+          requestId = "",
+        ),
+      ),
+    )
+    val fallbackFields = right(
+      PreviewControlJson.parse(
+        PreviewControlProtocol.error(
+          code = "",
+          message = "",
+          requestId = "request",
+        ),
+      ),
+    )
+
+    assertEquals(
+      fields.get("code"),
+      Some(PreviewControlJson.Atom.Text("invalidFrame")),
+    )
+    assertEquals(
+      fields.get("message"),
+      Some(PreviewControlJson.Atom.Text("IPC frame exceeds 8192 bytes")),
+    )
+    assertEquals(
+      fields.get("requestId"),
+      Some(PreviewControlJson.Atom.Text("")),
+    )
+    assertEquals(
+      fallbackFields.get("code"),
+      Some(PreviewControlJson.Atom.Text("internal")),
+    )
+    assertEquals(
+      fallbackFields.get("message"),
+      Some(PreviewControlJson.Atom.Text("unspecified IPC error")),
+    )
+
   test("hello opts into site events only with numeric version one"):
     val optedIn = hello.replace(
       "\"token\":",
