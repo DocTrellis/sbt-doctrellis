@@ -94,6 +94,26 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       assertEquals(singleDecodeExchange.getResponseCode, 200)
     finally GeneratedDirectory.delete(root)
 
+  test("bounds raw path decoding before accumulating decoded content"):
+    val maximum = StaticSiteHandler.MaximumRequestPathCharacters
+    val root    = Files.createTempDirectory("doctrellis-handler-long-path")
+    try
+      assertEquals(
+        StaticSiteHandler.decode("/" + ("a" * (maximum - 1))).map(_.length),
+        Some(maximum),
+      )
+      val oversized = "/" + ("a" * maximum)
+      assertEquals(StaticSiteHandler.decode(oversized), None)
+
+      val exchange = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create(oversized),
+      )
+      StaticSiteHandler(root).handle(exchange)
+      assertEquals(exchange.getResponseCode, 404)
+    finally GeneratedDirectory.delete(root)
+
   test("does not follow site symlinks outside the root"):
     val root    = Files.createTempDirectory("doctrellis-handler")
     val outside = Files.createTempFile("doctrellis-secret", ".txt")

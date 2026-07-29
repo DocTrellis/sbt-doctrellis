@@ -125,6 +125,9 @@ private[sbtplugin] final class StaticSiteHandler private (
 
 private[sbtplugin] object StaticSiteHandler:
   private val MaximumInMemoryResponseBytes = 1024L * 1024L
+  // Bound work here as defense in depth even when HttpServer rejects a long
+  // request line before dispatching it to this handler.
+  private[sbtplugin] val MaximumRequestPathCharacters = 8192
   // Keep this path and marker synchronized with PreviewWebviewBridge and
   // NodeHttpBridgeProbe in the VS Code extension infrastructure.
   private[sbtplugin] val WebviewBridgePath =
@@ -421,7 +424,7 @@ private[sbtplugin] object StaticSiteHandler:
     val raw     = Option(requestPath).getOrElse("/")
     val decoded = StringBuilder()
     var offset  = 0
-    var valid   = true
+    var valid   = raw.length <= MaximumRequestPathCharacters
     try
       while valid && offset < raw.length do
         if raw.charAt(offset) != '%' then
