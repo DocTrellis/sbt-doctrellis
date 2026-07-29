@@ -93,23 +93,30 @@ never logged, and endpoint metadata remains restricted to the current user.
 
 ## Protocol
 
-`doctrellis-preview-v1` is newline-delimited UTF-8 JSON. Readers accumulate
-arbitrary transport chunks, accept LF or CRLF, and process multiple frames per
-chunk. A frame is at most 8192 bytes. Empty, malformed, oversized,
+`doctrellis-preview-v1` is newline-delimited strict UTF-8 JSON. Readers
+accumulate arbitrary transport chunks, including a UTF-8 code point split
+across chunks, accept LF or CRLF, and process multiple frames per chunk. A frame
+is at most 8192 bytes. Invalid UTF-8, empty, malformed, oversized,
 unknown-version, and unknown-type messages are errors.
 
 Every request contains `version`, `type`, `token`, `clientId`, and `requestId`:
 
 - client to plugin: `hello`, `ping`, `stop`;
 - plugin to client: `ready` (`url`, `pid`, `sessionId`, `launchId`), `pong`,
-  `stopping`, `stopped`, and `error` (`code`, `message`).
+  `stopping`, `stopped`, and `error` (`requestId`, `code`, `message`).
 
 The client accepts `ready` only for its hello request, metadata PID, session ID,
 and launch ID. A second ready frame is rejected whether its URL is duplicate or
-conflicting. Stop first waits for `stopping`/`stopped`; disconnect, timeout, or
-an error falls back to the exact owned process-tree termination from ADR 0004.
-The single startup timeout covers both the IPC announcement and the HTTP probe,
-and both phases race the owned process exit.
+conflicting. `pong`, `stopping`, and `stopped` must correlate to their
+outstanding request, and a duplicate or late acknowledgement is an error.
+An `error` has non-empty `code` and `message` fields. Request-level errors echo
+the request ID. Frame- and message-level errors use an empty request ID because
+a valid correlation may not be available; the client accepts an error request
+ID only when it is empty or matches its hello, outstanding ping, or stop.
+Stop first waits for `stopping`/`stopped`; disconnect, timeout, or an error
+falls back to the exact owned process-tree termination from ADR 0004. The single
+startup timeout covers both the IPC announcement and the HTTP probe, and both
+phases race the owned process exit.
 
 Announced IPC previews require `doctrellisHost := "127.0.0.1"`; the plugin
 rejects other hosts before binding. Direct fixed-port CLI previews retain the
