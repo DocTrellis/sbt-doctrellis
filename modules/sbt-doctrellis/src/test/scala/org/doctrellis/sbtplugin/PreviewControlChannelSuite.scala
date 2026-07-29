@@ -84,6 +84,21 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         .isLeft,
     )
 
+  test("NDJSON framing rejects malformed UTF-8 instead of replacing it"):
+    val decoder   = PreviewFrameDecoder(PreviewControlProtocol.MaxFrameBytes)
+    val malformed = Array[Byte](
+      '"'.toByte,
+      0xc3.toByte,
+      0x28.toByte,
+      '"'.toByte,
+      '\n'.toByte,
+    )
+
+    assertEquals(
+      decoder.offer(malformed, malformed.length),
+      Left("IPC frame must contain valid UTF-8"),
+    )
+
   test("NDJSON framing rejects byte counts outside the input array"):
     val decoder = PreviewFrameDecoder(PreviewControlProtocol.MaxFrameBytes)
     val bytes   = (hello + "\n").getBytes(StandardCharsets.UTF_8)
