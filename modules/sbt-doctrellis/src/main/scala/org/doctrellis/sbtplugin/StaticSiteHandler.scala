@@ -55,49 +55,49 @@ private[sbtplugin] final class StaticSiteHandler private (
         includeBody = true,
         headers = List("Allow" -> "GET, HEAD"),
       )
-    else if requestPath == StaticSiteHandler.WebviewBridgePath then
-      StaticSiteHandler.webviewBridgeResponse(includeBody = method == "GET")
     else
-      StaticSiteHandler.resolve(
-        normalizedRoot,
-        requestPath,
-      ) match
-        case Some(file) if Files.isRegularFile(file) =>
-          val contentType = StaticSiteHandler.contentType(file)
-          val headers     = List(
-            "Content-Type"  -> contentType,
-            "Cache-Control" -> "no-store",
-          )
-          if method == "GET" then
-            val body = StaticSiteHandler.snapshotBody(
-              file,
-              maximumInMemoryResponseBytes,
-              createTemporaryFile,
-              deleteTemporaryFile,
-            )
-            try
-              StaticSiteHandler.ResponseSnapshot(
-                status = 200,
-                headers = headers,
-                contentLength = body.length,
-                body = Some(body),
+      StaticSiteHandler.decode(requestPath) match
+        case Some(StaticSiteHandler.WebviewBridgePath) =>
+          StaticSiteHandler.webviewBridgeResponse(includeBody = method == "GET")
+        case Some(decodedPath) =>
+          StaticSiteHandler.resolveDecoded(
+            normalizedRoot,
+            decodedPath,
+          ) match
+            case Some(file) if Files.isRegularFile(file) =>
+              val contentType = StaticSiteHandler.contentType(file)
+              val headers     = List(
+                "Content-Type"  -> contentType,
+                "Cache-Control" -> "no-store",
               )
-            catch
-              case error: Throwable =>
-                throw StaticSiteHandler.close(body, error)
-          else
-            StaticSiteHandler.ResponseSnapshot(
-              status = 200,
-              headers = headers,
-              contentLength = Files.size(file),
-              body = None,
-            )
-        case _ =>
-          StaticSiteHandler.textResponse(
-            404,
-            "Not Found",
-            includeBody = method == "GET",
-          )
+              if method == "GET" then
+                val body = StaticSiteHandler.snapshotBody(
+                  file,
+                  maximumInMemoryResponseBytes,
+                  createTemporaryFile,
+                  deleteTemporaryFile,
+                )
+                try
+                  StaticSiteHandler.ResponseSnapshot(
+                    status = 200,
+                    headers = headers,
+                    contentLength = body.length,
+                    body = Some(body),
+                  )
+                catch
+                  case error: Throwable =>
+                    throw StaticSiteHandler.close(body, error)
+              else
+                StaticSiteHandler.ResponseSnapshot(
+                  status = 200,
+                  headers = headers,
+                  contentLength = Files.size(file),
+                  body = None,
+                )
+            case _ =>
+              StaticSiteHandler.notFound(includeBody = method == "GET")
+        case None =>
+          StaticSiteHandler.notFound(includeBody = method == "GET")
 
   private def send(
       exchange: HttpExchange,
@@ -264,6 +264,13 @@ private[sbtplugin] object StaticSiteHandler:
       body = Option.when(includeBody)(new InMemoryBody(bytes)),
     )
 
+  private def notFound(includeBody: Boolean): ResponseSnapshot =
+    textResponse(
+      404,
+      "Not Found",
+      includeBody,
+    )
+
   private def sha256(value: String): String =
     val digest = MessageDigest
       .getInstance("SHA-256")
@@ -391,10 +398,12 @@ private[sbtplugin] object StaticSiteHandler:
   private def deleteTemporaryFile(path: Path): Unit =
     Files.deleteIfExists(path): Unit
 
-  def resolve(root: Path, requestPath: String): Option[Path] =
+  private[sbtplugin] def resolveDecoded(
+      root: Path,
+      decoded: String,
+  ): Option[Path] =
     try
       for
-        decoded  <- decode(requestPath)
         realRoot <- realPath(root)
         relative  = decoded.stripPrefix("/")
         candidate = realRoot.resolve(relative).normalize()
@@ -408,7 +417,7 @@ private[sbtplugin] object StaticSiteHandler:
       yield realPage
     catch case _: InvalidPathException => None
 
-  private def decode(requestPath: String): Option[String] =
+  private[sbtplugin] def decode(requestPath: String): Option[String] =
     val raw     = Option(requestPath).getOrElse("/")
     val decoded = StringBuilder()
     var offset  = 0
