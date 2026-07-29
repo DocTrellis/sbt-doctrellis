@@ -38,8 +38,7 @@ trait WebviewPanel extends Disposable:
   def onDidDispose(listener: js.Function0[Unit]): Disposable = js.native
 
 @js.native
-trait WebviewPanelOnDidChangeViewStateEvent extends js.Object:
-  val webviewPanel: WebviewPanel = js.native
+trait WebviewPanelOnDidChangeViewStateEvent extends js.Object
 
 @js.native
 trait Uri extends js.Object:
