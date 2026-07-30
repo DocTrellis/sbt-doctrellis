@@ -3,6 +3,7 @@ package org.doctrellis.vscode.infrastructure
 import scala.collection.mutable
 import scala.concurrent.duration.*
 import scala.scalajs.js
+import scala.scalajs.js.typedarray.Uint8Array
 
 import cats.effect.{Deferred, IO, Ref}
 
@@ -71,6 +72,21 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     assertEquals(
       afterCarriageReturn.offer("x"),
       Left("IPC frame exceeds 4 bytes"),
+    )
+
+  test(
+    "NDJSON framing rejects malformed UTF-8 without losing split characters",
+  ):
+    val valid  = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+    val first  = bytes(0x22, 0xc3)
+    val second = bytes(0xa9, 0x22, 0x0a)
+    assertEquals(valid.offer(first), Right(Vector.empty))
+    assertEquals(valid.offer(second), Right(Vector("\"é\"")))
+
+    val malformed = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+    assertEquals(
+      malformed.offer(bytes(0x22, 0xc3, 0x28, 0x22, 0x0a)),
+      Left("IPC frame must contain valid UTF-8"),
     )
 
   test("server protocol rejects malformed, unknown, and conflicting identity"):
@@ -187,6 +203,56 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     )
     assertEquals(valid, Right(WorkspaceChannelMessage.Pong))
     assert(unknown.isLeft)
+
+  test("error responses require their complete wire shape"):
+    val correlated = WorkspaceChannelProtocol.decodeServer(
+      frame =
+        """{"version":1,"type":"error","requestId":"hello","code":"authenticationFailed","message":"denied"}""",
+      helloRequestId = "hello",
+      pingRequestId = None,
+      stopRequestId = None,
+      expectedSessionId = "session",
+      expectedPid = 42,
+      expectedLaunchId = "launch",
+    )
+    val uncorrelated = WorkspaceChannelProtocol.decodeServer(
+      frame =
+        """{"version":1,"type":"error","requestId":"","code":"invalidFrame","message":"IPC frame exceeds 8192 bytes"}""",
+      helloRequestId = "hello",
+      pingRequestId = None,
+      stopRequestId = None,
+      expectedSessionId = "session",
+      expectedPid = 42,
+      expectedLaunchId = "launch",
+    )
+    assertEquals(correlated, Right(WorkspaceChannelMessage.Error("denied")))
+    assertEquals(
+      uncorrelated,
+      Right(WorkspaceChannelMessage.Error("IPC frame exceeds 8192 bytes")),
+    )
+
+    val invalid = Vector(
+      """{"version":1,"type":"error","requestId":"other","code":"authenticationFailed","message":"denied"}""",
+      """{"version":1,"type":"error","code":"authenticationFailed","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","code":"","message":"denied"}""",
+      """{"version":1,"type":"error","requestId":"hello","code":"authenticationFailed","message":""}""",
+    )
+    invalid.foreach: frame =>
+      assert(
+        WorkspaceChannelProtocol
+          .decodeServer(
+            frame = frame,
+            helloRequestId = "hello",
+            pingRequestId = None,
+            stopRequestId = None,
+            expectedSessionId = "session",
+            expectedPid = 42,
+            expectedLaunchId = "launch",
+          )
+          .isLeft,
+        clues(frame),
+      )
 
   test("site change messages parse a matching session and safe revision"):
     val valid = WorkspaceChannelProtocol.decodeServer(
@@ -384,6 +450,33 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       assert(!events.contains("emit:close"))
       assert(events.indexOf("off:close") < events.indexOf("destroy"))
 
+  test("a connection preserves an uncorrelated protocol error diagnostic"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, _) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          _ <- IO.delay(
+            emitData(
+              """{"version":1,"type":"error","requestId":"","code":"invalidFrame","message":"IPC frame exceeds 8192 bytes"}
+                |""".stripMargin,
+            ),
+          )
+          result <- connection.awaitExit.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage == "IPC frame exceeds 8192 bytes",
+          ),
+        ),
+      )(_.close)
+
   test("a connection preserves event order and rejects a duplicate revision"):
     val metadata = WorkspaceChannelMetadata(
       transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
@@ -419,6 +512,209 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           )
           assert(failure.left.exists(_.getMessage.contains("must be greater")))
           assert(exit.left.exists(_.getMessage.contains("must be greater"))),
+      )(_.close)
+
+  test("a connection rejects a duplicate pong response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          ping      <- connection.ping.start
+          _         <- IO.cede
+          pingFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"ping\"")),
+          )(IllegalStateException("the ping request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(pingFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          pongFrame =
+            s"""{"version":1,"type":"pong","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(pongFrame))
+          _      <- ping.joinWithNever.timeout(1.second)
+          _      <- IO.delay(emitData(pongFrame))
+          result <- connection.awaitExit.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late pong response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection rejects a duplicate stopped response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          stoppedFrame =
+            s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(stoppedFrame))
+          _      <- stop.joinWithNever.timeout(1.second)
+          _      <- IO.delay(emitData(stoppedFrame))
+          result <- connection.nextSiteRevision.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopped response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection completes a stopping then stopped sequence"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n""",
+            ),
+          )
+          _ <- IO.cede
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n""",
+            ),
+          )
+          result <- stop.joinWithNever.attempt.timeout(1.second)
+          exit   <- connection.awaitExit.timeout(1.second)
+        yield
+          assertEquals(result, Right(()))
+          assertEquals(
+            exit,
+            ProcessExit(code = Some(0), signal = None, error = None),
+          ),
+      )(_.close)
+
+  test("a connection rejects a duplicate stopping response"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          stoppingFrame =
+            s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n"""
+          _      <- IO.delay(emitData(stoppingFrame))
+          _      <- IO.delay(emitData(stoppingFrame))
+          result <- stop.joinWithNever.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopping response"),
+          ),
+        ),
+      )(_.close)
+
+  test("a connection rejects a stopping response after stopped"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, emitData, _, _, writes) = controlledSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(connection =>
+        for
+          stop      <- connection.stop.start
+          _         <- IO.cede
+          stopFrame <- IO.fromOption(
+            writes().find(_.contains("\"type\":\"stop\"")),
+          )(IllegalStateException("the stop request was not written"))
+          requestId <- IO.delay(
+            js.JSON
+              .parse(stopFrame)
+              .asInstanceOf[js.Dynamic]
+              .selectDynamic("requestId")
+              .asInstanceOf[String],
+          )
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopped","requestId":"$requestId"}\n""",
+            ),
+          )
+          _ <- stop.joinWithNever.timeout(1.second)
+          _ <- IO.delay(
+            emitData(
+              s"""{"version":1,"type":"stopping","requestId":"$requestId"}\n""",
+            ),
+          )
+          result <- connection.nextSiteRevision.attempt.timeout(1.second)
+        yield assert(
+          result.left.exists(
+            _.getMessage.contains("duplicate or late stopping response"),
+          ),
+        ),
       )(_.close)
 
   test("a transport error fails both site events and connection exit"):
@@ -691,10 +987,6 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     socket.updateDynamic("write")(
       ((_: String) => true): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")(
       (() => destroys += 1): js.Function0[Unit],
     )
@@ -709,7 +1001,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
   ) =
     val socket   = js.Dynamic.literal()
     val writes   = mutable.ListBuffer.empty[String]
-    var data     = Option.empty[js.Function1[String, Unit]]
+    var data     = Option.empty[js.Function1[Uint8Array, Unit]]
     var error    = Option.empty[js.Function1[js.Any, Unit]]
     var close    = Option.empty[js.Function0[Unit]]
     val register =
@@ -717,7 +1009,9 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           (event: String, listener: js.Function) =>
             event match
               case "data" =>
-                data = Some(listener.asInstanceOf[js.Function1[String, Unit]])
+                data = Some(
+                  listener.asInstanceOf[js.Function1[Uint8Array, Unit]],
+                )
               case "error" =>
                 error = Some(listener.asInstanceOf[js.Function1[js.Any, Unit]])
               case "close" =>
@@ -740,14 +1034,10 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         true,
       ): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")((() => ()): js.Function0[Unit])
     (
       socket.asInstanceOf[NodeSocket],
-      chunk => data.foreach(callback => callback(chunk)),
+      chunk => data.foreach(callback => callback(asciiBytes(chunk))),
       value => error.foreach(callback => callback(value)),
       () => close.foreach(callback => callback()),
       () => writes.toVector,
@@ -784,10 +1074,6 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         throw IllegalStateException("write failed"),
       ): js.Function1[String, Boolean],
     )
-    socket.updateDynamic("setEncoding")(
-      ((_: String) => socket): js.Function1[String, js.Dynamic],
-    )
-    socket.updateDynamic("end")((() => ()): js.Function0[Unit])
     socket.updateDynamic("destroy")(
       (() =>
         events += "destroy"
@@ -799,6 +1085,19 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       ): js.Function0[Unit],
     )
     socket.asInstanceOf[NodeSocket] -> (() => events.toVector)
+
+  private def bytes(values: Int*): Uint8Array =
+    val result = new Uint8Array(values.length)
+    values.zipWithIndex.foreach: (value, index) =>
+      result(index) = value.toShort
+    result
+
+  private def asciiBytes(value: String): Uint8Array =
+    require(
+      value.forall(_ <= '\u007f'),
+      "ASCII test fixture contained a non-ASCII character",
+    )
+    bytes(value.iterator.map(_.toInt).toSeq*)
 
   private def right[A](value: Either[ConfigProblem, A]): A =
     value.fold(problem => fail(problem.message), identity)

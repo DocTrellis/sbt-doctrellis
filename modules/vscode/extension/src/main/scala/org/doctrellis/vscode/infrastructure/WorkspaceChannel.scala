@@ -2,6 +2,7 @@ package org.doctrellis.vscode.infrastructure
 
 import scala.concurrent.duration.*
 import scala.scalajs.js
+import scala.scalajs.js.typedarray.Uint8Array
 
 import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.effect.std.{Dispatcher, Queue}
@@ -397,6 +398,21 @@ private[infrastructure] final class NdjsonFrameDecoder(maxFrameBytes: Int):
   private def frameTooLarge: Left[String, Nothing] =
     Left(s"IPC frame exceeds $maxFrameBytes bytes")
 
+private[infrastructure] final class Utf8NdjsonFrameDecoder(
+    maxFrameBytes: Int,
+):
+  private val decoder =
+    new NodeTextDecoder("utf-8", js.Dynamic.literal(fatal = true))
+  private val frames = NdjsonFrameDecoder(maxFrameBytes)
+
+  def offer(chunk: Uint8Array): Either[String, Vector[String]] =
+    val decoded: Either[String, String] =
+      try Right(decoder.decode(chunk, js.Dynamic.literal(stream = true)))
+      catch
+        case _: js.JavaScriptException =>
+          Left("IPC frame must contain valid UTF-8")
+    decoded.flatMap(frames.offer)
+
 private[infrastructure] enum WorkspaceChannelMessage:
   case Ready(url: PreviewUrl)
   case SiteChanged(revision: SiteRevision)
@@ -404,6 +420,11 @@ private[infrastructure] enum WorkspaceChannelMessage:
   case Stopping
   case Stopped
   case Error(message: String)
+
+private[infrastructure] enum ChannelState:
+  case Running
+  case Stopping
+  case Terminated
 
 private[infrastructure] enum WorkspaceSiteRevision:
   case Published(revision: SiteRevision)
@@ -508,7 +529,18 @@ private[infrastructure] object WorkspaceChannelProtocol:
             validateStopRequest(raw, stopRequestId)
               .as(WorkspaceChannelMessage.Stopped)
           case "error" =>
-            string(raw, "message").map(WorkspaceChannelMessage.Error(_))
+            for
+              requestId <- string(raw, "requestId")
+              _         <- require(
+                requestId.isEmpty ||
+                  requestId == helloRequestId ||
+                  pingRequestId.contains(requestId) ||
+                  stopRequestId.contains(requestId),
+                "error response has an unknown request id",
+              )
+              _       <- nonEmpty(raw, "code")
+              message <- nonEmpty(raw, "message")
+            yield WorkspaceChannelMessage.Error(message)
           case other => Left(s"unknown IPC message type '$other'")
       yield message
 
@@ -551,6 +583,17 @@ private[infrastructure] object WorkspaceChannelProtocol:
       field.asInstanceOf[String],
       s"IPC field '$name' must be a string",
     )
+
+  private def nonEmpty(
+      value: js.Dynamic,
+      name: String,
+  ): Either[String, String] =
+    string(value, name).flatMap: result =>
+      Either.cond(
+        result.nonEmpty,
+        result,
+        s"IPC field '$name' must not be empty",
+      )
 
   private def integer(value: js.Dynamic, name: String): Either[String, Int] =
     val field = value.selectDynamic(name)
@@ -633,13 +676,13 @@ private[infrastructure] final class WorkspaceChannelConnection private (
     siteRevisions: Queue[IO, WorkspaceSiteRevision],
     pingRequest: Ref[IO, Option[String]],
     stopRequest: Ref[IO, Option[String]],
+    channelState: Ref[IO, ChannelState],
     closed: Ref[IO, Boolean],
     releaseDispatcher: IO[Unit],
     listeners: WorkspaceChannelListeners,
 ):
   private def activate: IO[Unit] =
     IO.delay:
-      socket.setEncoding("utf8"): Unit
       socket.on("data", listeners.data): Unit
       socket.on("error", listeners.error): Unit
       socket.once("close", listeners.close): Unit
@@ -735,12 +778,12 @@ private[infrastructure] final class WorkspaceChannelConnection private (
                   ),
                 )
                 .void
-          (cleanup.attempt
-            .flatMap(result => settle *> result.liftTo[IO]))
+          (channelState.set(ChannelState.Terminated) *>
+            cleanup.attempt.flatMap(result => settle *> result.liftTo[IO]))
             .guarantee(releaseDispatcher)
 
 private[infrastructure] final case class WorkspaceChannelListeners(
-    data: js.Function1[String, Unit],
+    data: js.Function1[Uint8Array, Unit],
     error: js.Function1[js.Any, Unit],
     close: js.Function0[Unit],
 )
@@ -780,16 +823,18 @@ private[infrastructure] object WorkspaceChannelConnection:
       siteRevisions <- Queue.unbounded[IO, WorkspaceSiteRevision]
       pingRequest   <- Ref.of[IO, Option[String]](None)
       stopRequest   <- Ref.of[IO, Option[String]](None)
+      channelState  <- Ref.of[IO, ChannelState](ChannelState.Running)
       closed        <- Ref.of[IO, Boolean](false)
       clientId       = NodeCrypto.randomUUID()
       helloRequestId = NodeCrypto.randomUUID()
-      decoder        = NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
+      decoder        = Utf8NdjsonFrameDecoder(WorkspaceChannel.MaxFrameBytes)
       announced <- Ref.of[IO, Option[PreviewUrl]](None)
       revision  <- Ref.of[IO, Option[SiteRevision]](None)
       lastError <- Ref.of[IO, Option[String]](None)
       fail = (problem: String) =>
         val error = IllegalStateException(problem)
-        ready.complete(Left(error)).void *>
+        channelState.set(ChannelState.Terminated) *>
+          ready.complete(Left(error)).void *>
           pong.complete(Left(error)).void *>
           siteRevisions.offer(WorkspaceSiteRevision.Failed(error)) *>
           terminal.complete(Left(error)).void *>
@@ -836,27 +881,53 @@ private[infrastructure] object WorkspaceChannelConnection:
                       )
                     case Left(problem) => fail(problem)
               case Right(WorkspaceChannelMessage.Pong) =>
-                pong.complete(Right(())).void
-              case Right(WorkspaceChannelMessage.Stopping) => IO.unit
-              case Right(WorkspaceChannelMessage.Stopped)  =>
-                terminal
-                  .complete(
-                    Right(
-                      ProcessExit(code = Some(0), signal = None, error = None),
-                    ),
-                  )
-                  .void
+                pong
+                  .complete(Right(()))
+                  .flatMap: accepted =>
+                    if accepted then IO.unit
+                    else fail("duplicate or late pong response")
+              case Right(WorkspaceChannelMessage.Stopping) =>
+                channelState
+                  .modify:
+                    case ChannelState.Running =>
+                      ChannelState.Stopping -> true
+                    case current => current -> false
+                  .flatMap: accepted =>
+                    if accepted then IO.unit
+                    else fail("duplicate or late stopping response")
+              case Right(WorkspaceChannelMessage.Stopped) =>
+                channelState
+                  .modify:
+                    case ChannelState.Terminated =>
+                      ChannelState.Terminated -> false
+                    case _ => ChannelState.Terminated -> true
+                  .flatMap:
+                    case false => fail("duplicate or late stopped response")
+                    case true  =>
+                      terminal
+                        .complete(
+                          Right(
+                            ProcessExit(
+                              code = Some(0),
+                              signal = None,
+                              error = None,
+                            ),
+                          ),
+                        )
+                        .flatMap: accepted =>
+                          if accepted then IO.unit
+                          else fail("duplicate or late stopped response")
               case Right(WorkspaceChannelMessage.Error(message)) =>
                 fail(message)
       data = (
-          (chunk: String) =>
+          (chunk: Uint8Array) =>
             dispatcher.unsafeRunAndForget(
               IO.delay(decoder.offer(chunk))
                 .flatMap:
                   case Left(problem) => fail(problem)
                   case Right(frames) => frames.traverse_(handle),
             ),
-      ): js.Function1[String, Unit]
+      ): js.Function1[Uint8Array, Unit]
       error = (
           (raw: js.Any) =>
             dispatcher.unsafeRunAndForget(
@@ -866,32 +937,33 @@ private[infrastructure] object WorkspaceChannelConnection:
       close = (
           () =>
             dispatcher.unsafeRunAndForget(
-              lastError.get.flatMap:
-                case Some(problem) =>
-                  val error = IllegalStateException(problem)
-                  ready.complete(Left(error)).void *>
-                    pong.complete(Left(error)).void *>
-                    siteRevisions.offer(
-                      WorkspaceSiteRevision.Failed(error),
-                    ) *>
-                    terminal.complete(Left(error)).void
-                case None =>
-                  val problem = "workspace IPC connection ended"
-                  val error   = IllegalStateException(problem)
-                  ready.complete(Left(error)).void *>
-                    pong.complete(Left(error)).void *>
-                    siteRevisions.offer(WorkspaceSiteRevision.Ended) *>
-                    terminal
-                      .complete(
-                        Right(
-                          ProcessExit(
-                            code = None,
-                            signal = None,
-                            error = Some(problem),
+              channelState.set(ChannelState.Terminated) *> lastError.get
+                .flatMap:
+                  case Some(problem) =>
+                    val error = IllegalStateException(problem)
+                    ready.complete(Left(error)).void *>
+                      pong.complete(Left(error)).void *>
+                      siteRevisions.offer(
+                        WorkspaceSiteRevision.Failed(error),
+                      ) *>
+                      terminal.complete(Left(error)).void
+                  case None =>
+                    val problem = "workspace IPC connection ended"
+                    val error   = IllegalStateException(problem)
+                    ready.complete(Left(error)).void *>
+                      pong.complete(Left(error)).void *>
+                      siteRevisions.offer(WorkspaceSiteRevision.Ended) *>
+                      terminal
+                        .complete(
+                          Right(
+                            ProcessExit(
+                              code = None,
+                              signal = None,
+                              error = Some(problem),
+                            ),
                           ),
-                        ),
-                      )
-                      .void,
+                        )
+                        .void,
             ),
       ): js.Function0[Unit]
       listeners = WorkspaceChannelListeners(
@@ -910,6 +982,7 @@ private[infrastructure] object WorkspaceChannelConnection:
       siteRevisions = siteRevisions,
       pingRequest = pingRequest,
       stopRequest = stopRequest,
+      channelState = channelState,
       closed = closed,
       releaseDispatcher = releaseDispatcher,
       listeners = listeners,

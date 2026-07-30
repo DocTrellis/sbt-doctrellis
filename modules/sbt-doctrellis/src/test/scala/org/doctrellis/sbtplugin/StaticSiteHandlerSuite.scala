@@ -8,7 +8,7 @@ import java.io.{
 }
 import java.net.{InetSocketAddress, URI}
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
-import java.nio.file.Files
+import java.nio.file.{Files, Path}
 import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
 import java.util.concurrent.atomic.AtomicReference
 
@@ -28,11 +28,11 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       Files.writeString(nested.resolve("index.html"), "nested")
 
       assertEquals(
-        StaticSiteHandler.resolve(root, "/"),
+        resolve(root, "/"),
         Some(root.resolve("index.html").toRealPath()),
       )
       assertEquals(
-        StaticSiteHandler.resolve(root, "/guide/"),
+        resolve(root, "/guide/"),
         Some(nested.resolve("index.html").toRealPath()),
       )
     finally GeneratedDirectory.delete(root)
@@ -40,13 +40,13 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
   test("does not resolve traversal outside the site root"):
     val root = Files.createTempDirectory("doctrellis-handler")
     try
-      assertEquals(StaticSiteHandler.resolve(root, "/../secret.txt"), None)
+      assertEquals(resolve(root, "/../secret.txt"), None)
       assertEquals(
-        StaticSiteHandler.resolve(root, "/%2e%2e/secret.txt"),
+        resolve(root, "/%2e%2e/secret.txt"),
         None,
       )
-      assertEquals(StaticSiteHandler.resolve(root, "/%zz"), None)
-      assertEquals(StaticSiteHandler.resolve(root, "/%00"), None)
+      assertEquals(resolve(root, "/%zz"), None)
+      assertEquals(resolve(root, "/%00"), None)
 
       val nulExchange = BlockingExchange(
         CountDownLatch(0),
@@ -68,14 +68,14 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       Files.writeString(root.resolve("%2B.html"), "decoded once")
 
       assertEquals(
-        StaticSiteHandler.resolve(root, "/C++.html"),
+        resolve(root, "/C++.html"),
         Some(literalPlus.toRealPath()),
       )
       assertEquals(
-        StaticSiteHandler.resolve(root, "/C%2B%2B%20guide.html"),
+        resolve(root, "/C%2B%2B%20guide.html"),
         Some(plusAndSpace.toRealPath()),
       )
-      assertEquals(StaticSiteHandler.resolve(root, "/%c3%28"), None)
+      assertEquals(resolve(root, "/%c3%28"), None)
 
       val plusExchange = BlockingExchange(
         CountDownLatch(0),
@@ -94,12 +94,32 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       assertEquals(singleDecodeExchange.getResponseCode, 200)
     finally GeneratedDirectory.delete(root)
 
+  test("bounds raw path decoding before accumulating decoded content"):
+    val maximum = StaticSiteHandler.MaximumRequestPathCharacters
+    val root    = Files.createTempDirectory("doctrellis-handler-long-path")
+    try
+      assertEquals(
+        StaticSiteHandler.decode("/" + ("a" * (maximum - 1))).map(_.length),
+        Some(maximum),
+      )
+      val oversized = "/" + ("a" * maximum)
+      assertEquals(StaticSiteHandler.decode(oversized), None)
+
+      val exchange = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create(oversized),
+      )
+      StaticSiteHandler(root).handle(exchange)
+      assertEquals(exchange.getResponseCode, 404)
+    finally GeneratedDirectory.delete(root)
+
   test("does not follow site symlinks outside the root"):
     val root    = Files.createTempDirectory("doctrellis-handler")
     val outside = Files.createTempFile("doctrellis-secret", ".txt")
     try
       Files.createSymbolicLink(root.resolve("secret.txt"), outside)
-      assertEquals(StaticSiteHandler.resolve(root, "/secret.txt"), None)
+      assertEquals(resolve(root, "/secret.txt"), None)
     finally
       GeneratedDirectory.delete(root)
       Files.deleteIfExists(outside): Unit
@@ -218,6 +238,24 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       assert(!html.contains("sandbox=\"allow-scripts"))
       assert(!StaticSiteHandler.WebviewBridgeScript.contains("\"*\""))
       assert(!html.contains("site collision"))
+
+      val encoded = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create("/%2Edoctrellis/webview-bridge"),
+      )
+      StaticSiteHandler(root).handle(encoded)
+      assertEquals(encoded.getResponseCode, 200)
+      assertEquals(
+        encoded.getResponseHeaders.getFirst(
+          StaticSiteHandler.WebviewBridgeHeader,
+        ),
+        StaticSiteHandler.WebviewBridgeHeaderValue,
+      )
+      assert(
+        !String(encoded.responseBytes, java.nio.charset.StandardCharsets.UTF_8)
+          .contains("site collision"),
+      )
 
       val head = BlockingExchange(
         CountDownLatch(0),
@@ -551,6 +589,11 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       assertEquals(actual.getSuppressed.toList, List(closeFailure))
       assert(exchange.exchangeClosed)
     finally GeneratedDirectory.delete(root)
+
+  private def resolve(root: Path, requestPath: String): Option[Path] =
+    StaticSiteHandler
+      .decode(requestPath)
+      .flatMap(StaticSiteHandler.resolveDecoded(root, _))
 
   private final class BlockingExchange(
       started: CountDownLatch,

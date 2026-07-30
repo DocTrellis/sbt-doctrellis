@@ -15,7 +15,11 @@ import java.nio.channels.{
   ServerSocketChannel,
   SocketChannel,
 }
-import java.nio.charset.StandardCharsets
+import java.nio.charset.{
+  CharacterCodingException,
+  CodingErrorAction,
+  StandardCharsets,
+}
 import java.nio.file.{
   Files,
   InvalidPathException,
@@ -1058,7 +1062,10 @@ private[sbtplugin] final class PreviewFrameDecoder(maxFrameBytes: Int):
             raw.length - 1
           else raw.length
           if length == 0 then error = Some("IPC frame must not be empty")
-          else frames += String(raw, 0, length, StandardCharsets.UTF_8)
+          else
+            decodeUtf8(raw, length) match
+              case Right(frame)  => frames += frame
+              case Left(problem) => error = Some(problem)
         else
           pending.write(byte.toInt)
           val pendingBytes                  = pending.size()
@@ -1068,6 +1075,20 @@ private[sbtplugin] final class PreviewFrameDecoder(maxFrameBytes: Int):
             error = Some(s"IPC frame exceeds $maxFrameBytes bytes")
         index += 1
       error.toLeft(frames.result())
+
+  private def decodeUtf8(
+      bytes: Array[Byte],
+      length: Int,
+  ): Either[String, String] =
+    try
+      val decoder = StandardCharsets.UTF_8
+        .newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      Right(decoder.decode(ByteBuffer.wrap(bytes, 0, length)).toString)
+    catch
+      case _: CharacterCodingException =>
+        Left("IPC frame must contain valid UTF-8")
 
 private[sbtplugin] final class PreviewFrameWriter(
     output: java.io.OutputStream,
@@ -1272,12 +1293,16 @@ private[sbtplugin] object PreviewControlProtocol:
     ) + "\n"
 
   def error(code: String, message: String, requestId: String): String =
+    val encodedCode =
+      Option(code).filter(_.nonEmpty).getOrElse("internal")
+    val encodedMessage =
+      Option(message).filter(_.nonEmpty).getOrElse("unspecified IPC error")
     response(
       kind = "error",
-      requestId = requestId,
+      requestId = Option(requestId).getOrElse(""),
       extra = Vector(
-        "code"    -> PreviewControlJson.quoted(code),
-        "message" -> PreviewControlJson.quoted(message),
+        "code"    -> PreviewControlJson.quoted(encodedCode),
+        "message" -> PreviewControlJson.quoted(encodedMessage),
       ),
     )
 

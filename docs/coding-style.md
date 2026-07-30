@@ -20,11 +20,25 @@ build definitions, and supporting scripts.
 - `.scalafix.conf` is the source of truth for import organization.
 - The accepted ADRs under `docs/adr/` are the source of truth for architectural
   decisions.
-- This guide and the base guide cover design and review choices that automated
-  tools cannot enforce.
+- This guide, the base guide, and the specialized guides linked from this guide
+  cover design and review choices that automated tools cannot enforce.
 
 When these sources appear to disagree, do not work around an automated check.
 Clarify the rule or update the relevant decision explicitly.
+
+ADR headers record `Status` and the original `Date`. Add `Updated` for a later
+substantive factual or editorial revision that does not change the decision.
+Use `Amends`/`Amended by` when a later decision changes an earlier one,
+`Extends`/`Extended by` when it adds compatible scope, and `Related` for a
+non-changing contextual link. Record every relation in both ADRs: pair
+`Amends` with `Amended by`, pair `Extends` with `Extended by`, and repeat
+`Related` on both sides. Put explanations in the ADR body rather than in the
+relation field.
+
+A body reference requires a header relation when the current decision depends
+on another ADR's operative behavior or constrains its scope. A citation that
+only supplies background without making the other decision part of the current
+contract does not.
 
 ## Functional architecture in DocTrellis
 
@@ -106,6 +120,36 @@ boundaries:
 - a Node or VS Code callback being transferred into the selected `IO` runtime.
 
 Keep these operations out of the domain and application modules.
+
+## Structured HTTP APIs
+
+For a structured request/response HTTP API owned on both its Scala server and
+client sides, follow the
+[Tapir HTTP Contract Guide](tapir-http-contracts.md) and
+[ADR 0009](adr/0009-tapir-armeria-http-api.md). Shared Tapir endpoints are the
+contract source of truth, the server uses the Armeria Cats Effect interpreter,
+and JVM clients use the sttp v4 client interpreter with an Armeria backend. The
+Tapir guide is the specialized source of truth for that stack's capability,
+lifecycle, Unix-domain-socket operating, and verification rules.
+
+DocTrellis applies that stack only to jointly owned structured APIs. It does
+not apply to:
+
+- static documentation serving by the sbt plugin;
+- a single-purpose local health, callback, or bridge endpoint; or
+- the non-HTTP `doctrellis-preview-v1` control protocol.
+
+The preview server remains the JDK `HttpServer`. The control channel remains
+newline-delimited JSON over a Unix domain socket or Windows loopback TCP under
+ADR 0005. Do not add Armeria to the sbt plugin merely to replace either
+boundary.
+
+ADR 0009 records the stack selection. Replacing an existing transport,
+selecting another server or JVM client interpreter, or adding a WebSocket
+exception requires an ADR that supersedes or narrowly amends that decision.
+The Tapir guide's Unix-domain-socket checklist applies only to a future
+JVM-to-JVM local HTTP API approved by such a decision, not to the current
+control protocol.
 
 ## Scala.js and VS Code boundaries
 
