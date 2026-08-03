@@ -31,43 +31,102 @@ Use this order when two style rules compete:
 Significant indentation often makes Scala 3 code shorter, but reducing the
 line count must never hide lifecycle behavior, error handling, or ownership.
 
-## Principle of Least Power
+## Functional architecture: algebra, program, and interpreter
 
-Choose the least expressive mechanism that fully represents the requirement:
+This guide uses a tagless-final style with compile-time dependencies directed
+toward domain concepts. Domain code makes deterministic decisions without
+performing side effects. Algebras describe external capabilities in an abstract
+`F[_]`, programs compose those capabilities, and interpreters connect them to
+external systems and mutable platform state. The outer composition root selects
+the concrete effect and wires the parts together.
 
-- Prefer immutable `val` bindings to mutable state.
-- Prefer a pure function to an effectful function.
-- Prefer an abstract `F[_]` with the smallest required capability constraint
-  to concrete `IO` in programs and algebras.
-- Prefer a small record of algebra operations to a deep trait hierarchy.
-- Prefer an opaque type and a smart constructor to a broadly constructible
-  wrapper.
-- Prefer an enum or a sealed error hierarchy to strings and booleans that
-  encode states indirectly.
-- Prefer direct process execution with an argument vector to shell command
-  construction.
-- Prefer a hand-written platform binding containing only used members to a
-  generated binding for an entire API.
-- Prefer a local value or helper to a new public abstraction used only once.
+```text
+compile-time dependency direction
 
-Treat every type class constraint as a capability grant. Add only the weakest
-constraint needed by the implementation, and do not require `Async` merely for
-convenience when `Functor`, `MonadThrow`, `MonadCancelThrow`, `Temporal`,
-`Concurrent`, or `Sync` is sufficient. Effect polymorphism is primarily a way
-to restrict what inner code can do; testability is a useful consequence.
+composition root
+  |-> program -> algebra -> domain
+  `-> interpreters
+        |-> algebra
+        |-> domain
+        `-> platform APIs
+```
 
-Macros, reflection, unchecked casts, and global registries grant much broader
-power and require a concrete justification at a platform boundary.
+This vocabulary describes roles rather than requiring one package, trait, or
+type class per role:
+
+- **Domain** owns immutable state, pure and referentially transparent rules, and
+  values whose invariants are established at boundaries (see
+  [Parse, do not validate](#parse-do-not-validate)). It does not mention `F[_]`
+  or platform types. Domain rules do not perform I/O, observe the clock, obtain
+  randomness, inspect the environment, mutate shared state, log, or throw
+  exceptions.
+- **Algebra** describes the smallest capabilities a program requires in terms
+  of domain inputs and outputs. A small record of functions such as
+  `ServiceAlgebra[F]` is an algebra; do not introduce a trait or type class when
+  a record is sufficient.
+- **Program** implements use cases and lifecycle orchestration using only
+  domain values, algebras, and the weakest effect capabilities it needs. It
+  remains polymorphic in `F[_]`, must not select `IO` for itself, and must not
+  perform untracked side effects.
+- **Interpreter** implements an algebra using an external system. It translates
+  platform values at the boundary and suspends side effects in `F[_]` so neither
+  platform representations nor untracked effects escape into the program or
+  domain.
+- **Composition root** acquires shared resources, selects the concrete effect,
+  constructs interpreters, and supplies them to programs.
+
+In this guide, an *interpreter* is a production or test implementation of an
+algebra; `IO` and `SyncIO` are concrete effect types, not interpreters.
+
+Apply these architecture and dependency rules:
+
+- Prefer `val` bindings and immutable collections throughout. Keep domain data
+  and state immutable, and do not expose mutable cells, collections, or
+  platform state from the domain.
+- Keep every calculation that depends only on domain inputs pure. Do not lift a
+  deterministic `A => B` into `F[_]` merely for architectural uniformity.
+- Represent every capability that observes or changes the external world as an
+  algebra operation returning `F[_]`, or as a generic effect type class
+  capability such as `Temporal` when it is not domain-specific.
+- Programs describe and compose effects without executing them. Interpreters
+  implement domain-specific capabilities, concrete effect runtimes implement
+  generic capabilities, and outer runtime boundaries execute the composed
+  effect.
+- Make state changes that are observable across operations explicit in `F[_]`.
+  Manage them with an effect primitive such as `Ref[F, A]`, or delegate them to
+  an algebra whose interpreter owns the mutable platform state.
+- A locally encapsulated `var` may be an implementation detail only when it
+  cannot escape, cannot be observed independently, and does not change the
+  enclosing function's referentially transparent behavior. Prefer an immutable
+  implementation when it remains clear and practical.
+- Programs may depend on algebras and the domain; interpreters may depend on
+  algebras, the domain, and their platform APIs.
+- Inner modules must not import outer-module packages.
+- Algebra operations must accept and return parsed domain values rather than
+  raw platform representations.
+- Keep each algebra no more powerful than the program that consumes it. Split
+  unrelated capabilities when doing so makes ownership or reuse clearer, but
+  do not split a cohesive record merely to create more abstractions.
+- Tests should supply controlled algebra functions or in-memory interpreters;
+  they should not require changes to program logic.
+- Domain code must remain deterministic and independently testable.
 
 ## Parse, do not validate
 
-Untrusted values must be converted into domain values at the boundary. Do not
-check a raw value and continue passing the same raw type through the system.
+Untrusted values must be converted into domain values at the architectural
+boundary. Do not check a raw value and continue passing the same raw type
+through the system.
 
-Parsing allows code inside the boundary to be composed from total functions.
-Prefer strengthening the input type to weakening the result type. When parsing
-can establish a guarantee, encode it in the domain value so an inner function
-can return an ordinary value instead of repeating the check or propagating an
+Write parsers and domain functions as total functions wherever possible. A
+total function defines an outcome for every value admitted by its input type;
+in this guide, that means it does not throw, use a partial operation, or rely on
+a non-exhaustive match. Totality does not mean that every operation must
+succeed.
+
+Parsing makes total functions practical inside the boundary. Prefer
+strengthening the input type to weakening the result type. When parsing can
+establish a guarantee, encode it in the domain value so an inner function can
+return an ordinary value instead of repeating the check or propagating an
 unnecessary `Option` or `Either`.
 
 Prefer:
@@ -107,6 +166,10 @@ Apply these rules consistently:
 - Use `Option`, `Either`, or a domain-specific result ADT inside the boundary
   only when absence, rejection, or failure remains a legitimate outcome for an
   already parsed domain input.
+- Avoid partial operations, including `Option.get`, `Try.get`, unsafe either
+  projections, unchecked casts in inner modules, and non-exhaustive matches.
+  Refine the input type or handle every case explicitly instead. Automated lint
+  may enforce part of this rule; review must cover the rest.
 - Do not invent fallback values or rely on "impossible" exceptions merely to
   make a function appear total. Instead, refine the input type when it can rule
   out the case.
@@ -117,61 +180,37 @@ Apply these rules consistently:
 
 A boundary may have more than one narrowing stage. For example, decoding may
 produce a command template, while filesystem resolution produces a command
-that is safe to execute. Each stage must narrow the possible states.
+that is safe to execute. Each stage must narrow the possible states. After the
+final narrowing stage, build inner logic from the resulting domain values and
+pure, total domain functions wherever possible.
 
-## Functional architecture: algebra, program, and interpreter
+## Principle of Least Power
 
-This guide uses a tagless-final style with compile-time dependencies directed
-toward domain concepts. Algebras describe capabilities in an abstract `F[_]`,
-programs compose those capabilities, and interpreters connect them to external
-systems. The outer composition root selects the concrete effect and wires the
-parts together.
+Within the architectural roles and boundaries above, choose the least
+expressive mechanism that fully represents the requirement:
 
-```text
-compile-time dependency direction
+- Prefer a pure function to an effectful function.
+- Prefer an abstract `F[_]` with the smallest required capability constraint
+  to concrete `IO` in programs and algebras.
+- Prefer a small record of algebra operations to a deep trait hierarchy.
+- Prefer an opaque type and a smart constructor to a broadly constructible
+  wrapper.
+- Prefer an enum or a sealed error hierarchy to strings and booleans that
+  encode states indirectly.
+- Prefer direct process execution with an argument vector to shell command
+  construction.
+- Prefer a hand-written platform binding containing only used members to a
+  generated binding for an entire API.
+- Prefer a local value or helper to a new public abstraction used only once.
 
-composition root
-  |-> program -> algebra -> domain
-  `-> interpreters
-        |-> algebra
-        |-> domain
-        `-> platform APIs
-```
+Treat every type class constraint as a capability grant. Add only the weakest
+constraint needed by the implementation, and do not require `Async` merely for
+convenience when `Functor`, `MonadThrow`, `MonadCancelThrow`, `Temporal`,
+`Concurrent`, or `Sync` is sufficient. Effect polymorphism is primarily a way
+to restrict what inner code can do; testability is a useful consequence.
 
-This vocabulary describes roles rather than requiring one package, trait, or
-type class per role:
-
-- **Domain** owns parsed values, state, and deterministic pure rules. It does
-  not mention `F[_]` or platform types.
-- **Algebra** describes the smallest capabilities a program requires in terms
-  of domain inputs and outputs. A small record of functions such as
-  `ServiceAlgebra[F]` is an algebra; do not introduce a trait or type class when
-  a record is sufficient.
-- **Program** implements use cases and lifecycle orchestration using only
-  domain values, algebras, and the weakest effect capabilities it needs. It
-  remains polymorphic in `F[_]` and must not select `IO` for itself.
-- **Interpreter** implements an algebra using an external system. It translates
-  platform values at the boundary so they do not escape into the program or
-  domain.
-- **Composition root** acquires shared resources, selects the concrete effect,
-  constructs interpreters, and supplies them to programs.
-
-In this guide, an *interpreter* is a production or test implementation of an
-algebra; `IO` and `SyncIO` are concrete effect types, not interpreters.
-
-Apply these dependency rules:
-
-- Programs may depend on algebras and the domain; interpreters may depend on
-  algebras, the domain, and their platform APIs.
-- Inner modules must not import outer-module packages.
-- Algebra operations must accept and return parsed domain values rather than
-  raw platform representations.
-- Keep each algebra no more powerful than the program that consumes it. Split
-  unrelated capabilities when doing so makes ownership or reuse clearer, but
-  do not split a cohesive record merely to create more abstractions.
-- Tests should supply controlled algebra functions or in-memory interpreters;
-  they should not require changes to program logic.
-- Domain code must remain deterministic and independently testable.
+Macros, reflection, unchecked casts, and global registries grant much broader
+power and require a concrete justification at a platform boundary.
 
 ## Scala 3 syntax and formatting
 
@@ -274,10 +313,6 @@ Enforce this policy with the project's configured import-organization tool.
 
 Do not use `null` in Scala code. At foreign-platform boundaries, test null-like
 values explicitly and translate them immediately into Scala values.
-
-Avoid partial operations, including `Option.get`, `Try.get`, unsafe either
-projections, unchecked casts in inner modules, and non-exhaustive matches.
-Automated lint may enforce part of this rule; review must cover the rest.
 
 ## Cats Effect and effect polymorphism
 
