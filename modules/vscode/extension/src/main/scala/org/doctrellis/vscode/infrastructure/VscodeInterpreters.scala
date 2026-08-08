@@ -7,7 +7,7 @@ import cats.effect.{IO, Resource}
 import cats.effect.std.{Dispatcher, Supervisor}
 import cats.syntax.all.*
 
-import org.doctrellis.vscode.application.PreviewService
+import org.doctrellis.vscode.application.{PreviewService, ThrowableMessage}
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
 
@@ -57,7 +57,10 @@ private[infrastructure] object VscodePreferences:
   def load(workspace: Workspace): IO[PreviewPolicy] =
     IO.delay:
       val settings =
-        VSWorkspace.getConfiguration("doctrellis", VSUri.parse(workspace.uri))
+        VSWorkspace.getConfiguration(
+          "doctrellis",
+          VSUri.parse(workspace.key.value),
+        )
       val open     = settings.get("openPreviewWhenReady", true)
       val interval = settings.get("pollIntervalMs", 500)
       VscodePreferencesParser
@@ -105,36 +108,109 @@ private[infrastructure] object VscodePreferencesParser:
       )
 
 private[infrastructure] object WorkspaceSelection:
-  def choose: IO[Option[Workspace]] =
+  def choose(output: VscodeOutput): IO[Option[Workspace]] =
     IO.delay(
       VSWorkspace.workspaceFolders.toOption
         .map(_.toVector)
         .getOrElse(Vector.empty),
-    ).flatMap:
-      case Vector() =>
-        IO.fromPromise(
-          IO.delay(
-            VSWindow
-              .showErrorMessage("DocTrellis requires an open workspace folder."),
-          ),
-        ).as(None)
-      case Vector(folder) => IO.pure(Some(fromFolder(folder)))
-      case folders        =>
-        val candidates       = WorkspaceOptions.from(folders.map(fromFolder))
-        val labels           = candidates.map(_._1)
-        val quickPickOptions = js.Dynamic.literal(
-          placeHolder = "Select the workspace folder for DocTrellis preview",
-          title = "DocTrellis",
-        )
-        IO.fromPromise(
-          IO.delay(VSWindow.showQuickPick(labels.toJSArray, quickPickOptions)),
-        ).map: selected =>
-          selected.toOption.flatMap: label =>
-            WorkspaceOptions.select(candidates, label)
+    ).map(WorkspaceFolderLogic.parse)
+      .flatMap: parsed =>
+        parsed.problems.toList
+          .traverse_(problem =>
+            output
+              .append(s"Skipped ${problem.message}\n")
+              .handleError(_ => ()),
+          )
+          .as(WorkspaceFolderLogic.decide(parsed))
+      .flatMap:
+        case WorkspaceSelectionDecision.NoFolders =>
+          output
+            .report("An open workspace folder is required.")
+            .handleError(_ => ())
+            .as(None)
+        case WorkspaceSelectionDecision.NoValidFolders =>
+          output
+            .report("None of the open workspace folders could be used.")
+            .handleError(_ => ())
+            .as(None)
+        case WorkspaceSelectionDecision.Selected(workspace) =>
+          IO.pure(Some(workspace))
+        case WorkspaceSelectionDecision.Pick(workspaces) =>
+          val candidates       = WorkspaceOptions.from(workspaces)
+          val labels           = candidates.map(_._1)
+          val quickPickOptions = js.Dynamic.literal(
+            placeHolder = "Select the workspace folder for DocTrellis preview",
+            title = "DocTrellis",
+          )
+          IO.fromPromise(
+            IO.delay(VSWindow.showQuickPick(labels.toJSArray, quickPickOptions)),
+          ).map: selected =>
+            selected.toOption.flatMap: label =>
+              WorkspaceOptions.select(candidates, label)
 
-  def fromFolder(folder: WorkspaceFolder): Workspace =
+private[infrastructure] object WorkspaceFolderLogic:
+  def parse(folders: Vector[WorkspaceFolder]): ParsedWorkspaces =
+    val (problems, workspaces) = folders.partitionMap(fromFolder)
+    ParsedWorkspaces(
+      problems = problems,
+      workspaces = workspaces,
+    )
+
+  def decide(parsed: ParsedWorkspaces): WorkspaceSelectionDecision =
+    val folderCount = parsed.problems.size + parsed.workspaces.size
+    (folderCount, parsed.workspaces) match
+      case (0, _)               => WorkspaceSelectionDecision.NoFolders
+      case (_, Vector())        => WorkspaceSelectionDecision.NoValidFolders
+      case (1, Vector(current)) =>
+        WorkspaceSelectionDecision.Selected(current)
+      case (_, candidates) => WorkspaceSelectionDecision.Pick(candidates)
+
+  def fromFolder(
+      folder: WorkspaceFolder,
+  ): Either[ConfigProblem, Workspace] =
     val uri = folder.uri.toString()
-    Workspace(uri, folder.name, folder.uri.fsPath, uri)
+    WorkspaceId
+      .parse(uri)
+      .leftMap:
+        case ConfigProblem.InvalidValue(_, detail) =>
+          ConfigProblem.InvalidValue(
+            s"workspace folder '${folder.name}' URI",
+            detail,
+          )
+        case problem => problem
+      .map: key =>
+        Workspace(
+          key = key,
+          name = folder.name,
+          root = folder.uri.fsPath,
+        )
+
+private[infrastructure] final case class ParsedWorkspaces(
+    problems: Vector[ConfigProblem],
+    workspaces: Vector[Workspace],
+)
+
+private[infrastructure] enum WorkspaceSelectionDecision:
+  case NoFolders, NoValidFolders
+  case Selected(workspace: Workspace)
+  case Pick(workspaces: Vector[Workspace])
+
+private[infrastructure] object WorkspaceCleanup:
+  def stopRemoved(
+      folders: List[WorkspaceFolder],
+      stop: Workspace => IO[Unit],
+      onError: Throwable => IO[Unit],
+  ): IO[Unit] =
+    folders.traverse_(folder =>
+      IO.delay(WorkspaceFolderLogic.fromFolder(folder))
+        .flatMap(parsed =>
+          IO.fromEither(
+            parsed.leftMap(problem => IllegalArgumentException(problem.message)),
+          ),
+        )
+        .flatMap(stop)
+        .handleErrorWith(error => onError(error).handleError(_ => ())),
+    )
 
 private[infrastructure] object CommandBindings:
   def resource(
@@ -195,7 +271,8 @@ private[infrastructure] object CommandBindings:
     val callback: js.Function0[js.Any] = () =>
       dispatcher
         .unsafeToPromise(
-          trusted(requireTrust) *> WorkspaceSelection.choose
+          trusted(requireTrust) *> WorkspaceSelection
+            .choose(output)
             .flatMap(_.traverse_(action))
             .handleErrorWith(error => report(output, error)),
         )
@@ -221,11 +298,11 @@ private[infrastructure] object CommandBindings:
       output: VscodeOutput,
   ): Resource[IO, Unit] =
     val listener: js.Function1[WorkspaceFoldersChangeEvent, Unit] = event =>
-      val stop = event.removed.toList
-        .traverse_(folder =>
-          service.stopSilently(WorkspaceSelection.fromFolder(folder)),
-        )
-        .handleErrorWith(error => report(output, error))
+      val stop = WorkspaceCleanup.stopRemoved(
+        folders = event.removed.toList,
+        stop = service.stopSilently,
+        onError = error => log(output, error),
+      )
       dispatcher.unsafeRunAndForget(stop)
     disposable(
       context,
@@ -252,7 +329,10 @@ private[infrastructure] object CommandBindings:
 
   private def report(output: VscodeOutput, error: Throwable): IO[Unit] =
     output
-      .report(
-        Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString),
-      )
+      .report(ThrowableMessage.from(error))
+      .handleError(_ => ())
+
+  private def log(output: VscodeOutput, error: Throwable): IO[Unit] =
+    output
+      .append(s"ERROR: ${ThrowableMessage.from(error)}\n")
       .handleError(_ => ())

@@ -8,7 +8,7 @@ import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
 
-import org.doctrellis.vscode.application.RunningProcess
+import org.doctrellis.vscode.application.{RunningProcess, ThrowableMessage}
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
 
@@ -71,8 +71,8 @@ private[infrastructure] object WorkspaceChannel:
         NodeFsPromises.realpath(workspace.root),
         "could not canonicalize the workspace for its IPC endpoint",
       )
-      user          = NodeOs.userInfo()
-      platform      = ProcessPlatform.parse(NodeRuntime.platform)
+      user = NodeOs.userInfo()
+      platform <- IO.fromEither(ProcessPlatform.parse(NodeRuntime.platform))
       userHash      = digest(user.username).take(12)
       workspaceHash = digest(canonical).take(24)
       runtime       =
@@ -743,11 +743,11 @@ private[infrastructure] final class WorkspaceChannelConnection private (
                   requestId = requestId,
                 ),
               ),
-            ).void *> awaitExit.flatMap: exit =>
-              exit.error match
-                case Some(problem) =>
-                  IO.raiseError(IllegalStateException(problem))
-                case None => IO.unit
+            ).void *> awaitExit.flatMap:
+              case ProcessExit.Failed(problem, _) =>
+                IO.raiseError(IllegalStateException(problem))
+              case ProcessExit.Terminated(_) | ProcessExit.Unknown =>
+                IO.unit
 
   def close: IO[Unit] =
     closed
@@ -770,10 +770,9 @@ private[infrastructure] final class WorkspaceChannelConnection private (
               terminalResult
                 .complete(
                   Right(
-                    ProcessExit(
-                      code = None,
-                      signal = None,
-                      error = Some(problem.getMessage),
+                    ProcessExit.Failed(
+                      ThrowableMessage.from(problem),
+                      termination = None,
                     ),
                   ),
                 )
@@ -907,10 +906,8 @@ private[infrastructure] object WorkspaceChannelConnection:
                       terminal
                         .complete(
                           Right(
-                            ProcessExit(
-                              code = Some(0),
-                              signal = None,
-                              error = None,
+                            ProcessExit.Terminated(
+                              ProcessTermination.Code(0),
                             ),
                           ),
                         )
@@ -956,11 +953,7 @@ private[infrastructure] object WorkspaceChannelConnection:
                       terminal
                         .complete(
                           Right(
-                            ProcessExit(
-                              code = None,
-                              signal = None,
-                              error = Some(problem),
-                            ),
+                            ProcessExit.Failed(problem, termination = None),
                           ),
                         )
                         .void,

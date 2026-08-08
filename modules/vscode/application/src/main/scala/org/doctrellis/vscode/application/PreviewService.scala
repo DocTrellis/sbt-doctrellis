@@ -107,7 +107,7 @@ private final case class PreviewServiceClosed()
 
 final class PreviewService[F[_]] private (
     algebra: PreviewAlgebra[F],
-    sessions: Ref[F, Map[String, PreviewSession[F]]],
+    sessions: Ref[F, Map[WorkspaceId, PreviewSession[F]]],
     workspaceMutexes: WorkspaceMutexes[F],
     lifecycle: Mutex[F],
     closing: Ref[F, Boolean],
@@ -473,11 +473,7 @@ final class PreviewService[F[_]] private (
         _.get(workspace.key) match
           case Some(actual) if actual.eq(session) =>
             session.status
-              .modify:
-                case PreviewStatus.Ready(url, _) =>
-                  val updated = PreviewStatus.Ready(url, Some(revision))
-                  updated -> Some(updated)
-                case current => current -> None
+              .modify(PreviewStatusTransition.refresh(_, revision))
           case _ => F.pure(None)
 
     accepted.flatMap:
@@ -540,16 +536,21 @@ final class PreviewService[F[_]] private (
       sessions.get.flatMap:
         _.get(workspace.key) match
           case Some(actual) if actual.eq(session) =>
-            val display = session.status.get.flatMap:
-              case PreviewStatus.Stopping =>
-                updateView(workspace, PreviewViewState.Stopped).as(false)
-              case _ =>
-                session.status.set(PreviewStatus.Terminal(terminal)) *>
+            val display = session.status
+              .modify(PreviewStatusTransition.terminal(_, terminal))
+              .flatMap:
+                case TerminalAcceptance.Rejected =>
+                  updateView(workspace, PreviewViewState.Stopped).as(false)
+                case TerminalAcceptance.Accepted =>
                   updateView(workspace, terminal.viewState) *>
-                  session.status.get.flatMap:
-                    case PreviewStatus.Stopping =>
-                      updateView(workspace, PreviewViewState.Stopped).as(false)
-                    case _ => F.pure(true)
+                    session.status.get.flatMap:
+                      case PreviewStatus.Stopping =>
+                        updateView(workspace, PreviewViewState.Stopped).as(
+                          false,
+                        )
+                      case PreviewStatus.Starting | PreviewStatus.Ready(_, _) |
+                          PreviewStatus.Terminal(_) =>
+                        F.pure(true)
             display
               .map(Some(_))
           case _ => F.pure(None)
@@ -593,7 +594,7 @@ final class PreviewService[F[_]] private (
       case PreviewReadiness.Announced(awaitUrl) => awaitUrl
 
   private def removeExact(
-      key: String,
+      key: WorkspaceId,
       expected: PreviewSession[F],
   ): F[Unit] =
     sessions.update: current =>
@@ -601,13 +602,15 @@ final class PreviewService[F[_]] private (
         case Some(actual) if actual.eq(expected) => current.removed(key)
         case _                                   => current
 
-  private def selectForStop(key: String): F[Option[PreviewSession[F]]] =
+  private def selectForStop(
+      key: WorkspaceId,
+  ): F[Option[PreviewSession[F]]] =
     workspaceMutexes.surround(key):
       sessions.get.flatMap:
         _.get(key).traverse: session =>
-          session.status.set(PreviewStatus.Stopping).as(session)
+          session.status.update(PreviewStatusTransition.stopping).as(session)
 
-  private def selectForStopOrCancel(key: String): F[StopLookup[F]] =
+  private def selectForStopOrCancel(key: WorkspaceId): F[StopLookup[F]] =
     def loop(observedActivity: Boolean): F[StopLookup[F]] =
       sessions.get.flatMap: currentSessions =>
         val observed = observedActivity || currentSessions.contains(key)
@@ -640,11 +643,13 @@ final class PreviewService[F[_]] private (
         closing.set(true) *> (sessions.get, launches.get).tupled
       .flatMap: (selected, activeLaunches) =>
         selected.values.toList
-          .parTraverse_(session => session.status.set(PreviewStatus.Stopping))
+          .parTraverse_(session =>
+            session.status.update(PreviewStatusTransition.stopping),
+          )
           .as(StopSelection(selected.values.toList, activeLaunches.toList))
 
   private def removeExactLocked(
-      key: String,
+      key: WorkspaceId,
       expected: PreviewSession[F],
   ): F[Unit] =
     workspaceMutexes.surround(key)(removeExact(key, expected))
@@ -766,7 +771,7 @@ final class PreviewService[F[_]] private (
       .handleErrorWith(error => report(message(error)))
 
   private def message(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
+    ThrowableMessage.from(error)
 
 private final case class PreviewSession[F[_]](
     workspace: Workspace,
@@ -801,24 +806,6 @@ private final case class PreviewSession[F[_]](
   def awaitClosed: F[Unit] = closer.awaitClosed
 
   def isClosed: F[Boolean] = closer.isClosed
-
-private[application] enum ReadyAcceptance:
-  case Accepted, Rejected
-
-private[application] object PreviewStatusTransition:
-  def ready(
-      current: PreviewStatus,
-      url: PreviewUrl,
-  ): (PreviewStatus, ReadyAcceptance) =
-    current match
-      case PreviewStatus.Starting =>
-        PreviewStatus.Ready(url, None) -> ReadyAcceptance.Accepted
-      case current @ PreviewStatus.Ready(_, _) =>
-        current -> ReadyAcceptance.Accepted
-      case PreviewStatus.Stopping =>
-        PreviewStatus.Stopping -> ReadyAcceptance.Rejected
-      case current @ PreviewStatus.Terminal(_) =>
-        current -> ReadyAcceptance.Rejected
 
 private[application] object PreviewReadyGate:
   def accept[F[_]](
@@ -947,7 +934,7 @@ private final case class StopSelection[F[_]](
 )
 
 private final case class PendingLaunch[F[_]](
-    workspaceKey: String,
+    workspaceKey: WorkspaceId,
     workspaceName: String,
     cancel: Deferred[F, Throwable],
     completed: Deferred[F, Unit],
@@ -959,12 +946,12 @@ private enum StopLookup[F[_]]:
   case Inactive()
 
 private final class WorkspaceMutexes[F[_]](
-    locks: Ref[F, Map[String, Mutex[F]]],
+    locks: Ref[F, Map[WorkspaceId, Mutex[F]]],
 )(using F: Temporal[F]):
-  def surround[A](key: String)(action: F[A]): F[A] =
+  def surround[A](key: WorkspaceId)(action: F[A]): F[A] =
     mutex(key).flatMap(_.lock.surround(action))
 
-  private def mutex(key: String): F[Mutex[F]] =
+  private def mutex(key: WorkspaceId): F[Mutex[F]] =
     locks.get.flatMap:
       _.get(key) match
         case Some(existing) => F.pure(existing)
@@ -978,7 +965,7 @@ private final class WorkspaceMutexes[F[_]](
 private object WorkspaceMutexes:
   def create[F[_]](using F: Temporal[F]): F[WorkspaceMutexes[F]] =
     Ref
-      .of[F, Map[String, Mutex[F]]](Map.empty)
+      .of[F, Map[WorkspaceId, Mutex[F]]](Map.empty)
       .map(WorkspaceMutexes(_))
 
 object PreviewService:
@@ -988,7 +975,7 @@ object PreviewService:
     Supervisor[F](await = false).flatMap: supervisor =>
       for
         sessions <- Resource.eval(
-          Ref.of[F, Map[String, PreviewSession[F]]](Map.empty),
+          Ref.of[F, Map[WorkspaceId, PreviewSession[F]]](Map.empty),
         )
         workspaceMutexes <- Resource.eval(WorkspaceMutexes.create[F])
         lifecycle        <- Resource.eval(Mutex[F])

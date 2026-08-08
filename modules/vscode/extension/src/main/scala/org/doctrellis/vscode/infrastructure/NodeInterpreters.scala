@@ -15,9 +15,19 @@ import org.doctrellis.vscode.infrastructure.facade.*
 private[infrastructure] enum ProcessPlatform:
   case Posix, Windows
 
+private[infrastructure] final case class UnsupportedProcessPlatform(
+    value: String,
+) extends IllegalStateException(s"Unsupported Node process platform '$value'.")
+
 private[infrastructure] object ProcessPlatform:
-  def parse(value: String): ProcessPlatform =
-    if value == "win32" then ProcessPlatform.Windows else ProcessPlatform.Posix
+  def parse(
+      value: String,
+  ): Either[UnsupportedProcessPlatform, ProcessPlatform] = value match
+    case "win32" => Right(ProcessPlatform.Windows)
+    case "aix" | "android" | "cygwin" | "darwin" | "freebsd" | "haiku" |
+        "linux" | "netbsd" | "openbsd" | "sunos" =>
+      Right(ProcessPlatform.Posix)
+    case unsupported => Left(UnsupportedProcessPlatform(unsupported))
 
 private[infrastructure] object NodeError:
   def hasCode(error: Throwable, expected: String): Boolean =
@@ -127,9 +137,28 @@ private[infrastructure] object NodeProcess:
       workspaceName: String,
       environment: Map[String, String],
   ): IO[OwnedProcess] =
+    IO.delay(NodeRuntime.platform)
+      .flatMap(raw => IO.fromEither(ProcessPlatform.parse(raw)))
+      .flatMap: platform =>
+        spawnOnPlatform(
+          platform,
+          command,
+          dispatcher,
+          append,
+          workspaceName,
+          environment,
+        )
+
+  private def spawnOnPlatform(
+      platform: ProcessPlatform,
+      command: PreviewCommand,
+      dispatcher: Dispatcher[IO],
+      append: String => IO[Unit],
+      workspaceName: String,
+      environment: Map[String, String],
+  ): IO[OwnedProcess] =
     IO.delay:
-      val platform = ProcessPlatform.parse(NodeRuntime.platform)
-      val options  = js.Dynamic.literal(
+      val options = js.Dynamic.literal(
         cwd = command.workingDirectory.value,
         detached = platform == ProcessPlatform.Posix,
         shell = false,
@@ -185,7 +214,11 @@ private[infrastructure] object NodeProcess:
         val error: js.Function1[js.Any, Unit] =
           raw => processError = Some(errorMessage(raw))
         val close: js.Function2[js.Any, js.Any, Unit] = (code, signal) =>
-          val exit = ProcessExit(number(code), string(signal), processError)
+          val exit = ProcessExit.fromObservation(
+            code = number(code),
+            signal = string(signal),
+            error = processError,
+          )
           dispatcher.unsafeRunAndForget(closed.complete(exit).void)
 
         child.stdout.on("data", stdout): Unit
@@ -386,10 +419,9 @@ private[infrastructure] object ProcessClose:
         ).handleError(_ => ()) *>
           closed
             .complete(
-              ProcessExit(
-                code = None,
-                signal = None,
-                error = Some("close notification was not delivered"),
+              ProcessExit.Failed(
+                "close notification was not delivered",
+                termination = None,
               ),
             )
             .void

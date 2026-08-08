@@ -15,6 +15,9 @@ import org.doctrellis.vscode.infrastructure.facade.*
 class WorkspaceChannelSuite extends CatsEffectSuite:
   private val firstUrl  = right(PreviewUrl.parse("http://127.0.0.1:43123"))
   private val secondUrl = right(PreviewUrl.parse("http://127.0.0.1:43124"))
+  private val currentPlatform = ProcessPlatform
+    .parse(NodeRuntime.platform)
+    .fold(problem => fail(problem.getMessage), identity)
 
   test("hello opts into site events with a numeric atomic field"):
     assertEquals(
@@ -632,7 +635,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           assertEquals(result, Right(()))
           assertEquals(
             exit,
-            ProcessExit(code = Some(0), signal = None, error = None),
+            ProcessExit.Terminated(ProcessTermination.Code(0)),
           ),
       )(_.close)
 
@@ -769,7 +772,10 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           assertEquals(revisionResult, Right(None))
           assert(
             exitResult.exists(
-              _.error.contains("workspace IPC connection ended"),
+              _ == ProcessExit.Failed(
+                "workspace IPC connection ended",
+                termination = None,
+              ),
             ),
           ),
       )(_.close)
@@ -841,16 +847,14 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
   test("workspace endpoints are stable, distinct, short, and outside projects"):
     val root  = TestNodeRuntime.cwd()
     val first = Workspace(
-      key = "first",
+      key = right(WorkspaceId.parse("file:///first")),
       name = "first",
       root = root,
-      uri = "file://first",
     )
     val second = Workspace(
-      key = "second",
+      key = right(WorkspaceId.parse("file:///second")),
       name = "second",
       root = NodePath.join(root, "modules"),
-      uri = "file://second",
     )
     for
       firstEndpoint  <- WorkspaceChannel.endpoint(first)
@@ -859,8 +863,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
     yield
       assertEquals(firstEndpoint, repeated)
       assertNotEquals(firstEndpoint.workspaceHash, secondEndpoint.workspaceHash)
-      if ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Posix
-      then
+      if currentPlatform == ProcessPlatform.Posix then
         assert(
           NodeBuffer.Buffer.byteLength(
             s"${firstEndpoint.socketPrefix}${"f" * 16}.sock",
@@ -871,8 +874,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       assert(!secondEndpoint.runtimeDirectory.startsWith(second.root))
 
   test("runtime validation rejects symlinks and a different POSIX owner"):
-    if ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Windows
-    then IO.unit
+    if currentPlatform == ProcessPlatform.Windows then IO.unit
     else
       promise(
         TestNodeFsPromises.mkdtemp(

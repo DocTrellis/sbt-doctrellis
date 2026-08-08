@@ -14,9 +14,17 @@ import org.doctrellis.vscode.domain.*
 
 class WebviewPreviewSuite extends CatsEffectSuite:
   private val first =
-    Workspace("first", "First docs", "/first", "file:///first")
+    Workspace(
+      key = right(WorkspaceId.parse("file:///first")),
+      name = "First docs",
+      root = "/first",
+    )
   private val second =
-    Workspace("second", "Second docs", "/second", "file:///second")
+    Workspace(
+      key = right(WorkspaceId.parse("file:///second")),
+      name = "Second docs",
+      root = "/second",
+    )
 
   private def at[A](values: scala.collection.Seq[A], index: Int): A =
     values
@@ -884,7 +892,7 @@ class WebviewPreviewSuite extends CatsEffectSuite:
               )
               .start
             _ <- resolving.get
-            exit = ProcessExit(Some(1), None, None)
+            exit = ProcessExit.Terminated(ProcessTermination.Code(1))
             _ <- registry.update(first, PreviewViewState.Exited(exit))
             _ <- continue.complete(())
             _ <- open.joinWithNever

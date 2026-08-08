@@ -211,18 +211,76 @@ object PreviewPolicy:
   ): Either[ConfigProblem, PreviewPolicy] =
     PollInterval.parse(pollIntervalMs).map(PreviewPolicy(openWhenReady, _))
 
-final case class Workspace(key: String, name: String, root: String, uri: String)
+opaque type WorkspaceId = String
 
-final case class ProcessExit(
-    code: Option[Int],
-    signal: Option[String],
-    error: Option[String],
-):
-  def render: String =
-    error
-      .orElse(code.map(value => s"exit code $value"))
-      .orElse(signal.map(value => s"signal $value"))
-      .getOrElse("an unknown status")
+object WorkspaceId:
+  private val UriWithScheme = """[A-Za-z][A-Za-z0-9+.-]*:.*""".r
+
+  def parse(value: String): Either[ConfigProblem, WorkspaceId] =
+    val hasScheme = value match
+      case UriWithScheme() => true
+      case _               => false
+    val hasInvalidCharacter = value.exists(character =>
+      Character.isISOControl(character) || character.isWhitespace ||
+        character.isSpaceChar,
+    )
+    Either.cond(
+      hasScheme && !hasInvalidCharacter,
+      value,
+      ConfigProblem.InvalidValue(
+        "workspace.key",
+        "must have a URI scheme and contain neither whitespace nor control characters",
+      ),
+    )
+
+  extension (value: WorkspaceId) def value: String = value
+
+final case class Workspace(
+    key: WorkspaceId,
+    name: String,
+    root: String,
+)
+
+enum ProcessTermination:
+  case Code(value: Int)
+  case Signal(value: String)
+  case Ambiguous(code: Int, signal: String)
+
+  def render: String = this match
+    case Code(value)             => s"exit code $value"
+    case Signal(value)           => s"signal $value"
+    case Ambiguous(code, signal) =>
+      s"exit code $code and signal $signal"
+
+enum ProcessExit:
+  case Terminated(termination: ProcessTermination)
+  case Failed(reason: String, termination: Option[ProcessTermination])
+  case Unknown
+
+  def render: String = this match
+    case Terminated(termination)           => termination.render
+    case Failed(reason, Some(termination)) =>
+      s"$reason (${termination.render})"
+    case Failed(reason, None) => reason
+    case Unknown              => "an unknown status"
+
+object ProcessExit:
+  def fromObservation(
+      code: Option[Int],
+      signal: Option[String],
+      error: Option[String],
+  ): ProcessExit =
+    val termination = (code, signal) match
+      case (Some(value), None) => Some(ProcessTermination.Code(value))
+      case (None, Some(value)) => Some(ProcessTermination.Signal(value))
+      case (Some(exitCode), Some(exitSignal)) =>
+        Some(ProcessTermination.Ambiguous(exitCode, exitSignal))
+      case (None, None) => None
+
+    (error, termination) match
+      case (Some(reason), observed) => ProcessExit.Failed(reason, observed)
+      case (None, Some(observed))   => ProcessExit.Terminated(observed)
+      case (None, None)             => ProcessExit.Unknown
 
 enum PreviewViewState:
   case Starting
@@ -244,3 +302,53 @@ enum PreviewStatus:
   case Starting, Stopping
   case Ready(url: PreviewUrl, revision: Option[SiteRevision])
   case Terminal(value: PreviewTerminal)
+
+enum ReadyAcceptance:
+  case Accepted, Rejected
+
+enum TerminalAcceptance:
+  case Accepted, Rejected
+
+object PreviewStatusTransition:
+  def ready(
+      current: PreviewStatus,
+      url: PreviewUrl,
+  ): (PreviewStatus, ReadyAcceptance) =
+    current match
+      case PreviewStatus.Starting =>
+        PreviewStatus.Ready(url, None) -> ReadyAcceptance.Accepted
+      case current @ PreviewStatus.Ready(_, _) =>
+        current -> ReadyAcceptance.Accepted
+      case PreviewStatus.Stopping =>
+        PreviewStatus.Stopping -> ReadyAcceptance.Rejected
+      case current @ PreviewStatus.Terminal(_) =>
+        current -> ReadyAcceptance.Rejected
+
+  def refresh(
+      current: PreviewStatus,
+      revision: SiteRevision,
+  ): (PreviewStatus, Option[PreviewStatus]) =
+    current match
+      case PreviewStatus.Ready(url, _) =>
+        val updated = PreviewStatus.Ready(url, Some(revision))
+        updated -> Some(updated)
+      case current @ (PreviewStatus.Starting | PreviewStatus.Stopping |
+          PreviewStatus.Terminal(_)) =>
+        current -> None
+
+  def stopping(current: PreviewStatus): PreviewStatus =
+    current match
+      case PreviewStatus.Starting | PreviewStatus.Stopping |
+          PreviewStatus.Ready(_, _) | PreviewStatus.Terminal(_) =>
+        PreviewStatus.Stopping
+
+  def terminal(
+      current: PreviewStatus,
+      terminal: PreviewTerminal,
+  ): (PreviewStatus, TerminalAcceptance) =
+    current match
+      case PreviewStatus.Stopping =>
+        PreviewStatus.Stopping -> TerminalAcceptance.Rejected
+      case PreviewStatus.Starting | PreviewStatus.Ready(_, _) |
+          PreviewStatus.Terminal(_) =>
+        PreviewStatus.Terminal(terminal) -> TerminalAcceptance.Accepted

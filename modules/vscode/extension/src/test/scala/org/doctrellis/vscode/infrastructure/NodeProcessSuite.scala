@@ -25,32 +25,55 @@ class NodeProcessSuite extends CatsEffectSuite:
   private val nodePathSemantics =
     new PathSemantics(NodePath.sep, NodePath.isAbsolute)
 
+  private val currentPlatform =
+    ProcessPlatform
+      .parse(NodeRuntime.platform)
+      .fold(problem => fail(problem.getMessage), identity)
+
+  private def reportedTermination(exit: ProcessExit): Boolean = exit match
+    case ProcessExit.Terminated(_)          => true
+    case ProcessExit.Failed(_, termination) => termination.nonEmpty
+    case ProcessExit.Unknown                => false
+
   private val workspace = Workspace(
-    key = "file:///node-process-suite",
+    key = right(WorkspaceId.parse("file:///node-process-suite")),
     name = "node-process-suite",
     root = TestNodeRuntime.cwd(),
-    uri = "file:///node-process-suite",
   )
 
   private val exampleWorkspace = Workspace(
-    key = "file:///doctrellis-basic-example",
+    key = right(WorkspaceId.parse("file:///doctrellis-basic-example")),
     name = "doctrellis-basic-example",
     root = NodePath.join(TestNodeRuntime.cwd(), "examples", "basic"),
-    uri = "file:///doctrellis-basic-example",
   )
 
   test("stops a ready process, releases its port, and tolerates repeat stop"):
     Dispatcher.parallel[IO](await = false).use(testReadyStop)
 
   test("forces only its TERM-ignoring POSIX process group"):
-    if ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Windows
+    if currentPlatform == ProcessPlatform.Windows
     then IO.unit
     else Dispatcher.parallel[IO](await = false).use(testForcedTree)
 
   test("selects the exact Windows task tree command"):
     IO:
-      assertEquals(ProcessPlatform.parse("win32"), ProcessPlatform.Windows)
-      assertEquals(ProcessPlatform.parse("linux"), ProcessPlatform.Posix)
+      assertEquals(
+        ProcessPlatform.parse("win32"),
+        Right(ProcessPlatform.Windows),
+      )
+      assertEquals(
+        ProcessPlatform.parse("linux"),
+        Right(ProcessPlatform.Posix),
+      )
+      assertEquals(
+        ProcessPlatform.parse("android"),
+        Right(ProcessPlatform.Posix),
+      )
+      assertEquals(
+        ProcessPlatform.parse("netbsd"),
+        Right(ProcessPlatform.Posix),
+      )
+      assert(ProcessPlatform.parse("unknown").isLeft)
       assertEquals(
         OwnedProcess.taskkillArguments(pid = 1234, force = false),
         Vector("/PID", "1234", "/T"),
@@ -128,7 +151,13 @@ class NodeProcessSuite extends CatsEffectSuite:
       exit <- closed.get
       log  <- logs.get
     yield
-      assertEquals(exit.error, Some("close notification was not delivered"))
+      assertEquals(
+        exit,
+        ProcessExit.Failed(
+          "close notification was not delivered",
+          termination = None,
+        ),
+      )
       assert(log.contains("confirmed group exit"))
 
   test("a missing Windows close event remains a shutdown failure"):
@@ -213,11 +242,12 @@ class NodeProcessSuite extends CatsEffectSuite:
       (ready, exit, stopped, rebound, alive) = result
     yield
       assert(ready)
-      if ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Posix
-      then
-        assertEquals(exit.code, None)
-        assertEquals(exit.signal, Some("SIGTERM"))
-      else assert(exit.code.nonEmpty || exit.signal.nonEmpty)
+      if currentPlatform == ProcessPlatform.Posix then
+        assertEquals(
+          exit,
+          ProcessExit.Terminated(ProcessTermination.Signal("SIGTERM")),
+        )
+      else assert(reportedTermination(exit))
       assert(!stopped)
       assert(rebound)
       assert(!alive)
@@ -271,7 +301,10 @@ class NodeProcessSuite extends CatsEffectSuite:
           )
       (exit, childReady, otherReady, rootAlive, childAlive, logs) = result
     yield
-      assertEquals(exit.signal, Some("SIGKILL"))
+      assertEquals(
+        exit,
+        ProcessExit.Terminated(ProcessTermination.Signal("SIGKILL")),
+      )
       assert(!childReady)
       assert(otherReady)
       assert(!rootAlive)
@@ -389,7 +422,7 @@ class NodeProcessSuite extends CatsEffectSuite:
       assert(observerOutput.contains("read-only lease"))
       assertEquals(occupiedPort, 4242)
       assertNotEquals(dynamicPort, 4242)
-      assert(exit.code.nonEmpty || exit.signal.nonEmpty)
+      assert(reportedTermination(exit))
       assert(!stopped)
       assert(!alive)
       assert(rebound)
@@ -432,16 +465,14 @@ class NodeProcessSuite extends CatsEffectSuite:
       val firstRoot  = NodePath.join(temporary, "first")
       val secondRoot = NodePath.join(temporary, "second")
       val first      = Workspace(
-        key = s"file://$firstRoot",
+        key = right(WorkspaceId.parse(s"file://$firstRoot")),
         name = "first-dynamic-example",
         root = firstRoot,
-        uri = s"file://$firstRoot",
       )
       val second = Workspace(
-        key = s"file://$secondRoot",
+        key = right(WorkspaceId.parse(s"file://$secondRoot")),
         name = "second-dynamic-example",
         root = secondRoot,
-        uri = s"file://$secondRoot",
       )
       for
         _              <- prepareExampleCopy(source, firstRoot)
@@ -509,8 +540,8 @@ class NodeProcessSuite extends CatsEffectSuite:
         assertNotEquals(firstUrl, secondUrl)
         assertNotEquals(ports._1, ports._2)
         assertEquals(ready, (true, true))
-        assert(exits._1.code.nonEmpty || exits._1.signal.nonEmpty)
-        assert(exits._2.code.nonEmpty || exits._2.signal.nonEmpty)
+        assert(reportedTermination(exits._1))
+        assert(reportedTermination(exits._2))
         assertEquals(stopped, (false, false))
         assertEquals(alive, (false, false))
         assertEquals(metadataExists, (false, false))
@@ -563,8 +594,7 @@ class NodeProcessSuite extends CatsEffectSuite:
       metadataAfter <- exists(endpoint.metadataPath)
       socketAfter   <- socketPath.traverse(exists).map(_.exists(identity))
       portReusable  <- rebind(dispatcher, dynamicPort(url))
-      expectsUnixFile =
-        ProcessPlatform.parse(NodeRuntime.platform) == ProcessPlatform.Posix
+      expectsUnixFile = currentPlatform == ProcessPlatform.Posix
     yield
       assert(served)
       assertEquals(socketDuring, expectsUnixFile)

@@ -7,6 +7,7 @@ import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.effect.std.{Dispatcher, Mutex}
 import cats.syntax.all.*
 
+import org.doctrellis.vscode.application.ThrowableMessage
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
 
@@ -121,8 +122,8 @@ private final case class RenderedPanel(
 
 private[infrastructure] final class PreviewPanelRegistry private (
     backend: PreviewPanelBackend,
-    panels: Ref[IO, Map[String, PreviewPanelRegistry.Slot]],
-    bridges: Ref[IO, Map[String, BridgeSession]],
+    panels: Ref[IO, Map[WorkspaceId, PreviewPanelRegistry.Slot]],
+    bridges: Ref[IO, Map[WorkspaceId, BridgeSession]],
     closed: Ref[IO, Boolean],
     mutex: Mutex[IO],
 ):
@@ -163,7 +164,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
                     PanelInstallation(
                       PreviewWebviewHtml.render(
                         workspace,
-                        PreviewViewState.Failed(message(error)),
+                        PreviewViewState.Failed(ThrowableMessage.from(error)),
                         None,
                       ),
                       channel = None,
@@ -176,7 +177,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
             .onCancel(abandon(workspace.key, reservation))
 
   private def reserve(
-      key: String,
+      key: WorkspaceId,
       open: Boolean,
   ): IO[Option[Reservation]] =
     mutex.lock.surround:
@@ -459,7 +460,10 @@ private[infrastructure] final class PreviewPanelRegistry private (
       ) *>
         IO.delay(entry.channel = installation.channel)
 
-  private def consumeOpenIntent(key: String, intent: Revision): IO[Unit] =
+  private def consumeOpenIntent(
+      key: WorkspaceId,
+      intent: Revision,
+  ): IO[Unit] =
     panels.update: current =>
       current.get(key) match
         case Some(slot) if slot.openIntent.exists(_.eq(intent)) =>
@@ -467,7 +471,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
         case _ => current
 
   private def abandon(
-      key: String,
+      key: WorkspaceId,
       reservation: Reservation,
   ): IO[Unit] =
     mutex.lock.surround:
@@ -602,7 +606,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
                       )
                     case _ => current
 
-  private def bridgeSession(key: String): IO[BridgeSession] =
+  private def bridgeSession(key: WorkspaceId): IO[BridgeSession] =
     IO.delay(BridgeSession(new Object, cached = None))
       .flatMap: fresh =>
         bridges.modify: current =>
@@ -611,7 +615,7 @@ private[infrastructure] final class PreviewPanelRegistry private (
             case None           => current.updated(key, fresh) -> fresh
 
   private def resetBridgeSession(
-      key: String,
+      key: WorkspaceId,
       state: PreviewViewState,
   ): IO[Unit] =
     state match
@@ -624,9 +628,6 @@ private[infrastructure] final class PreviewPanelRegistry private (
         bridges.update(_.removed(key))
       case PreviewViewState.Ready(_, _) | PreviewViewState.Refreshed(_, _) =>
         IO.unit
-
-  private def message(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
 
   private def closeAll: IO[Unit] =
     mutex.lock
@@ -665,8 +666,8 @@ private[infrastructure] object PreviewPanelRegistry:
   ): Resource[IO, PreviewPanelRegistry] =
     Resource.make(
       for
-        panels  <- Ref.of[IO, Map[String, Slot]](Map.empty)
-        bridges <- Ref.of[IO, Map[String, BridgeSession]](Map.empty)
+        panels  <- Ref.of[IO, Map[WorkspaceId, Slot]](Map.empty)
+        bridges <- Ref.of[IO, Map[WorkspaceId, BridgeSession]](Map.empty)
         closed  <- Ref.of[IO, Boolean](false)
         mutex   <- Mutex[IO]
       yield PreviewPanelRegistry(backend, panels, bridges, closed, mutex),
@@ -938,13 +939,13 @@ private[infrastructure] object PreviewVisibilityDelivery:
             safelyLog(
               shouldLog,
               log,
-              s"Failed to deliver DocTrellis preview visibility: ${message(error)}\n",
+              s"Failed to deliver DocTrellis preview visibility: ${ThrowableMessage.from(error)}\n",
             ).as(None)
       case Left(error) =>
         safelyLog(
           shouldLog,
           log,
-          s"Failed to read DocTrellis preview visibility: ${message(error)}\n",
+          s"Failed to read DocTrellis preview visibility: ${ThrowableMessage.from(error)}\n",
         ).as(None)
 
   private def safelyLog(
@@ -955,9 +956,6 @@ private[infrastructure] object PreviewVisibilityDelivery:
     shouldLog.attempt.flatMap:
       case Right(true)            => log(value).handleError(_ => ())
       case Right(false) | Left(_) => IO.unit
-
-  private def message(error: Throwable): String =
-    Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.toString)
 
 private[infrastructure] final class PreviewVisibilityRelay private (
     mutex: Mutex[IO],

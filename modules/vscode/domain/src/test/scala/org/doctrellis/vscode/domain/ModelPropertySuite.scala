@@ -18,6 +18,45 @@ class ModelPropertySuite extends HedgehogSuite:
     for executable <- genNulExecutable.forAll
     yield Result.assert(Executable.parse(executable).isLeft)
 
+  property("workspace identities accept URI scheme characters"):
+    for
+      scheme <- genUriScheme.forAll
+      path   <- Gen.string(Gen.lower, Range.linear(1, 32)).forAll
+    yield
+      val value = s"$scheme://host/$path"
+      WorkspaceId.parse(value).map(_.value) ==== Right(value)
+
+  property("workspace identities reject a leading digit in the scheme"):
+    for
+      digit  <- Gen.int(Range.linear(0, 9)).forAll
+      suffix <- Gen.string(Gen.lower, Range.linear(1, 16)).forAll
+    yield
+      val value = s"$digit$suffix://host/workspace"
+      Result.assert(WorkspaceId.parse(value).isLeft)
+
+  property("workspace identities reject whitespace and control characters"):
+    for
+      prefix  <- Gen.string(Gen.lower, Range.linear(0, 16)).forAll
+      invalid <- Gen
+        .choice1(
+          Gen.constant('\u0000'),
+          Gen.constant('\u0001'),
+          Gen.constant('\u007f'),
+          Gen.constant('\u0085'),
+          Gen.constant('\u009f'),
+          Gen.constant(' '),
+          Gen.constant('\t'),
+          Gen.constant('\u00a0'),
+          Gen.constant('\u2007'),
+          Gen.constant('\u2028'),
+          Gen.constant('\u3000'),
+        )
+        .forAll
+      suffix <- Gen.string(Gen.lower, Range.linear(0, 16)).forAll
+    yield
+      val value = s"file:///$prefix$invalid$suffix"
+      Result.assert(WorkspaceId.parse(value).isLeft)
+
   property("startup timeouts accept exactly the documented range"):
     for milliseconds <- genStartupTimeout.forAll
     yield
@@ -97,6 +136,18 @@ class ModelPropertySuite extends HedgehogSuite:
       prefix <- Gen.string(Gen.unicode, Range.linear(0, 32))
       suffix <- Gen.string(Gen.unicode, Range.linear(0, 32))
     yield prefix + '\u0000' + suffix
+
+  private def genUriScheme: Gen[String] =
+    for
+      prefix <- Gen.string(Gen.lower, Range.linear(1, 8))
+      digit  <- Gen.int(Range.linear(0, 9))
+      mark   <- Gen.choice1(
+        Gen.constant('+'),
+        Gen.constant('-'),
+        Gen.constant('.'),
+      )
+      suffix <- Gen.string(Gen.lower, Range.linear(1, 8))
+    yield s"$prefix$digit$mark$suffix"
 
   private def genStartupTimeout: Gen[Int] =
     Gen.choice1(

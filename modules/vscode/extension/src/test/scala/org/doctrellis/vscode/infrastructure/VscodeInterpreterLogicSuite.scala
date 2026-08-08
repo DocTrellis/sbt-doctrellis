@@ -3,11 +3,12 @@ package org.doctrellis.vscode.infrastructure
 import scala.concurrent.duration.*
 import scala.scalajs.js
 
-import cats.effect.{Deferred, IO}
+import cats.effect.{Deferred, IO, Ref}
 
 import munit.CatsEffectSuite
 
 import org.doctrellis.vscode.domain.*
+import org.doctrellis.vscode.infrastructure.facade.WorkspaceFolder
 
 class VscodeInterpreterLogicSuite extends CatsEffectSuite:
   test("cancels owned background tasks when their resource closes"):
@@ -32,7 +33,7 @@ class VscodeInterpreterLogicSuite extends CatsEffectSuite:
       Vector("docs — /work/first", "docs — /work/second"),
     )
     assertEquals(
-      actual.map(_._2.key),
+      actual.map(_._2.key.value),
       Vector("file:///work/first", "file:///work/second"),
     )
 
@@ -46,6 +47,71 @@ class VscodeInterpreterLogicSuite extends CatsEffectSuite:
       Some(second),
     )
     assertEquals(WorkspaceOptions.select(candidates, "unknown"), None)
+
+  test("workspace selection keeps valid folders when another URI is malformed"):
+    val valid    = folder("first", "/work/first", "file:///work/first")
+    val invalid  = folder("invalid", "/work/invalid", "invalid\u0000uri")
+    val parsed   = WorkspaceFolderLogic.parse(Vector(valid, invalid))
+    val rejected = WorkspaceFolderLogic.parse(Vector(invalid))
+    val selected = WorkspaceFolderLogic.parse(Vector(valid))
+    val empty    = WorkspaceFolderLogic.parse(Vector.empty)
+
+    assertEquals(parsed.problems.size + parsed.workspaces.size, 2)
+    assertEquals(parsed.problems.size, 1)
+    assert(parsed.problems.exists(_.message.contains("invalid")))
+    assertEquals(
+      parsed.workspaces.map(_.key.value),
+      Vector("file:///work/first"),
+    )
+    assertEquals(
+      WorkspaceFolderLogic.decide(parsed),
+      WorkspaceSelectionDecision.Pick(parsed.workspaces),
+    )
+    assertEquals(
+      WorkspaceFolderLogic.decide(rejected),
+      WorkspaceSelectionDecision.NoValidFolders,
+    )
+    assertEquals(
+      WorkspaceFolderLogic.decide(selected),
+      WorkspaceSelectionDecision.Selected(
+        workspace("/work/first", "file:///work/first").copy(name = "first"),
+      ),
+    )
+    assertEquals(
+      WorkspaceFolderLogic.decide(empty),
+      WorkspaceSelectionDecision.NoFolders,
+    )
+
+  test("removed workspace cleanup attempts every folder after a failure"):
+    val invalid = folder("invalid", "/work/invalid", "invalid\u0000uri")
+    val first   = folder("first", "/work/first", "file:///work/first")
+    val second  = folder("second", "/work/second", "file:///work/second")
+    val firstId = WorkspaceId
+      .parse("file:///work/first")
+      .fold(problem => fail(problem.message), identity)
+
+    for
+      stopped  <- Ref.of[IO, Vector[WorkspaceId]](Vector.empty)
+      reported <- Ref.of[IO, Vector[String]](Vector.empty)
+      _        <- WorkspaceCleanup.stopRemoved(
+        folders = List(invalid, first, second),
+        stop = workspace =>
+          stopped.update(_ :+ workspace.key) *>
+            IO.raiseWhen(workspace.key == firstId)(
+              IllegalStateException("first cleanup failed"),
+            ),
+        onError = error => reported.update(_ :+ error.getMessage),
+      )
+      actualStops   <- stopped.get
+      actualReports <- reported.get
+    yield
+      assertEquals(
+        actualStops.map(_.value),
+        Vector("file:///work/first", "file:///work/second"),
+      )
+      assertEquals(actualReports.size, 2)
+      assert(actualReports.exists(_.contains("invalid")))
+      assert(actualReports.contains("first cleanup failed"))
 
   test("VS Code preferences parse typed boundary values"):
     val parsed = VscodePreferencesParser.parse(
@@ -136,4 +202,21 @@ class VscodeInterpreterLogicSuite extends CatsEffectSuite:
     assertEquals(trusted, Right(()))
 
   private def workspace(root: String, value: String): Workspace =
-    Workspace(value, "docs", root, value)
+    Workspace(
+      key = WorkspaceId
+        .parse(value)
+        .fold(problem => fail(problem.message), identity),
+      name = "docs",
+      root = root,
+    )
+
+  private def folder(
+      name: String,
+      root: String,
+      value: String,
+  ): WorkspaceFolder =
+    val uri = js.Dynamic.literal(fsPath = root)
+    uri.updateDynamic("toString")((() => value): js.Function0[String])
+    js.Dynamic
+      .literal(name = name, uri = uri)
+      .asInstanceOf[WorkspaceFolder]

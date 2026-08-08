@@ -13,7 +13,11 @@ import org.doctrellis.vscode.domain.*
 class PreviewServiceSuite extends CatsEffectSuite:
   private val posixPaths = new PathSemantics("/", _.startsWith("/"))
   private val workspace  =
-    Workspace("file:///workspace", "example", "/workspace", "file:///workspace")
+    Workspace(
+      key = right(WorkspaceId.parse("file:///workspace")),
+      name = "example",
+      root = "/workspace",
+    )
 
   private val command =
     PreviewCommand(
@@ -33,6 +37,12 @@ class PreviewServiceSuite extends CatsEffectSuite:
     )
 
   private val policy = PreviewPolicy(false, right(PollInterval.parse(500)))
+
+  private def exitCode(value: Int): ProcessExit =
+    ProcessExit.Terminated(ProcessTermination.Code(value))
+
+  private def exitSignal(value: String): ProcessExit =
+    ProcessExit.Terminated(ProcessTermination.Signal(value))
 
   test("starts at most one process for a workspace"):
     for
@@ -62,10 +72,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("a slow launch does not block a different workspace"):
     val second = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     for
       firstEntered  <- Deferred[IO, Unit]
@@ -233,7 +242,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield ()
 
   test("reports an exit that happens before readiness"):
-    val exit    = ProcessExit(Some(1), None, None)
+    val exit    = exitCode(1)
     val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(command),
       policy = _ => IO.pure(policy),
@@ -464,14 +473,13 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("silent workspace cleanup stops only the selected workspace"):
     val second = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     for
-      releases <- Ref.of[IO, Vector[String]](Vector.empty)
-      launches <- Ref.of[IO, Map[String, Int]](Map.empty)
+      releases <- Ref.of[IO, Vector[WorkspaceId]](Vector.empty)
+      launches <- Ref.of[IO, Map[WorkspaceId, Int]](Map.empty)
       algebra = PreviewAlgebra[IO](
         load = _ => IO.pure(command),
         policy = _ => IO.pure(policy),
@@ -522,7 +530,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(states.lastOption, Some(PreviewViewState.Stopped))
 
   test("unexpected exit updates an open preview view without disposing it"):
-    val exit = ProcessExit(Some(7), None, None)
+    val exit = exitCode(7)
     for
       exited <- Deferred[IO, ProcessExit]
       shown  <- Deferred[IO, Unit]
@@ -552,7 +560,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assert(states.contains(PreviewViewState.Exited(exit)))
 
   test("an exited session is replaceable while its error report is pending"):
-    val exit = ProcessExit(Some(7), None, None)
+    val exit = exitCode(7)
     for
       launches       <- Ref.of[IO, Int](0)
       probeCalls     <- Ref.of[IO, Int](0)
@@ -724,7 +732,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       case other => fail(s"expected DynamicPreviewStarting, got $other")
 
   test("a ready signal preserves a session that already became terminal"):
-    val exit     = ProcessExit(code = Some(17), signal = None, error = None)
+    val exit     = exitCode(17)
     val terminal = PreviewStatus.Terminal(PreviewTerminal.Exited(exit))
     for
       status     <- Ref.of[IO, PreviewStatus](terminal)
@@ -794,7 +802,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("openExternal rejects a terminal announced session"):
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
     val announced = right(PreviewUrl.parse("http://127.0.0.1:53118"))
-    val exit      = ProcessExit(code = Some(0), signal = None, error = None)
+    val exit      = exitCode(0)
     for
       exited          <- Deferred[IO, ProcessExit]
       releaseEntered  <- Deferred[IO, Unit]
@@ -893,7 +901,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(states, Vector(PreviewViewState.Starting))
 
   test("open shows stopped while an active session is stopping"):
-    val exit = ProcessExit(None, Some("SIGTERM"), None)
+    val exit = exitSignal("SIGTERM")
     for
       closeEntered  <- Deferred[IO, Unit]
       continueClose <- Deferred[IO, Unit]
@@ -1162,7 +1170,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
       assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("ready completion does not wait for panel display"):
-    val exit = ProcessExit(None, Some("SIGTERM"), None)
+    val exit = exitSignal("SIGTERM")
     for
       infoEntered  <- Deferred[IO, Unit]
       continueInfo <- Deferred[IO, Unit]
@@ -1291,7 +1299,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("stop racing an unexpected exit converges the panel to stopped"):
-    val exit = ProcessExit(Some(1), None, None)
+    val exit = exitCode(1)
     for
       exited          <- Deferred[IO, ProcessExit]
       exitViewEntered <- Deferred[IO, Unit]
@@ -1329,7 +1337,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
     yield assertEquals(actual.lastOption, Some(PreviewViewState.Stopped))
 
   test("an old terminal view completes before a replacement session starts"):
-    val exit = ProcessExit(Some(1), None, None)
+    val exit = exitCode(1)
     for
       launches        <- Ref.of[IO, Int](0)
       oldExited       <- Deferred[IO, ProcessExit]
@@ -1438,10 +1446,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("terminal cleanup does not block another workspace"):
     val second = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     val failure       = IllegalStateException("startup failed")
     val secondCommand = command.copy(endpoint =
@@ -1493,10 +1500,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("attempts every release and retries a failed session cleanup"):
     val second = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     for
       releases <- Ref.of[IO, Int](0)
@@ -1528,10 +1534,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("stops independent workspace sessions concurrently"):
     val second = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     for
       firstEntered  <- Deferred[IO, Unit]
@@ -2006,7 +2011,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("a normal site event end is reconciled with the process exit"):
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
     val announced = right(PreviewUrl.parse("http://127.0.0.1:53123"))
-    val exit      = ProcessExit(code = Some(9), signal = None, error = None)
+    val exit      = exitCode(9)
     for
       announcement <- Deferred[IO, PreviewUrl]
       processExit  <- Deferred[IO, ProcessExit]
@@ -2153,7 +2158,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
 
   test("dynamic startup reports process exit before ready announcement"):
     val dynamic = command.copy(endpoint = PreviewEndpoint.Announced)
-    val exit    = ProcessExit(code = Some(2), signal = None, error = None)
+    val exit    = exitCode(2)
     val algebra = PreviewAlgebra[IO](
       load = _ => IO.pure(dynamic),
       policy = _ => IO.pure(policy),
@@ -2184,7 +2189,7 @@ class PreviewServiceSuite extends CatsEffectSuite:
   ):
     val dynamic   = command.copy(endpoint = PreviewEndpoint.Announced)
     val announced = right(PreviewUrl.parse("http://127.0.0.1:53112"))
-    val exit      = ProcessExit(code = Some(3), signal = None, error = None)
+    val exit      = exitCode(3)
     val algebra   = PreviewAlgebra[IO](
       load = _ => IO.pure(dynamic),
       policy = _ => IO.pure(policy),
@@ -2286,10 +2291,9 @@ class PreviewServiceSuite extends CatsEffectSuite:
   test("two dynamic workspaces keep independently announced URLs"):
     val dynamic         = command.copy(endpoint = PreviewEndpoint.Announced)
     val secondWorkspace = workspace.copy(
-      key = "file:///workspace-two",
+      key = right(WorkspaceId.parse("file:///workspace-two")),
       name = "example-two",
       root = "/workspace-two",
-      uri = "file:///workspace-two",
     )
     val firstUrl  = right(PreviewUrl.parse("http://127.0.0.1:53115"))
     val secondUrl = right(PreviewUrl.parse("http://127.0.0.1:53116"))
