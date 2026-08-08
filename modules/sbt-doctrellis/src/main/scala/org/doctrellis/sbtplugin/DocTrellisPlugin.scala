@@ -125,10 +125,16 @@ private[sbtplugin] object PreviewServer:
       log: Logger,
   ): Unit =
     val layout        = buildProgram.layout
-    val controlConfig = PreviewControlConfig.fromEnvironment(
-      layout.workspaceDirectory,
-      sys.env,
-    )
+    val controlConfig = PreviewControlConfig
+      .fromEnvironment(
+        layout.workspaceDirectory,
+        sys.env,
+        runtimeOwnerRequired = PreviewControlConfig.runtimeOwnerRequired,
+      )
+      .fold(
+        problem => throw IllegalArgumentException(problem.message),
+        identity,
+      )
     PreviewHost.requireCompatible(host, controlConfig.nonEmpty)
     val mailbox         = BlockingPreviewEventMailbox()
     val publication     = PreviewPublication.open(layout, log)

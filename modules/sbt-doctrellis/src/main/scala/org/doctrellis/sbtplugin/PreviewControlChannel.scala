@@ -53,6 +53,117 @@ private[sbtplugin] final case class PreviewControlConfig(
     runtimeOwner: Option[Long] = None,
 )
 
+private[sbtplugin] enum PreviewControlConfigProblem:
+  case UnsupportedProtocol(actual: String)
+  case Missing(field: String)
+  case Invalid(field: String, detail: String)
+  case CannotResolve(field: String, value: String, detail: String)
+  case WorkingDirectoryOutsideWorkspace
+  case WorkspaceHashMismatch
+  case RuntimeDirectoryInsideWorkspace
+
+  def message: String = this match
+    case UnsupportedProtocol(actual) =>
+      s"Unsupported DocTrellis preview protocol '$actual'."
+    case Missing(field)                      => s"Missing $field."
+    case Invalid(field, detail)              => s"The $field $detail."
+    case CannotResolve(field, value, detail) =>
+      s"Could not resolve the $field '$value': $detail"
+    case WorkingDirectoryOutsideWorkspace =>
+      "The preview working directory is outside the canonical workspace."
+    case WorkspaceHashMismatch =>
+      "The workspace IPC hash does not match the canonical workspace path."
+    case RuntimeDirectoryInsideWorkspace =>
+      "The workspace IPC endpoint must not be stored inside the project."
+
+private[sbtplugin] final case class PreviewControlEnvironment private (
+    canonicalWorkspace: String,
+    runtimeDirectory: String,
+    workspaceHash: String,
+    launchId: String,
+    runtimeOwner: Option[Long],
+)
+
+private[sbtplugin] object PreviewControlEnvironment:
+  def parse(
+      environment: Map[String, String],
+      runtimeOwnerRequired: Boolean,
+  ): Either[PreviewControlConfigProblem, Option[PreviewControlEnvironment]] =
+    environment.get(PreviewControlConfig.ProtocolEnvironment) match
+      case None           => Right(None)
+      case Some(protocol) =>
+        for
+          _ <- Either.cond(
+            protocol == PreviewControlConfig.Protocol,
+            (),
+            PreviewControlConfigProblem.UnsupportedProtocol(protocol),
+          )
+          canonical <- required(
+            environment,
+            PreviewControlConfig.WorkspaceEnvironment,
+            "canonical workspace path",
+          )
+          runtime <- required(
+            environment,
+            PreviewControlConfig.RuntimeEnvironment,
+            "workspace IPC runtime directory",
+          )
+          hash <- required(
+            environment,
+            PreviewControlConfig.HashEnvironment,
+            "workspace IPC hash",
+          )
+          launchId <- required(
+            environment,
+            PreviewControlConfig.LaunchEnvironment,
+            "workspace launch ID",
+          )
+          owner <- runtimeOwner(
+            environment.get(PreviewControlConfig.OwnerEnvironment),
+            runtimeOwnerRequired,
+          )
+        yield Some(
+          PreviewControlEnvironment(
+            canonicalWorkspace = canonical,
+            runtimeDirectory = runtime,
+            workspaceHash = hash,
+            launchId = launchId,
+            runtimeOwner = owner,
+          ),
+        )
+
+  private def required(
+      environment: Map[String, String],
+      name: String,
+      field: String,
+  ): Either[PreviewControlConfigProblem, String] =
+    environment
+      .get(name)
+      .filter(_.nonEmpty)
+      .toRight(PreviewControlConfigProblem.Missing(field))
+
+  private def runtimeOwner(
+      value: Option[String],
+      required: Boolean,
+  ): Either[PreviewControlConfigProblem, Option[Long]] = value match
+    case Some(raw) =>
+      raw.toLongOption
+        .filter(_ >= 0L)
+        .map(Some(_))
+        .toRight(
+          PreviewControlConfigProblem.Invalid(
+            "workspace IPC runtime owner",
+            "must be a non-negative integer",
+          ),
+        )
+    case None if required =>
+      Left(
+        PreviewControlConfigProblem.Missing(
+          "workspace IPC runtime owner",
+        ),
+      )
+    case None => Right(None)
+
 private[sbtplugin] object PreviewControlConfig:
   val Protocol             = "doctrellis-preview-v1"
   val ProtocolEnvironment  = "DOCTRELLIS_PREVIEW_PROTOCOL"
@@ -65,81 +176,50 @@ private[sbtplugin] object PreviewControlConfig:
   def fromEnvironment(
       workspace: Path,
       environment: Map[String, String],
-  ): Option[PreviewControlConfig] =
-    environment
-      .get(ProtocolEnvironment)
-      .map: protocol =>
-        if protocol != Protocol then
-          throw IllegalArgumentException(
-            s"Unsupported DocTrellis preview protocol '$protocol'.",
-          )
-        val project       = workspace.toRealPath()
-        val canonicalText = environment.getOrElse(
-          WorkspaceEnvironment,
-          throw IllegalArgumentException(
-            "Missing canonical workspace path.",
-          ),
-        )
-        val canonical = Path
-          .of(
-            canonicalText,
-          )
-          .toRealPath()
-        if !project.startsWith(canonical) then
-          throw IllegalArgumentException(
-            "The preview working directory is outside the canonical workspace.",
-          )
-        val expected = shortHash(canonicalText)
-        val supplied = environment
-          .getOrElse(
-            HashEnvironment,
-            throw IllegalArgumentException("Missing workspace IPC hash."),
-          )
-        if supplied != expected then
-          throw IllegalArgumentException(
-            "The workspace IPC hash does not match the canonical workspace path.",
-          )
-        val runtime = Path
-          .of(
-            environment.getOrElse(
-              RuntimeEnvironment,
-              throw IllegalArgumentException(
-                "Missing workspace IPC runtime directory.",
-              ),
-            ),
-          )
-          .toAbsolutePath
-          .normalize()
-        if runtime.startsWith(canonical) then
-          throw IllegalArgumentException(
-            "The workspace IPC endpoint must not be stored inside the project.",
-          )
-        val runtimeOwner = environment
-          .get(OwnerEnvironment)
-          .map: value =>
-            value.toLongOption
-              .filter(_ >= 0L)
-              .getOrElse(
-                throw IllegalArgumentException(
-                  "The workspace IPC runtime owner must be a non-negative integer.",
-                ),
-              )
-        if !isWindows && runtimeOwner.isEmpty then
-          throw IllegalArgumentException(
-            "Missing workspace IPC runtime owner.",
-          )
-        val launchId = environment
-          .get(LaunchEnvironment)
-          .filter(_.nonEmpty)
-          .getOrElse(
-            throw IllegalArgumentException("Missing workspace launch ID."),
-          )
-        PreviewControlConfig(
-          runtimeDirectory = runtime,
-          workspaceHash = expected,
-          launchId = launchId,
-          runtimeOwner = runtimeOwner,
-        )
+      runtimeOwnerRequired: Boolean,
+  ): Either[PreviewControlConfigProblem, Option[PreviewControlConfig]] =
+    PreviewControlEnvironment
+      .parse(environment, runtimeOwnerRequired)
+      .flatMap:
+        case Some(value) => resolve(workspace, value).map(Some(_))
+        case None        => Right(None)
+
+  def resolve(
+      workspace: Path,
+      environment: PreviewControlEnvironment,
+  ): Either[PreviewControlConfigProblem, PreviewControlConfig] =
+    for
+      project   <- canonicalPath("preview working directory", workspace)
+      canonical <- canonicalPath(
+        "canonical workspace path",
+        environment.canonicalWorkspace,
+      )
+      _ <- Either.cond(
+        project.startsWith(canonical),
+        (),
+        PreviewControlConfigProblem.WorkingDirectoryOutsideWorkspace,
+      )
+      expected = shortHash(environment.canonicalWorkspace)
+      _ <- Either.cond(
+        environment.workspaceHash == expected,
+        (),
+        PreviewControlConfigProblem.WorkspaceHashMismatch,
+      )
+      runtime <- absolutePath(
+        "workspace IPC runtime directory",
+        environment.runtimeDirectory,
+      )
+      _ <- Either.cond(
+        !runtime.startsWith(canonical),
+        (),
+        PreviewControlConfigProblem.RuntimeDirectoryInsideWorkspace,
+      )
+    yield PreviewControlConfig(
+      runtimeDirectory = runtime,
+      workspaceHash = expected,
+      launchId = environment.launchId,
+      runtimeOwner = environment.runtimeOwner,
+    )
 
   def shortHash(value: String): String =
     MessageDigest
@@ -149,6 +229,57 @@ private[sbtplugin] object PreviewControlConfig:
       .map(byte => f"${byte & 0xff}%02x")
       .mkString
       .take(24)
+
+  def runtimeOwnerRequired: Boolean =
+    !isWindows
+
+  private def canonicalPath(
+      field: String,
+      value: Path,
+  ): Either[PreviewControlConfigProblem, Path] =
+    try Right(value.toRealPath())
+    catch
+      case NonFatal(error) =>
+        Left(
+          PreviewControlConfigProblem.CannotResolve(
+            field,
+            value.toString,
+            errorMessage(error),
+          ),
+        )
+
+  private def canonicalPath(
+      field: String,
+      value: String,
+  ): Either[PreviewControlConfigProblem, Path] =
+    try Right(Path.of(value).toRealPath())
+    catch
+      case NonFatal(error) =>
+        Left(
+          PreviewControlConfigProblem.CannotResolve(
+            field,
+            value,
+            errorMessage(error),
+          ),
+        )
+
+  private def absolutePath(
+      field: String,
+      value: String,
+  ): Either[PreviewControlConfigProblem, Path] =
+    try Right(Path.of(value).toAbsolutePath.normalize())
+    catch
+      case NonFatal(error) =>
+        Left(
+          PreviewControlConfigProblem.CannotResolve(
+            field,
+            value,
+            errorMessage(error),
+          ),
+        )
+
+  private def errorMessage(error: Throwable): String =
+    error.toString
 
   private def isWindows: Boolean =
     System

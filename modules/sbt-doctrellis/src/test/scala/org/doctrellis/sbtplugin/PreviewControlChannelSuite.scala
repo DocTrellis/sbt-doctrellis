@@ -509,6 +509,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     val workspace   = Files.createTempDirectory("doctrellis-workspace-")
     val project     = Files.createDirectories(workspace.resolve("subproject"))
     val runtime     = shortTempDirectory("dtc-config-")
+    val unrelated   = Files.createTempDirectory("doctrellis-unrelated-")
     val canonical   = workspace.toRealPath()
     val hash        = PreviewControlConfig.shortHash(canonical.toString)
     val owner       = Option.unless(isWindows)(runtimeOwner(runtime))
@@ -523,34 +524,250 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     )
     try
       assertEquals(
-        PreviewControlConfig.fromEnvironment(project, environment),
-        Some(
-          PreviewControlConfig(
-            runtimeDirectory = runtime.toAbsolutePath.normalize(),
-            workspaceHash = hash,
-            launchId = "environment-launch",
-            runtimeOwner = owner,
+        PreviewControlConfig.fromEnvironment(
+          workspace = project,
+          environment = environment,
+          runtimeOwnerRequired = !isWindows,
+        ),
+        Right(
+          Some(
+            PreviewControlConfig(
+              runtimeDirectory = runtime.toAbsolutePath.normalize(),
+              workspaceHash = hash,
+              launchId = "environment-launch",
+              runtimeOwner = owner,
+            ),
           ),
         ),
       )
       assert(
-        intercept[IllegalArgumentException](
-          PreviewControlConfig.fromEnvironment(
-            project,
-            environment.updated(
+        PreviewControlConfig
+          .fromEnvironment(
+            workspace = project,
+            environment = environment.updated(
               PreviewControlConfig.HashEnvironment,
               "0" * 24,
             ),
-          ),
-        ).getMessage.contains("hash"),
+            runtimeOwnerRequired = !isWindows,
+          )
+          .swap
+          .exists(_.message.contains("hash")),
       )
       assert(
-        intercept[IllegalArgumentException](
-          PreviewControlConfig.fromEnvironment(
-            project,
-            environment - PreviewControlConfig.LaunchEnvironment,
+        PreviewControlConfig
+          .fromEnvironment(
+            workspace = project,
+            environment = environment - PreviewControlConfig.LaunchEnvironment,
+            runtimeOwnerRequired = !isWindows,
+          )
+          .swap
+          .exists(_.message.contains("launch ID")),
+      )
+      assertEquals(
+        PreviewControlConfig.fromEnvironment(
+          workspace = project,
+          environment = Map.empty,
+          runtimeOwnerRequired = !isWindows,
+        ),
+        Right(None),
+      )
+      val unrelatedCanonical = unrelated.toRealPath().toString
+      assertEquals(
+        PreviewControlConfig.fromEnvironment(
+          workspace = project,
+          environment = environment
+            .updated(
+              PreviewControlConfig.WorkspaceEnvironment,
+              unrelatedCanonical,
+            )
+            .updated(
+              PreviewControlConfig.HashEnvironment,
+              PreviewControlConfig.shortHash(unrelatedCanonical),
+            ),
+          runtimeOwnerRequired = !isWindows,
+        ),
+        Left(PreviewControlConfigProblem.WorkingDirectoryOutsideWorkspace),
+      )
+      assertEquals(
+        PreviewControlConfig.fromEnvironment(
+          workspace = project,
+          environment = environment.updated(
+            PreviewControlConfig.RuntimeEnvironment,
+            canonical.resolve("ipc").toString,
           ),
-        ).getMessage.contains("launch ID"),
+          runtimeOwnerRequired = !isWindows,
+        ),
+        Left(PreviewControlConfigProblem.RuntimeDirectoryInsideWorkspace),
+      )
+    finally
+      deleteTree(unrelated)
+      deleteTree(runtime)
+      deleteTree(workspace)
+
+  test("environment contract reports malformed input as structured values"):
+    val base = Map(
+      PreviewControlConfig.ProtocolEnvironment -> PreviewControlConfig.Protocol,
+      PreviewControlConfig.RuntimeEnvironment  -> "/tmp/doctrellis-runtime",
+      PreviewControlConfig.HashEnvironment     -> ("0" * 24),
+      PreviewControlConfig.WorkspaceEnvironment -> "/workspace",
+      PreviewControlConfig.LaunchEnvironment    -> "environment-launch",
+    )
+
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base.updated(PreviewControlConfig.ProtocolEnvironment, "unknown"),
+        runtimeOwnerRequired = false,
+      ),
+      Left(PreviewControlConfigProblem.UnsupportedProtocol("unknown")),
+    )
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base - PreviewControlConfig.LaunchEnvironment,
+        runtimeOwnerRequired = false,
+      ),
+      Left(PreviewControlConfigProblem.Missing("workspace launch ID")),
+    )
+    List(
+      PreviewControlConfig.WorkspaceEnvironment -> "canonical workspace path",
+      PreviewControlConfig.RuntimeEnvironment   ->
+        "workspace IPC runtime directory",
+      PreviewControlConfig.HashEnvironment   -> "workspace IPC hash",
+      PreviewControlConfig.LaunchEnvironment -> "workspace launch ID",
+    ).foreach: (name, field) =>
+      List(base - name, base.updated(name, "")).foreach: environment =>
+        assertEquals(
+          PreviewControlEnvironment.parse(
+            environment,
+            runtimeOwnerRequired = false,
+          ),
+          Left(PreviewControlConfigProblem.Missing(field)),
+        )
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base.updated(PreviewControlConfig.ProtocolEnvironment, ""),
+        runtimeOwnerRequired = false,
+      ),
+      Left(PreviewControlConfigProblem.UnsupportedProtocol("")),
+    )
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base,
+        runtimeOwnerRequired = true,
+      ),
+      Left(
+        PreviewControlConfigProblem.Missing(
+          "workspace IPC runtime owner",
+        ),
+      ),
+    )
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base.updated(PreviewControlConfig.OwnerEnvironment, "not-a-pid"),
+        runtimeOwnerRequired = false,
+      ),
+      Left(
+        PreviewControlConfigProblem.Invalid(
+          "workspace IPC runtime owner",
+          "must be a non-negative integer",
+        ),
+      ),
+    )
+    assertEquals(
+      PreviewControlEnvironment.parse(
+        base.updated(PreviewControlConfig.OwnerEnvironment, "-1"),
+        runtimeOwnerRequired = false,
+      ),
+      Left(
+        PreviewControlConfigProblem.Invalid(
+          "workspace IPC runtime owner",
+          "must be a non-negative integer",
+        ),
+      ),
+    )
+    assertEquals(
+      PreviewControlEnvironment
+        .parse(
+          base.updated(PreviewControlConfig.OwnerEnvironment, "0"),
+          runtimeOwnerRequired = false,
+        )
+        .map(_.flatMap(_.runtimeOwner)),
+      Right(Some(0L)),
+    )
+
+  test("environment contract catches invalid paths during resolution"):
+    val workspace   = Files.createTempDirectory("doctrellis-config-path-")
+    val runtime     = shortTempDirectory("dtc-config-path-")
+    val canonical   = workspace.toRealPath().toString
+    val environment = Map(
+      PreviewControlConfig.ProtocolEnvironment -> PreviewControlConfig.Protocol,
+      PreviewControlConfig.RuntimeEnvironment  -> runtime.toString,
+      PreviewControlConfig.HashEnvironment -> PreviewControlConfig.shortHash(
+        canonical,
+      ),
+      PreviewControlConfig.WorkspaceEnvironment -> canonical,
+      PreviewControlConfig.LaunchEnvironment    -> "environment-launch",
+    )
+    try
+      val invalidRuntime = PreviewControlConfig.fromEnvironment(
+        workspace = workspace,
+        environment = environment.updated(
+          PreviewControlConfig.RuntimeEnvironment,
+          "invalid\u0000path",
+        ),
+        runtimeOwnerRequired = false,
+      )
+      assert(
+        invalidRuntime.swap.exists:
+          case PreviewControlConfigProblem.CannotResolve(
+                "workspace IPC runtime directory",
+                "invalid\u0000path",
+                _,
+              ) =>
+            true
+          case _ => false,
+      )
+
+      val missingCanonical    = workspace.resolve("missing-canonical").toString
+      val unresolvedCanonical = PreviewControlConfig.fromEnvironment(
+        workspace = workspace,
+        environment = environment
+          .updated(
+            PreviewControlConfig.WorkspaceEnvironment,
+            missingCanonical,
+          )
+          .updated(
+            PreviewControlConfig.HashEnvironment,
+            PreviewControlConfig.shortHash(missingCanonical),
+          ),
+        runtimeOwnerRequired = false,
+      )
+      assert(
+        unresolvedCanonical.swap.exists:
+          case PreviewControlConfigProblem.CannotResolve(
+                "canonical workspace path",
+                `missingCanonical`,
+                detail,
+              ) =>
+            detail.nonEmpty && detail != missingCanonical
+          case _ => false,
+      )
+
+      val missingProject    = workspace.resolve("missing-project")
+      val unresolvedProject = PreviewControlConfig.fromEnvironment(
+        workspace = missingProject,
+        environment = environment,
+        runtimeOwnerRequired = false,
+      )
+      assert(
+        unresolvedProject.swap.exists:
+          case PreviewControlConfigProblem.CannotResolve(
+                "preview working directory",
+                value,
+                detail,
+              ) =>
+            value == missingProject.toString && detail.nonEmpty &&
+            detail != value
+          case _ => false,
       )
     finally
       deleteTree(runtime)
