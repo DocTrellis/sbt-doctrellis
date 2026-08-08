@@ -381,7 +381,7 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
           override def call(): Unit =
             StaticSiteHandler(root, lock).handle(exchange),
       )
-      assert(started.await(2L, TimeUnit.SECONDS))
+      assert(started.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       val publication = pool.submit(
         new Callable[Unit]:
           override def call(): Unit =
@@ -390,13 +390,13 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
               acquired.countDown(),
       )
       assert(
-        acquired.await(2L, TimeUnit.SECONDS),
+        acquired.await(TestTimeout.Seconds, TimeUnit.SECONDS),
         "publication remained blocked by response streaming",
       )
-      publication.get(2L, TimeUnit.SECONDS)
+      publication.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assert(!response.isDone, "the simulated client should still be stalled")
       release.countDown()
-      response.get(2L, TimeUnit.SECONDS)
+      response.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assertEquals(
         String(exchange.responseBytes, java.nio.charset.StandardCharsets.UTF_8),
         "streamed response",
@@ -454,7 +454,7 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
         new Callable[Unit]:
           override def call(): Unit = handler.handle(exchange),
       )
-      assert(started.await(2L, TimeUnit.SECONDS))
+      assert(started.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       val snapshot = snapshotPath
         .get()
         .getOrElse(fail("the disk snapshot was not created"))
@@ -465,11 +465,11 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
             lock.write:
               Files.writeString(root.resolve("index.html"), "replacement"): Unit,
       )
-      publication.get(2L, TimeUnit.SECONDS)
+      publication.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assert(!response.isDone, "the simulated client should still be stalled")
 
       release.countDown()
-      response.get(2L, TimeUnit.SECONDS)
+      response.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assertEquals(
         String(exchange.responseBytes, java.nio.charset.StandardCharsets.UTF_8),
         original,
@@ -482,7 +482,7 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
     finally
       release.countDown()
       pool.shutdownNow()
-      val _ = pool.awaitTermination(2L, TimeUnit.SECONDS)
+      val _ = pool.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS)
       GeneratedDirectory.delete(root)
       GeneratedDirectory.delete(temporary)
 

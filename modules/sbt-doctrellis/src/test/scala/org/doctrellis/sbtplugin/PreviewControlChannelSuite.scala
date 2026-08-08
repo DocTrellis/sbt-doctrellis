@@ -209,17 +209,17 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           override def call(): Boolean =
             events.acceptHello("ready", siteEvents = true),
       )
-      assert(readyEntered.await(1L, TimeUnit.SECONDS))
+      assert(readyEntered.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       val publication = pool.submit(
         new Callable[Unit]:
           override def call(): Unit =
             publicationStarted.countDown()
             events.siteChanged("siteChanged"),
       )
-      assert(publicationStarted.await(1L, TimeUnit.SECONDS))
+      assert(publicationStarted.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       releaseReady.countDown()
-      assert(acceptance.get(1L, TimeUnit.SECONDS))
-      publication.get(1L, TimeUnit.SECONDS)
+      assert(acceptance.get(TestTimeout.Seconds, TimeUnit.SECONDS))
+      publication.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assertEquals(
         sent.iterator().asScala.toVector,
         Vector("ready", "siteChanged"),
@@ -248,8 +248,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     try
       writer.start()
       assert(writer.send("first\n"))
-      assert(failed.await(1L, TimeUnit.SECONDS))
-      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(failed.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
       assertEquals(failure.get().getClass, classOf[IOException])
       assert(!writer.send("second\n"))
     finally
@@ -275,7 +275,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           length: Int,
       ): Unit =
         writeEntered.countDown()
-        if !releaseWrite.await(1L, TimeUnit.SECONDS) then
+        if !releaseWrite.await(TestTimeout.Seconds, TimeUnit.SECONDS) then
           throw IOException("controlled write was not released")
         writeExited.set(true)
         throw IOException("controlled write failure")
@@ -293,7 +293,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     try
       writer.start()
       assert(writer.send("frame\n"))
-      assert(writeEntered.await(1L, TimeUnit.SECONDS))
+      assert(writeEntered.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       assert(
         writer.finish(() =>
           callbackSawWriteExit.set(writeExited.get())
@@ -303,9 +303,9 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       )
       releaseWrite.countDown()
 
-      assert(failed.await(1L, TimeUnit.SECONDS))
-      assert(callbackRan.await(1L, TimeUnit.SECONDS))
-      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(failed.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(callbackRan.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
       assertEquals(failure.get().getMessage, "controlled write failure")
       assert(callbackSawWriteExit.get())
       assertEquals(callbackCount.get(), 1)
@@ -334,7 +334,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           length: Int,
       ): Unit =
         writeEntered.countDown()
-        if !releaseWrite.await(1L, TimeUnit.SECONDS) then
+        if !releaseWrite.await(TestTimeout.Seconds, TimeUnit.SECONDS) then
           throw IOException("controlled write was not released")
         writeExited.set(true)
 
@@ -348,7 +348,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     try
       writer.start()
       assert(writer.send("frame\n"))
-      assert(writeEntered.await(1L, TimeUnit.SECONDS))
+      assert(writeEntered.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       assert(
         writer.finish(() =>
           callbackSawWriteExit.set(writeExited.get())
@@ -361,8 +361,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       assertEquals(callbackCount.get(), 0)
       releaseWrite.countDown()
 
-      assert(callbackRan.await(1L, TimeUnit.SECONDS))
-      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(callbackRan.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
       assert(callbackSawWriteExit.get())
       assertEquals(callbackCount.get(), 1)
 
@@ -398,8 +398,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         ),
       )
 
-      assert(callbackRan.await(1L, TimeUnit.SECONDS))
-      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(callbackRan.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
       assertEquals(observed.get(), "first\nsecond\n")
       assertEquals(callbackCount.get(), 1)
       assert(!writer.finish(() => callbackCount.incrementAndGet(): Unit))
@@ -433,9 +433,9 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         ),
       )
 
-      assert(failed.await(1L, TimeUnit.SECONDS))
-      assert(terminated.await(1L, TimeUnit.SECONDS))
-      assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+      assert(failed.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(terminated.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+      assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
       assertEquals(failure.get().getMessage, "controlled callback failure")
       assertEquals(callbackCount.get(), 1)
       writer.abort()
@@ -461,8 +461,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     val failure = intercept[RejectedExecutionException](writer.start())
 
     assertEquals(failure.getMessage, "controlled rejection")
-    assert(terminated.await(1L, TimeUnit.SECONDS))
-    assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+    assert(terminated.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+    assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
     assertEquals(callbackCount.get(), 1)
     writer.abort()
     assertEquals(callbackCount.get(), 1)
@@ -483,8 +483,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     assert(writer.finish(() => callbackCount.incrementAndGet(): Unit))
     writer.abort()
 
-    assert(terminated.await(1L, TimeUnit.SECONDS))
-    assert(writer.awaitTermination(1L, TimeUnit.SECONDS))
+    assert(terminated.await(TestTimeout.Seconds, TimeUnit.SECONDS))
+    assert(writer.awaitTermination(TestTimeout.Seconds, TimeUnit.SECONDS))
     assertEquals(callbackCount.get(), 1)
     writer.abort()
     assertEquals(callbackCount.get(), 1)
@@ -755,7 +755,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
                 .toEither,
         )
       start.countDown()
-      val results = attempts.map(_.get(5L, TimeUnit.SECONDS))
+      val results = attempts.map(_.get(TestTimeout.Seconds, TimeUnit.SECONDS))
       val winners = results.collect { case Right(paths) => paths }
       assertEquals(winners.size, 1)
       val winner = winners match
@@ -1012,8 +1012,8 @@ class PreviewControlChannelSuite extends munit.FunSuite:
             (1 to frameCount).foreach(index => control.siteChanged(index + 1L)),
       )
       start.countDown()
-      pings.get(2L, TimeUnit.SECONDS)
-      events.get(2L, TimeUnit.SECONDS)
+      pings.get(TestTimeout.Seconds, TimeUnit.SECONDS)
+      events.get(TestTimeout.Seconds, TimeUnit.SECONDS)
 
       val frames = Vector.fill(frameCount * 2)(
         right(PreviewControlJson.parse(read(client))),
@@ -1159,7 +1159,10 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         finally client.close()
 
         assert(
-          control.awaitStopAcknowledgedIfRequested(1L, TimeUnit.SECONDS),
+          control.awaitStopAcknowledgedIfRequested(
+            TestTimeout.Seconds,
+            TimeUnit.SECONDS,
+          ),
         )
         assertHttpStopped(binding.url)
         assertPortReusable(binding.port)
@@ -1211,7 +1214,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         new Callable[Int]:
           override def call(): Int = channel.read(ByteBuffer.allocate(1)),
       )
-      assertEquals(result.get(1L, TimeUnit.SECONDS), -1)
+      assertEquals(result.get(TestTimeout.Seconds, TimeUnit.SECONDS), -1)
     finally executor.shutdownNow(): Unit
 
   private def unixMetadataJson(address: String): String =

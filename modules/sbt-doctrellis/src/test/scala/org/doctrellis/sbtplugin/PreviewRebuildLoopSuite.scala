@@ -20,7 +20,7 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
     val pool              = Executors.newFixedThreadPool(2)
     val mailbox           = BlockingPreviewEventMailbox(() =>
       timestampCaptured.countDown()
-      if !releaseEnqueue.await(1L, TimeUnit.SECONDS) then
+      if !releaseEnqueue.await(TestTimeout.Seconds, TimeUnit.SECONDS) then
         throw AssertionError("test did not release the invalidation enqueue")
       7L,
     )
@@ -30,7 +30,7 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
         new Callable[Unit]:
           override def call(): Unit = mailbox.invalidate(),
       )
-      assert(timestampCaptured.await(1L, TimeUnit.SECONDS))
+      assert(timestampCaptured.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       val drain = pool.submit(
         new Callable[Unit]:
           override def call(): Unit =
@@ -38,15 +38,15 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
             drained.set(mailbox.pollNow())
             drainCompleted.countDown(),
       )
-      assert(drainStarted.await(1L, TimeUnit.SECONDS))
+      assert(drainStarted.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       assert(
         !drainCompleted.await(100L, TimeUnit.MILLISECONDS),
         "the drain must not pass a timestamped invalidation before its enqueue",
       )
 
       releaseEnqueue.countDown()
-      invalidation.get(1L, TimeUnit.SECONDS)
-      drain.get(1L, TimeUnit.SECONDS)
+      invalidation.get(TestTimeout.Seconds, TimeUnit.SECONDS)
+      drain.get(TestTimeout.Seconds, TimeUnit.SECONDS)
       assertEquals(
         drained.get(),
         Some(PreviewLoopEvent.Invalidated(7L)),
@@ -130,7 +130,11 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
                       "rebuilt",
                     )
                     buildStarted.countDown()
-                    if !releaseBuild.await(5L, TimeUnit.SECONDS) then
+                    if !releaseBuild.await(
+                        TestTimeout.Seconds,
+                        TimeUnit.SECONDS,
+                      )
+                    then
                       throw AssertionError(
                         "test did not release the staged rebuild",
                       )
@@ -153,7 +157,7 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
       )
 
       try
-        assert(buildStarted.await(5L, TimeUnit.SECONDS))
+        assert(buildStarted.await(TestTimeout.Seconds, TimeUnit.SECONDS))
         assert(
           Files.isRegularFile(staged.mdocDirectory.resolve("index.md")),
         )
@@ -177,8 +181,8 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
         )
 
         releaseBuild.countDown()
-        loop.get(5L, TimeUnit.SECONDS)
-        assert(cleanupFinished.await(1L, TimeUnit.SECONDS))
+        loop.get(TestTimeout.Seconds, TimeUnit.SECONDS)
+        assert(cleanupFinished.await(TestTimeout.Seconds, TimeUnit.SECONDS))
         assertEquals(published.toVector, Vector(2L))
         assertEquals(
           Files.readString(layout.mdocDirectory.resolve("index.md")),
@@ -193,7 +197,7 @@ class PreviewRebuildLoopSuite extends munit.FunSuite:
         releaseBuild.countDown()
         mailbox.stop()
         if !loop.isDone then
-          try loop.get(5L, TimeUnit.SECONDS): Unit
+          try loop.get(TestTimeout.Seconds, TimeUnit.SECONDS): Unit
           catch case _: Exception => ()
         worker.shutdownNow(): Unit
 

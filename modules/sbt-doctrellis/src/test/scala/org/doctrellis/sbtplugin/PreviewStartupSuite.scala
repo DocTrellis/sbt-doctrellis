@@ -103,11 +103,11 @@ class PreviewStartupSuite extends munit.FunSuite:
     try
       val waiting = executor.submit(() =>
         entered.countDown()
-        completion.await(5L, TimeUnit.SECONDS),
+        completion.await(TestTimeout.Seconds, TimeUnit.SECONDS),
       )
-      assert(entered.await(1L, TimeUnit.SECONDS))
+      assert(entered.await(TestTimeout.Seconds, TimeUnit.SECONDS))
       assert(!waiting.isDone)
       completion.complete()
       completion.complete()
-      assert(waiting.get(1L, TimeUnit.SECONDS))
+      assert(waiting.get(TestTimeout.Seconds, TimeUnit.SECONDS))
     finally executor.shutdownNow(): Unit
