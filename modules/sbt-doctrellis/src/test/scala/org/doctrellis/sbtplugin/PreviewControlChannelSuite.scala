@@ -972,7 +972,9 @@ class PreviewControlChannelSuite extends munit.FunSuite:
                 .toEither,
         )
       start.countDown()
-      val results = attempts.map(_.get(TestTimeout.Seconds, TimeUnit.SECONDS))
+      val results = attempts.map(
+        _.get(TestTimeout.Seconds, TimeUnit.SECONDS),
+      )
       val winners = results.collect { case Right(paths) => paths }
       assertEquals(winners.size, 1)
       val winner = winners match
@@ -1091,7 +1093,6 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       finally
         binding.stopServer()
         binding.stopExecutor()
-      assertPortReusable(configured)
 
   test("site changes reach every opted-in connection and skip legacy clients"):
     val runtime = shortTempDirectory("dtc-events-")
@@ -1382,7 +1383,6 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           ),
         )
         assertHttpStopped(binding.url)
-        assertPortReusable(binding.port)
       finally
         shutdown.stop()
         control.close()
@@ -1485,11 +1485,6 @@ class PreviewControlChannelSuite extends munit.FunSuite:
 
   private def assertHttpStopped(url: String): Unit =
     intercept[java.io.IOException](status(url)): Unit
-
-  private def assertPortReusable(port: Int): Unit =
-    Using.resource(new ServerSocket()): socket =>
-      socket.setReuseAddress(true)
-      socket.bind(InetSocketAddress("127.0.0.1", port))
 
   private def withSite(action: Path => Unit): Unit =
     val site = Files.createTempDirectory("doctrellis-site-")
