@@ -8,7 +8,10 @@ import cats.effect.{Deferred, IO, Ref}
 import munit.CatsEffectSuite
 
 import org.doctrellis.vscode.domain.*
-import org.doctrellis.vscode.infrastructure.facade.WorkspaceFolder
+import org.doctrellis.vscode.infrastructure.facade.{
+  OutputChannel,
+  WorkspaceFolder,
+}
 
 class VscodeInterpreterLogicSuite extends CatsEffectSuite:
   test("cancels owned background tasks when their resource closes"):
@@ -22,6 +25,53 @@ class VscodeInterpreterLogicSuite extends CatsEffectSuite:
         ) *> started.get
       _ <- canceled.get.timeout(1.second)
     yield ()
+
+  test("error reporting does not await the user notification"):
+    val events = js.Array[String]()
+    for
+      notificationStarted  <- Deferred[IO, Unit]
+      keepNotificationOpen <- Deferred[IO, Unit]
+      notifications        <- Ref.of[IO, Vector[String]](Vector.empty)
+      _                    <- BackgroundTasks.resource.use: tasks =>
+        val output = VscodeOutput(
+          channel = outputChannel(events),
+          backgroundTasks = tasks,
+          notifyInformation = _ => IO.unit,
+          notifyError = message =>
+            notifications.update(_ :+ message) *>
+              notificationStarted.complete(()).void *>
+              keepNotificationOpen.get,
+        )
+        output.report("failure").timeout(1.second) *>
+          notificationStarted.get.timeout(1.second)
+      actualNotifications <- notifications.get
+    yield
+      assertEquals(
+        events.toVector,
+        Vector("append:ERROR: failure\n", "show:true"),
+      )
+      assertEquals(actualNotifications, Vector("DocTrellis: failure"))
+
+  test("information reporting writes and sends an unprefixed notification"):
+    val events = js.Array[String]()
+    for
+      notificationStarted <- Deferred[IO, Unit]
+      notifications       <- Ref.of[IO, Vector[String]](Vector.empty)
+      _                   <- BackgroundTasks.resource.use: tasks =>
+        val output = VscodeOutput(
+          channel = outputChannel(events),
+          backgroundTasks = tasks,
+          notifyInformation = message =>
+            notifications.update(_ :+ message) *>
+              notificationStarted.complete(()).void,
+          notifyError = _ => IO.unit,
+        )
+        output.info("ready") *>
+          notificationStarted.get.timeout(1.second)
+      actualNotifications <- notifications.get
+    yield
+      assertEquals(events.toVector, Vector("append:ready\n"))
+      assertEquals(actualNotifications, Vector("ready"))
 
   test("multi-root selection keeps labels and workspaces independent"):
     val first  = workspace("/work/first", "file:///work/first")
@@ -220,3 +270,13 @@ class VscodeInterpreterLogicSuite extends CatsEffectSuite:
     js.Dynamic
       .literal(name = name, uri = uri)
       .asInstanceOf[WorkspaceFolder]
+
+  private def outputChannel(events: js.Array[String]): OutputChannel =
+    val append: js.Function1[String, Unit] = value =>
+      events.push(s"append:$value"): Unit
+    val show: js.Function1[Boolean, Unit] = preserveFocus =>
+      events.push(s"show:$preserveFocus"): Unit
+    val dispose: js.Function0[Unit] = () => ()
+    js.Dynamic
+      .literal(append = append, show = show, dispose = dispose)
+      .asInstanceOf[OutputChannel]

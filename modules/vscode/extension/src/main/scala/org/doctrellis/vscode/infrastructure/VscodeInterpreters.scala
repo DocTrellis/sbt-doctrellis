@@ -11,9 +11,11 @@ import org.doctrellis.vscode.application.{PreviewService, ThrowableMessage}
 import org.doctrellis.vscode.domain.*
 import org.doctrellis.vscode.infrastructure.facade.*
 
-private[infrastructure] final class VscodeOutput private (
+private[infrastructure] final class VscodeOutput private[infrastructure] (
     channel: OutputChannel,
     backgroundTasks: BackgroundTasks,
+    notifyInformation: String => IO[Unit],
+    notifyError: String => IO[Unit],
 ):
   def append(value: String): IO[Unit] = IO.delay(channel.append(value))
 
@@ -21,17 +23,15 @@ private[infrastructure] final class VscodeOutput private (
     append(s"$message\n") *>
       backgroundTasks
         .submit(
-          IO.fromPromise(IO.delay(VSWindow.showInformationMessage(message)))
-            .attempt
-            .void,
+          notifyInformation(message).attempt.void,
         )
 
   def report(message: String): IO[Unit] =
     append(s"ERROR: $message\n") *>
       IO.delay(channel.show(true)) *>
-      IO.fromPromise(
-        IO.delay(VSWindow.showErrorMessage(s"DocTrellis: $message")),
-      ).void
+      backgroundTasks.submit(
+        notifyError(s"DocTrellis: $message").attempt.void,
+      )
 
   def show: IO[Unit] = IO.delay(channel.show(false))
 
@@ -42,7 +42,14 @@ private[infrastructure] object VscodeOutput:
         IO.delay(VSWindow.createOutputChannel("DocTrellis")),
       )(channel => IO.delay(channel.dispose()))
       backgroundTasks <- BackgroundTasks.resource
-    yield VscodeOutput(channel, backgroundTasks)
+    yield VscodeOutput(
+      channel = channel,
+      backgroundTasks = backgroundTasks,
+      notifyInformation = message =>
+        IO.fromPromise(IO.delay(VSWindow.showInformationMessage(message))).void,
+      notifyError = message =>
+        IO.fromPromise(IO.delay(VSWindow.showErrorMessage(message))).void,
+    )
 
 private[infrastructure] final class BackgroundTasks private (
     supervisor: Supervisor[IO],
