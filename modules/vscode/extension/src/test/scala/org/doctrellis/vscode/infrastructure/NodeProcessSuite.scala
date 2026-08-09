@@ -209,9 +209,13 @@ class NodeProcessSuite extends CatsEffectSuite:
     if !runExampleIntegration then IO.unit
     else Dispatcher.parallel[IO](await = false).use(testSignalEndpointCleanup)
 
-  test("replaces stale TCP metadata on a recycled loopback port"):
+  test("replaces stale metadata whose pid and port belong to another process"):
     if !runExampleIntegration then IO.unit
     else Dispatcher.parallel[IO](await = false).use(testRecycledTcpMetadata)
+
+  test("replaces malformed workspace metadata"):
+    if !runExampleIntegration then IO.unit
+    else Dispatcher.parallel[IO](await = false).use(testMalformedMetadata)
 
   private def testReadyStop(dispatcher: Dispatcher[IO]): IO[Unit] =
     for
@@ -621,7 +625,7 @@ class NodeProcessSuite extends CatsEffectSuite:
           for
             fixture <- occupiedReady.get.timeout(5.seconds)
             stale =
-              s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":2147483647,"sessionId":"stale-session","launchId":"stale-launch","token":"${"0" * 64}"}"""
+              s"""{"version":1,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":${fixture.pid},"sessionId":"stale-session","launchId":"stale-launch","token":"${"0" * 64}"}"""
             _ <- promise(
               TestNodeFsPromises.writeFile(endpoint.metadataPath, stale),
             )
@@ -655,6 +659,41 @@ class NodeProcessSuite extends CatsEffectSuite:
     yield
       assert(served)
       assert(occupiedDuring)
+      assert(!stopped)
+      assert(!alive)
+      assert(!metadataAfter)
+
+  private def testMalformedMetadata(
+      dispatcher: Dispatcher[IO],
+  ): IO[Unit] =
+    for
+      endpoint <- WorkspaceChannel.endpoint(exampleWorkspace)
+      _        <- promise(
+        TestNodeFsPromises.writeFile(endpoint.metadataPath, "not-json"),
+      )
+      ownedPid <- Deferred[IO, Int]
+      log      <- Ref.of[IO, String]("")
+      active   <- WorkspacePreview
+        .launch(dispatcher, captureOwnedPid(log, ownedPid))(
+          exampleWorkspace,
+          exampleCommand,
+        )
+        .use: running =>
+          for
+            announcement <- IO.fromOption(running.announcedUrl)(
+              IllegalStateException("dynamic URL was not available"),
+            )
+            url    <- announcement.timeout(120.seconds)
+            pid    <- ownedPid.get.timeout(10.seconds)
+            served <- NodeHttpProbe.ready(url)
+          yield (running, url, pid, served)
+      (running, url, pid, served) = active
+      _             <- running.awaitExit
+      stopped       <- NodeHttpProbe.ready(url)
+      alive         <- processIsAlive(pid)
+      metadataAfter <- exists(endpoint.metadataPath)
+    yield
+      assert(served)
       assert(!stopped)
       assert(!alive)
       assert(!metadataAfter)

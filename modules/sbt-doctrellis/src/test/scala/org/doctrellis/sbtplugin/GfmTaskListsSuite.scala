@@ -140,6 +140,34 @@ class GfmTaskListsSuite extends munit.FunSuite:
     assertEquals(occurrences(html, "type=\"checkbox\""), 2)
     assert(html.contains("fenced content"))
 
+  test("does not open a fence indented four spaces past list content"):
+    val html = render(
+      """- ordinary parent
+        |
+        |      ```text
+        |  - [x] nested child
+        |""".stripMargin,
+    )
+
+    assertEquals(occurrences(html, "<ul"), 2)
+    assertEquals(occurrences(html, "type=\"checkbox\""), 1)
+    assert(html.contains("nested child"))
+
+  test("does not close a fence indented four spaces past list content"):
+    val html = render(
+      """- ordinary parent
+        |  ```text
+        |      ```
+        |  - [x] fenced literal
+        |  ```
+        |  - [x] nested child
+        |""".stripMargin,
+    )
+
+    assertEquals(occurrences(html, "type=\"checkbox\""), 1)
+    assert(html.contains("- [x] fenced literal"))
+    assert(html.contains("nested child"))
+
   test("does not reinterpret indented code as nested task lists"):
     val bullet = render(
       """- [ ] task

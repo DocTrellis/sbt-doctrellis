@@ -28,11 +28,16 @@ private[sbtplugin] final class StaticSiteHandler private (
   )
 
   override def handle(exchange: HttpExchange): Unit =
-    val method   = exchange.getRequestMethod
-    val response =
+    val method     = exchange.getRequestMethod
+    val requestUri = exchange.getRequestURI
+    val response   =
       try
         publicationLock.read(
-          snapshot(method, exchange.getRequestURI.getRawPath),
+          snapshot(
+            method,
+            requestUri.getRawPath,
+            Option(requestUri.getRawQuery),
+          ),
         )
       catch
         case error: Throwable =>
@@ -47,6 +52,7 @@ private[sbtplugin] final class StaticSiteHandler private (
   private def snapshot(
       method: String,
       requestPath: String,
+      rawQuery: Option[String],
   ): StaticSiteHandler.ResponseSnapshot =
     if method != "GET" && method != "HEAD" then
       StaticSiteHandler.textResponse(
@@ -59,6 +65,17 @@ private[sbtplugin] final class StaticSiteHandler private (
       StaticSiteHandler.decode(requestPath) match
         case Some(StaticSiteHandler.WebviewBridgePath) =>
           StaticSiteHandler.webviewBridgeResponse(includeBody = method == "GET")
+        case Some(decodedPath)
+            if !requestPath.endsWith("/") &&
+              StaticSiteHandler.resolvesDirectory(
+                normalizedRoot,
+                decodedPath,
+              ) =>
+          val query = rawQuery.filter(_.nonEmpty).fold("")(value => s"?$value")
+          StaticSiteHandler.redirectResponse(
+            location = s"$requestPath/$query",
+            includeBody = method == "GET",
+          )
         case Some(decodedPath) =>
           StaticSiteHandler.resolveDecoded(
             normalizedRoot,
@@ -267,6 +284,20 @@ private[sbtplugin] object StaticSiteHandler:
       body = Option.when(includeBody)(new InMemoryBody(bytes)),
     )
 
+  private def redirectResponse(
+      location: String,
+      includeBody: Boolean,
+  ): ResponseSnapshot =
+    textResponse(
+      status = 308,
+      message = "Permanent Redirect",
+      includeBody = includeBody,
+      headers = List(
+        "Location"      -> location,
+        "Cache-Control" -> "no-store",
+      ),
+    )
+
   private def notFound(includeBody: Boolean): ResponseSnapshot =
     textResponse(
       404,
@@ -419,6 +450,22 @@ private[sbtplugin] object StaticSiteHandler:
         if realPage.startsWith(realRoot)
       yield realPage
     catch case _: InvalidPathException => None
+
+  private[sbtplugin] def resolvesDirectory(
+      root: Path,
+      decoded: String,
+  ): Boolean =
+    try
+      (for
+        realRoot <- realPath(root)
+        relative  = decoded.stripPrefix("/")
+        candidate = realRoot.resolve(relative).normalize()
+        realPath <- Option
+          .when(candidate.startsWith(realRoot))(candidate)
+          .flatMap(StaticSiteHandler.realPath)
+        if realPath.startsWith(realRoot) && Files.isDirectory(realPath)
+      yield ()).nonEmpty
+    catch case _: InvalidPathException => false
 
   private[sbtplugin] def decode(requestPath: String): Option[String] =
     val raw     = Option(requestPath).getOrElse("/")

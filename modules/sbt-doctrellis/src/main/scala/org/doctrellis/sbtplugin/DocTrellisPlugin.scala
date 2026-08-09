@@ -141,18 +141,22 @@ private[sbtplugin] object PreviewServer:
     var watcher         = Option.empty[PreviewSourceWatcher]
     var binding         = Option.empty[PreviewHttpBinding]
     var shutdown        = Option.empty[PreviewServerShutdown]
+    var buildSession    = Option.empty[DocTrellisBuildSession]
     val control         = AtomicReference[PreviewControlServer]()
     val cleanupComplete = PreviewCleanupCompletion()
     var shutdownHook    = Option.empty[Thread]
     var primaryFailure  = Option.empty[Throwable]
     try
+      val openedBuildSession = buildProgram.openSession()
+      buildSession = Some(openedBuildSession)
       val openedWatcher = PreviewSourceWatcher.open(
         layout.sourceDirectory,
         mailbox,
       )
       watcher = Some(openedWatcher)
       val openedBinding = PreviewStartup.startServing(
-        initialBuild = () => publication.buildAndPublish(buildProgram.build),
+        initialBuild =
+          () => publication.buildAndPublish(openedBuildSession.build),
         ensureWatcherHealthy = () => mailbox.throwIfWatcherFailed(),
         startServing = () =>
           PreviewHttpBinding.start(
@@ -212,7 +216,7 @@ private[sbtplugin] object PreviewServer:
       PreviewRebuildLoop.run(
         mailbox = mailbox,
         quietPeriodNanos = PreviewRebuildLoop.QuietPeriodNanos,
-        rebuild = () => publication.buildAndPublish(buildProgram.build),
+        rebuild = () => publication.buildAndPublish(openedBuildSession.build),
         onPublished =
           revision => Option(control.get()).foreach(_.siteChanged(revision)),
         log = log,
@@ -247,6 +251,7 @@ private[sbtplugin] object PreviewServer:
           cleanup(binding.foreach(_.stopServer()))
           cleanup(binding.foreach(_.stopExecutor()))
         cleanup(watcher.foreach(_.close()))
+        cleanup(buildSession.foreach(_.close()))
         cleanup(publication.close())
         if restoreInterrupt then Thread.currentThread().interrupt()
         cleanupFailure.foreach: error =>

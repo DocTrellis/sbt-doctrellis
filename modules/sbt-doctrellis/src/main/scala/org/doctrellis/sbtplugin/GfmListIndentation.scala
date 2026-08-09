@@ -31,7 +31,11 @@ private[sbtplugin] object GfmListIndentation:
       segment: Int,
   )
 
-  private final case class Fence(marker: Char, length: Int)
+  private final case class Fence(
+      marker: Char,
+      length: Int,
+      containerIndent: Int,
+  )
 
   def normalize(input: String): String =
     val lines        = splitLines(input)
@@ -110,12 +114,21 @@ private[sbtplugin] object GfmListIndentation:
               else endList()
 
             case FenceLine(indentation, marker, _) =>
-              val originalIndent = indentation.length
-              if containingItem(originalIndent).nonEmpty then
-                editContinuation(line, index)
-              else endList()
-              val markerCharacter = if marker.startsWith("`") then '`' else '~'
-              fence = Some(Fence(markerCharacter, marker.length))
+              val originalIndent  = indentation.length
+              val parent          = containingItem(originalIndent)
+              val containerIndent = parent.fold(0)(_.contentIndent)
+              val relativeIndent  = originalIndent - containerIndent
+              parent.fold(endList())(_ => editContinuation(line, index))
+              if relativeIndent >= 0 && relativeIndent <= 3 then
+                val markerCharacter =
+                  if marker.startsWith("`") then '`' else '~'
+                fence = Some(
+                  Fence(
+                    markerCharacter,
+                    marker.length,
+                    containerIndent,
+                  ),
+                )
 
             case _ if line.content.trim.isEmpty => ()
             case _                              =>
@@ -164,8 +177,11 @@ private[sbtplugin] object GfmListIndentation:
     input.takeWhile(_ == ' ').length
 
   private def closesFence(input: String, fence: Fence): Boolean =
-    val content = input.dropWhile(_ == ' ')
-    val marker  = content.takeWhile(_ == fence.marker)
+    val indentation    = leadingSpaces(input)
+    val relativeIndent = indentation - fence.containerIndent
+    val content        = input.drop(indentation)
+    val marker         = content.takeWhile(_ == fence.marker)
+    relativeIndent >= 0 && relativeIndent <= 3 &&
     marker.length >= fence.length && content.drop(marker.length).trim.isEmpty
 
   private def splitLines(input: String): Vector[SourceLine] =

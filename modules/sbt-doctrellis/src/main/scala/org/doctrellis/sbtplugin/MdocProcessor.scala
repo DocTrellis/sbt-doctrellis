@@ -10,7 +10,76 @@ import scala.util.control.NonFatal
 
 import mdoc.interfaces.{DiagnosticSeverity, Mdoc}
 
+private[sbtplugin] final class MdocProcessor private (
+    loader: IsolatedMdocClassLoader,
+    engine: Mdoc,
+    variables: Map[String, String],
+    info: String => Unit,
+    warn: String => Unit,
+) extends AutoCloseable:
+  def process(
+      sourceDirectory: Path,
+      outputDirectory: Path,
+  ): Unit =
+    val markdownCount = MdocProcessor.processSourceTree(
+      sourceDirectory,
+      outputDirectory,
+    ): (relative, input, target) =>
+      MdocProcessor.evaluate(
+        engine,
+        relative,
+        input,
+        target,
+        variables,
+        info,
+        warn,
+      )
+    info(s"DocTrellis: mdoc processed $markdownCount Markdown file(s)")
+
+  override def close(): Unit =
+    var failure = Option.empty[Throwable]
+
+    def release(action: => Unit): Unit =
+      try action
+      catch
+        case error: Throwable =>
+          failure match
+            case None           => failure = Some(error)
+            case Some(existing) => existing.addSuppressed(error)
+
+    release(engine.shutdown())
+    release(loader.close())
+    failure.foreach(throw _)
+
 private[sbtplugin] object MdocProcessor:
+  def open(
+      workspaceDirectory: Path,
+      classpath: Seq[Path],
+      scalacOptions: Seq[String],
+      settings: Seq[String],
+      variables: Map[String, String],
+      info: String => Unit,
+      warn: String => Unit,
+  ): MdocProcessor =
+    val loader = IsolatedMdocClassLoader(
+      classpath.map(_.toUri.toURL).toArray,
+      classOf[Mdoc].getClassLoader,
+    )
+    try
+      val configured = configure(
+        engine = load(loader),
+        workspaceDirectory = workspaceDirectory,
+        classpath = classpath,
+        scalacOptions = scalacOptions,
+        settings = settings,
+      )
+      new MdocProcessor(loader, configured, variables, info, warn)
+    catch
+      case error: Throwable =>
+        try loader.close()
+        catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        throw error
+
   def process(
       workspaceDirectory: Path,
       sourceDirectory: Path,
@@ -22,38 +91,17 @@ private[sbtplugin] object MdocProcessor:
       info: String => Unit,
       warn: String => Unit,
   ): Unit =
-    val source = sourceDirectory
-    val output = outputDirectory
-
     MdocResource.use(
-      IsolatedMdocClassLoader(
-        classpath.map(_.toUri.toURL).toArray,
-        classOf[Mdoc].getClassLoader,
+      open(
+        workspaceDirectory,
+        classpath,
+        scalacOptions,
+        settings,
+        variables,
+        info,
+        warn,
       ),
-    )(_.close()): loader =>
-      MdocResource.use(
-        configure(
-          engine = load(loader),
-          workspaceDirectory = workspaceDirectory,
-          classpath = classpath,
-          scalacOptions = scalacOptions,
-          settings = settings,
-        ),
-      )(_.shutdown()): configured =>
-        val markdownCount = processSourceTree(source, output):
-          (relative, input, target) =>
-            evaluate(
-              configured,
-              relative,
-              input,
-              target,
-              variables,
-              info,
-              warn,
-            )
-        info(
-          s"DocTrellis: mdoc processed $markdownCount Markdown file(s)",
-        )
+    )(_.close())(_.process(sourceDirectory, outputDirectory))
 
   private[sbtplugin] def processSourceTree(
       source: Path,

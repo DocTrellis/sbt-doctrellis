@@ -52,8 +52,7 @@ private[infrastructure] final case class WorkspaceLaunchMismatch(
 
 private[infrastructure] final case class WorkspaceMetadataFailure(
     detail: String,
-) extends IllegalStateException(detail):
-  def retryableDuringPublication: Boolean = detail == "IPC TCP port is invalid"
+) extends IllegalStateException(detail)
 
 private[infrastructure] object WorkspaceChannel:
   val Protocol             = "doctrellis-preview-v1"
@@ -87,12 +86,17 @@ private[infrastructure] object WorkspaceChannel:
         "could not create the DocTrellis IPC runtime directory",
       )
       owner = Option.when(platform == ProcessPlatform.Posix)(user.uid)
-      _ <- owner.traverse_(verifyRuntimeDirectory(runtime, _))
+      _                <- owner.traverse_(verifyRuntimeDirectory(runtime, _))
+      canonicalRuntime <- promise(
+        NodeFsPromises.realpath(runtime),
+        "could not canonicalize the DocTrellis IPC runtime directory",
+      )
+      _ <- owner.traverse_(verifyRuntimeDirectory(canonicalRuntime, _))
     yield WorkspaceChannelEndpoint(
       canonicalWorkspace = canonical,
-      runtimeDirectory = runtime,
-      metadataPath = NodePath.join(runtime, s"$workspaceHash.json"),
-      socketPrefix = NodePath.join(runtime, s"$workspaceHash."),
+      runtimeDirectory = canonicalRuntime,
+      metadataPath = NodePath.join(canonicalRuntime, s"$workspaceHash.json"),
+      socketPrefix = NodePath.join(canonicalRuntime, s"$workspaceHash."),
       workspaceHash = workspaceHash,
       runtimeOwner = owner,
     )
@@ -982,6 +986,8 @@ private[infrastructure] object WorkspaceChannelConnection:
     )
 
 private[infrastructure] object WorkspacePreview:
+  private val ExistingPreviewConnectTimeout = 1.second
+
   def launch(
       dispatcher: Dispatcher[IO],
       append: String => IO[Unit],
@@ -1018,9 +1024,29 @@ private[infrastructure] object WorkspacePreview:
               s"[${workspace.name}] Reusing the existing workspace preview as a read-only lease.\n",
             ).handleError(_ => ()),
           )
-          DynamicPreviewRuntime.reused(connect)
+          reuseOrLaunch(
+            reuse = DynamicPreviewRuntime.reused(connect),
+            launch = launchOwned(
+              dispatcher,
+              append,
+              endpoint,
+              workspace,
+              command,
+            ),
+          )
         case false =>
           launchOwned(dispatcher, append, endpoint, workspace, command)
+
+  private[infrastructure] def reuseOrLaunch[A](
+      reuse: IO[A],
+      launch: IO[A],
+      timeout: FiniteDuration = ExistingPreviewConnectTimeout,
+  ): IO[A] =
+    reuse
+      .map(Some(_))
+      .handleError(_ => None)
+      .timeoutTo(timeout, IO.none)
+      .flatMap(_.fold(launch)(IO.pure))
 
   private def launchOwned(
       dispatcher: Dispatcher[IO],
@@ -1113,50 +1139,48 @@ private[infrastructure] object DynamicPreviewRuntime:
   def reused(
       acquire: IO[WorkspaceChannelConnection],
   ): IO[DynamicPreviewRuntime] =
-    for
-      shared     <- acquire.memoize
-      connection <- Ref.of[IO, DynamicPreviewConnection](
-        DynamicPreviewConnection.Pending,
-      )
-      stop <- Deferred[IO, Unit]
-    yield
-      def connected: IO[WorkspaceChannelConnection] =
-        connection.get.flatMap:
-          case DynamicPreviewConnection.Active(value) => IO.pure(value)
-          case DynamicPreviewConnection.Releasing     =>
-            IO.raiseError(
-              IllegalStateException("the reused preview is closing"),
+    IO.uncancelable: poll =>
+      poll(acquire).flatMap: active =>
+        val initialize =
+          for connection <- Ref.of[IO, DynamicPreviewConnection](
+              DynamicPreviewConnection.Active(active),
             )
-          case DynamicPreviewConnection.Pending =>
-            acquireAndInstall(
-              connection,
-              shared,
-            ).race(stop.get)
-              .flatMap:
-                case Left(value) => IO.pure(value)
-                case Right(_)    =>
+          yield
+            def connected: IO[WorkspaceChannelConnection] =
+              connection.get.flatMap:
+                case DynamicPreviewConnection.Active(value) => IO.pure(value)
+                case DynamicPreviewConnection.Pending       =>
                   IO.raiseError(
-                    IllegalStateException("the reused preview was closed"),
+                    IllegalStateException(
+                      "the reused preview connection is unavailable",
+                    ),
+                  )
+                case DynamicPreviewConnection.Releasing =>
+                  IO.raiseError(
+                    IllegalStateException("the reused preview is closing"),
                   )
 
-      val release = stop.complete(()).void *>
-        connection
-          .modify:
-            case DynamicPreviewConnection.Active(active) =>
-              DynamicPreviewConnection.Releasing -> Some(active)
-            case DynamicPreviewConnection.Pending |
-                DynamicPreviewConnection.Releasing =>
-              DynamicPreviewConnection.Releasing -> None
-          .flatMap(_.traverse_(_.close))
+            val release = connection
+              .modify:
+                case DynamicPreviewConnection.Active(value) =>
+                  DynamicPreviewConnection.Releasing -> Some(value)
+                case DynamicPreviewConnection.Pending |
+                    DynamicPreviewConnection.Releasing =>
+                  DynamicPreviewConnection.Releasing -> None
+              .flatMap(_.traverse_(_.close))
 
-      new DynamicPreviewRuntime(
-        running = RunningProcess.announced(
-          awaitExit = connected.flatMap(_.awaitExit),
-          awaitUrl = connected.flatMap(_.awaitUrl),
-          nextSiteRevision = connected.flatMap(_.nextSiteRevision),
-        ),
-        release = release,
-      )
+            new DynamicPreviewRuntime(
+              running = RunningProcess.announced(
+                awaitExit = connected.flatMap(_.awaitExit),
+                awaitUrl = connected.flatMap(_.awaitUrl),
+                nextSiteRevision = connected.flatMap(_.nextSiteRevision),
+              ),
+              release = release,
+            )
+
+        poll(initialize)
+          .onCancel(active.close.attempt.void)
+          .onError(_ => active.close.attempt.void)
 
   private[infrastructure] def installConnection(
       connection: Ref[IO, DynamicPreviewConnection],
@@ -1216,6 +1240,19 @@ private[infrastructure] object DynamicPreviewRuntime:
       workspaceName: String,
   ): DynamicPreviewRuntime =
     def connected: IO[WorkspaceChannelConnection] =
+      def retryWhileStarting(error: Throwable): IO[WorkspaceChannelConnection] =
+        IO.sleep(50.millis)
+          .race(process.awaitExit)
+          .flatMap:
+            case Left(_)     => connected
+            case Right(exit) =>
+              IO.raiseError(
+                IllegalStateException(
+                  s"the preview process exited before publishing its IPC endpoint ($exit)",
+                  error,
+                ),
+              )
+
       connection.get.flatMap:
         case DynamicPreviewConnection.Active(value) => IO.pure(value)
         case DynamicPreviewConnection.Releasing     =>
@@ -1232,17 +1269,8 @@ private[infrastructure] object DynamicPreviewRuntime:
             ),
           ).attempt
             .flatMap:
-              case Right(value)                         => IO.pure(value)
-              case Left(error: WorkspaceLaunchMismatch) =>
-                WorkspaceChannel
-                  .endpointOwnerAlive(endpoint)
-                  .flatMap:
-                    case true  => IO.raiseError(error)
-                    case false => IO.sleep(50.millis) *> connected
-              case Left(error: WorkspaceMetadataFailure)
-                  if !error.retryableDuringPublication =>
-                IO.raiseError(error)
-              case Left(_) => IO.sleep(50.millis) *> connected
+              case Right(value) => IO.pure(value)
+              case Left(error)  => retryWhileStarting(error)
 
     val release = connection
       .modify:

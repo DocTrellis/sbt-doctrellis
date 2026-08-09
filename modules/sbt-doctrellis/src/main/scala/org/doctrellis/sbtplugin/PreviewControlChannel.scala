@@ -41,7 +41,6 @@ import java.util.concurrent.{
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.annotation.tailrec
-import scala.jdk.OptionConverters.*
 import scala.util.control.NonFatal
 
 import sbt.Logger
@@ -205,7 +204,7 @@ private[sbtplugin] object PreviewControlConfig:
         (),
         PreviewControlConfigProblem.WorkspaceHashMismatch,
       )
-      runtime <- absolutePath(
+      runtime <- canonicalPath(
         "workspace IPC runtime directory",
         environment.runtimeDirectory,
       )
@@ -253,21 +252,6 @@ private[sbtplugin] object PreviewControlConfig:
       value: String,
   ): Either[PreviewControlConfigProblem, Path] =
     try Right(Path.of(value).toRealPath())
-    catch
-      case NonFatal(error) =>
-        Left(
-          PreviewControlConfigProblem.CannotResolve(
-            field,
-            value,
-            errorMessage(error),
-          ),
-        )
-
-  private def absolutePath(
-      field: String,
-      value: String,
-  ): Either[PreviewControlConfigProblem, Path] =
-    try Right(Path.of(value).toAbsolutePath.normalize())
     catch
       case NonFatal(error) =>
         Left(
@@ -470,12 +454,9 @@ private[sbtplugin] enum StaleEndpointDecision:
   case ProtectLive, RemoveStale
 
 private[sbtplugin] object StaleEndpointDecision:
-  def decide(
-      connectSucceeded: Boolean,
-      ownerAlive: Boolean,
-  ): StaleEndpointDecision =
-    if !connectSucceeded && !ownerAlive then StaleEndpointDecision.RemoveStale
-    else StaleEndpointDecision.ProtectLive
+  def decide(connectSucceeded: Boolean): StaleEndpointDecision =
+    if connectSucceeded then StaleEndpointDecision.ProtectLive
+    else StaleEndpointDecision.RemoveStale
 
 private[sbtplugin] final class PreviewControlServer private (
     server: ServerSocketChannel,
@@ -951,14 +932,10 @@ private[sbtplugin] object PreviewControlEndpoint:
       if Files.exists(metadataPath, LinkOption.NOFOLLOW_LINKS) then
         val existing = readRecoverable(metadataPath)
         val decision = existing match
-          case None           => StaleEndpointDecision.ProtectLive
+          case None           => StaleEndpointDecision.RemoveStale
           case Some(metadata) =>
             StaleEndpointDecision.decide(
               connectSucceeded = canConnect(metadata),
-              ownerAlive = ProcessHandle
-                .of(metadata.pid)
-                .toScala
-                .exists(_.isAlive),
             )
         decision match
           case StaleEndpointDecision.ProtectLive =>

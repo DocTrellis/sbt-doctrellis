@@ -489,31 +489,30 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     writer.abort()
     assertEquals(callbackCount.get(), 1)
 
-  test("stale endpoint policy removes only unreachable dead owners"):
+  test("stale endpoint policy trusts an authenticated endpoint, not its pid"):
     assertEquals(
       StaleEndpointDecision.decide(
         connectSucceeded = false,
-        ownerAlive = false,
       ),
       StaleEndpointDecision.RemoveStale,
     )
     assertEquals(
       StaleEndpointDecision.decide(
         connectSucceeded = true,
-        ownerAlive = false,
       ),
       StaleEndpointDecision.ProtectLive,
     )
 
   test("environment contract hashes the canonical workspace, not a subproject"):
-    val workspace   = Files.createTempDirectory("doctrellis-workspace-")
-    val project     = Files.createDirectories(workspace.resolve("subproject"))
-    val runtime     = shortTempDirectory("dtc-config-")
-    val unrelated   = Files.createTempDirectory("doctrellis-unrelated-")
-    val canonical   = workspace.toRealPath()
-    val hash        = PreviewControlConfig.shortHash(canonical.toString)
-    val owner       = Option.unless(isWindows)(runtimeOwner(runtime))
-    val environment = Map(
+    val workspace = Files.createTempDirectory("doctrellis-workspace-")
+    val project   = Files.createDirectories(workspace.resolve("subproject"))
+    val runtime   = shortTempDirectory("dtc-config-")
+    val unrelated = Files.createTempDirectory("doctrellis-unrelated-")
+    val canonical = workspace.toRealPath()
+    val workspaceRuntime = Files.createDirectories(canonical.resolve("ipc"))
+    val hash             = PreviewControlConfig.shortHash(canonical.toString)
+    val owner            = Option.unless(isWindows)(runtimeOwner(runtime))
+    val environment      = Map(
       PreviewControlConfig.ProtocolEnvironment -> PreviewControlConfig.Protocol,
       PreviewControlConfig.RuntimeEnvironment  -> runtime.toString,
       PreviewControlConfig.HashEnvironment     -> hash,
@@ -532,7 +531,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
         Right(
           Some(
             PreviewControlConfig(
-              runtimeDirectory = runtime.toAbsolutePath.normalize(),
+              runtimeDirectory = runtime.toRealPath(),
               workspaceHash = hash,
               launchId = "environment-launch",
               runtimeOwner = owner,
@@ -593,12 +592,26 @@ class PreviewControlChannelSuite extends munit.FunSuite:
           workspace = project,
           environment = environment.updated(
             PreviewControlConfig.RuntimeEnvironment,
-            canonical.resolve("ipc").toString,
+            workspaceRuntime.toString,
           ),
           runtimeOwnerRequired = !isWindows,
         ),
         Left(PreviewControlConfigProblem.RuntimeDirectoryInsideWorkspace),
       )
+      if !isWindows then
+        val linkedRuntime = unrelated.resolve("linked-runtime")
+        Files.createSymbolicLink(linkedRuntime, workspaceRuntime)
+        assertEquals(
+          PreviewControlConfig.fromEnvironment(
+            workspace = project,
+            environment = environment.updated(
+              PreviewControlConfig.RuntimeEnvironment,
+              linkedRuntime.toString,
+            ),
+            runtimeOwnerRequired = true,
+          ),
+          Left(PreviewControlConfigProblem.RuntimeDirectoryInsideWorkspace),
+        )
     finally
       deleteTree(unrelated)
       deleteTree(runtime)
@@ -905,7 +918,7 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       replacement.foreach(_.lease.close())
       deleteTree(runtime)
 
-  test("unmarked port-zero metadata remains protected"):
+  test("unmarked port-zero metadata is recoverable while holding the lease"):
     val runtime      = shortTempDirectory("dtc-windows-protect-")
     val hash         = "9123456789abcdef01234567"
     val metadataPath = runtime.resolve(s"$hash.json")
@@ -918,20 +931,26 @@ class PreviewControlChannelSuite extends munit.FunSuite:
     ).json
     try
       Files.writeString(metadataPath, unmarked)
-      intercept[IllegalStateException](
-        PreviewControlEndpoint.prepare(
-          config = PreviewControlConfig(
-            runtimeDirectory = runtime,
-            workspaceHash = hash,
-            launchId = launchId,
-          ),
-          pid = ProcessHandle.current().pid(),
-          sessionId = "replacement-session",
-          token = "1" * 64,
-          windows = true,
+      val prepared = PreviewControlEndpoint.prepare(
+        config = PreviewControlConfig(
+          runtimeDirectory = runtime,
+          workspaceHash = hash,
+          launchId = launchId,
         ),
-      ): Unit
-      assertEquals(Files.readString(metadataPath), unmarked)
+        pid = ProcessHandle.current().pid(),
+        sessionId = "replacement-session",
+        token = "1" * 64,
+        windows = true,
+      )
+      assertEquals(
+        right(
+          PreviewControlMetadata.parseProvisional(
+            Files.readString(metadataPath),
+          ),
+        ).sessionId,
+        "replacement-session",
+      )
+      prepared.lease.close()
     finally deleteTree(runtime)
 
   test("an endpoint lease serializes simultaneous stale cleanup"):
@@ -1035,33 +1054,30 @@ class PreviewControlChannelSuite extends munit.FunSuite:
       ): Unit
     finally deleteTree(parent)
 
-  test("malformed ownership metadata is protected instead of unlinked"):
+  test("malformed ownership metadata is replaced while holding the lease"):
     val runtime      = shortTempDirectory("dtc-protect-")
     val hash         = "2123456789abcdef01234567"
     val metadataPath = runtime.resolve(s"$hash.json")
     try
       Files.writeString(metadataPath, "not-json")
-      intercept[IllegalStateException](
-        PreviewControlEndpoint.prepare(
-          config = PreviewControlConfig(
-            runtimeDirectory = runtime,
-            workspaceHash = hash,
-            launchId = launchId,
-          ),
-          pid = ProcessHandle.current().pid(),
-          sessionId = "new-session",
-          token = "1" * 64,
+      val prepared = PreviewControlEndpoint.prepare(
+        config = PreviewControlConfig(
+          runtimeDirectory = runtime,
+          workspaceHash = hash,
+          launchId = launchId,
         ),
-      ): Unit
-      assertEquals(Files.readString(metadataPath), "not-json")
+        pid = ProcessHandle.current().pid(),
+        sessionId = "new-session",
+        token = "1" * 64,
+      )
+      assertEquals(
+        right(
+          PreviewControlMetadata.parse(Files.readString(metadataPath)),
+        ).sessionId,
+        "new-session",
+      )
+      prepared.lease.close()
     finally deleteTree(runtime)
-    assertEquals(
-      StaleEndpointDecision.decide(
-        connectSucceeded = false,
-        ownerAlive = true,
-      ),
-      StaleEndpointDecision.ProtectLive,
-    )
 
   test("two port-zero HTTP servers bind distinct positive ports"):
     withSite: site =>

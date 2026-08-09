@@ -65,6 +65,30 @@ class PreviewWebviewScriptSuite extends FunSuite:
     assertEquals(harness.frameUrl, harness.directUrl)
     assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
 
+  test("retries the bridge after an initial visible fallback"):
+    val harness = WrapperScriptHarness()
+
+    harness.fireNextTimeout()
+    assertEquals(harness.frameUrl, harness.directUrl)
+
+    harness.sendRefresh("attempt-1", "2")
+    assertEquals(harness.frameUrl, harness.bridgeUrl)
+    assertEquals(harness.refreshAcknowledgements, Nil)
+    assertEquals(harness.pendingTimerCount, 1)
+
+    harness.fireFrameLoad()
+    assertEquals(
+      harness.bridgeMessageTypes,
+      List("doctrellis.bridge.hello"),
+    )
+
+    harness.sendBridgeActive()
+    assertEquals(
+      harness.bridgeMessageTypes,
+      List("doctrellis.bridge.hello", "doctrellis.preview.refresh"),
+    )
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
+
   test("ignores panel visibility messages with another channel token"):
     val harness = WrapperScriptHarness()
 
@@ -206,6 +230,12 @@ private final class WrapperScriptHarness:
   )
   frame.updateDynamic("setAttribute")(
     ((_: String, _: String) => ()): js.Function2[String, String, Unit],
+  )
+  frame.updateDynamic("getAttribute")(
+    (
+        (name: String) =>
+          if name == "sandbox" then "allow-scripts allow-same-origin" else null,
+    ): js.Function1[String, String],
   )
   frame.updateDynamic("removeAttribute")(
     ((_: String) => ()): js.Function1[String, Unit],

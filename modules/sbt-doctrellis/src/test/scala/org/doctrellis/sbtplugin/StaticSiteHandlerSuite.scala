@@ -37,6 +37,37 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       )
     finally GeneratedDirectory.delete(root)
 
+  test("redirects directory requests to a trailing slash"):
+    val root = Files.createTempDirectory("doctrellis-handler-redirect")
+    try
+      val nested = Files.createDirectories(root.resolve("guide"))
+      Files.writeString(nested.resolve("index.html"), "nested")
+      val get = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create("/guide?section=intro"),
+      )
+      val head = BlockingExchange(
+        CountDownLatch(0),
+        CountDownLatch(0),
+        URI.create("/guide"),
+        requestMethod = "HEAD",
+        failOnResponseBody = true,
+      )
+
+      StaticSiteHandler(root).handle(get)
+      StaticSiteHandler(root).handle(head)
+
+      assertEquals(get.getResponseCode, 308)
+      assertEquals(
+        get.getResponseHeaders.getFirst("Location"),
+        "/guide/?section=intro",
+      )
+      assertEquals(head.getResponseCode, 308)
+      assertEquals(head.getResponseHeaders.getFirst("Location"), "/guide/")
+      assert(!head.responseBodyRequested)
+    finally GeneratedDirectory.delete(root)
+
   test("does not resolve traversal outside the site root"):
     val root = Files.createTempDirectory("doctrellis-handler")
     try

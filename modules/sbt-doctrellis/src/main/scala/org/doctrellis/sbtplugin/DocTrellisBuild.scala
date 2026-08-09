@@ -39,7 +39,8 @@ private[sbtplugin] final class DocTrellisBuildProgram(
   def layout: DocTrellisLayout = inputs.layout
 
   def buildPublic(): Unit =
-    withLockedPublicTarget(build)
+    withLockedPublicTarget: target =>
+      MdocResource.use(openSession())(_.close())(_.build(target))
 
   private[sbtplugin] def withLockedPublicTarget[A](
       operation: DocTrellisBuildTarget => A,
@@ -49,42 +50,32 @@ private[sbtplugin] final class DocTrellisBuildProgram(
       operation(target)
 
   def build(target: DocTrellisBuildTarget): Unit =
+    MdocResource.use(openSession())(_.close())(_.build(target))
+
+  def openSession(): DocTrellisBuildSession =
+    DocTrellisBuildSession.open(inputs)
+
+private[sbtplugin] final class DocTrellisBuildSession private (
+    inputs: DocTrellisBuildInputs,
+    mdoc: MdocProcessor,
+    laika: DocTrellisLaikaRenderer,
+) extends AutoCloseable:
+  def build(target: DocTrellisBuildTarget): Unit =
     GeneratedDirectory.reset(target.mdocDirectory)
     inputs.log.info(
       s"DocTrellis: running mdoc from ${inputs.layout.sourceDirectory}",
     )
-    MdocProcessor.process(
-      workspaceDirectory = inputs.layout.workspaceDirectory,
+    mdoc.process(
       sourceDirectory = inputs.layout.sourceDirectory,
       outputDirectory = target.mdocDirectory,
-      classpath = inputs.classpath,
-      scalacOptions = inputs.scalacOptions,
-      settings = inputs.mdocArguments,
-      variables = inputs.mdocVariables,
-      info = inputs.log.info,
-      warn = inputs.log.warn,
     )
 
     GeneratedDirectory.reset(target.siteDirectory)
     inputs.log.info(
       s"DocTrellis: rendering HTML with Laika and the Helium theme into ${target.siteDirectory}",
     )
-    val rendered = try
-      Transformer
-        .from(Markdown)
-        .to(HTML)
-        .using(Markdown.GitHubFlavor, GfmTaskLists)
-        .parallel[CatsIO]
-        .withTheme(
-          Helium.defaults.site.inlineCSS(GfmTaskLists.themeCSS).build,
-        )
-        .build
-        .use(
-          _.fromDirectory(target.mdocDirectory.toString)
-            .toDirectory(target.siteDirectory.toString)
-            .transform,
-        )
-        .unsafeRunSync()
+    val renderedPaths = try
+      laika.render(target.mdocDirectory, target.siteDirectory)
     catch
       case NonFatal(error) =>
         throw IllegalStateException(
@@ -93,7 +84,7 @@ private[sbtplugin] final class DocTrellisBuildProgram(
         )
 
     inputs.log.info(
-      s"DocTrellis: Laika rendered ${rendered.allDocuments.map(_.path).mkString(", ")}",
+      s"DocTrellis: Laika rendered ${renderedPaths.mkString(", ")}",
     )
 
     val index = target.siteDirectory.resolve("index.html")
@@ -102,6 +93,72 @@ private[sbtplugin] final class DocTrellisBuildProgram(
         s"DocTrellis did not generate an index page at $index",
       )
     inputs.log.success(s"DocTrellis site generated at ${target.siteDirectory}")
+
+  override def close(): Unit =
+    var failure = Option.empty[Throwable]
+
+    def release(action: => Unit): Unit =
+      try action
+      catch
+        case error: Throwable =>
+          failure match
+            case None           => failure = Some(error)
+            case Some(existing) => existing.addSuppressed(error)
+
+    release(laika.close())
+    release(mdoc.close())
+    failure.foreach(throw _)
+
+private[sbtplugin] object DocTrellisBuildSession:
+  def open(inputs: DocTrellisBuildInputs): DocTrellisBuildSession =
+    val mdoc = MdocProcessor.open(
+      workspaceDirectory = inputs.layout.workspaceDirectory,
+      classpath = inputs.classpath,
+      scalacOptions = inputs.scalacOptions,
+      settings = inputs.mdocArguments,
+      variables = inputs.mdocVariables,
+      info = inputs.log.info,
+      warn = inputs.log.warn,
+    )
+    try new DocTrellisBuildSession(inputs, mdoc, DocTrellisLaikaRenderer.open())
+    catch
+      case error: Throwable =>
+        try mdoc.close()
+        catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        throw error
+
+private[sbtplugin] final class DocTrellisLaikaRenderer private (
+    transform: (Path, Path) => Vector[String],
+    release: CatsIO[Unit],
+) extends AutoCloseable:
+  def render(source: Path, destination: Path): Vector[String] =
+    transform(source, destination)
+
+  override def close(): Unit = release.unsafeRunSync()
+
+private[sbtplugin] object DocTrellisLaikaRenderer:
+  def open(): DocTrellisLaikaRenderer =
+    val (transformer, release) = Transformer
+      .from(Markdown)
+      .to(HTML)
+      .using(Markdown.GitHubFlavor, GfmTaskLists)
+      .parallel[CatsIO]
+      .withTheme(
+        Helium.defaults.site.inlineCSS(GfmTaskLists.themeCSS).build,
+      )
+      .build
+      .allocated
+      .unsafeRunSync()
+    new DocTrellisLaikaRenderer(
+      transform = (source, destination) =>
+        transformer
+          .fromDirectory(source.toString)
+          .toDirectory(destination.toString)
+          .transform
+          .map(_.allDocuments.map(_.path.toString).toVector)
+          .unsafeRunSync(),
+      release = release,
+    )
 
 private[sbtplugin] object GeneratedDirectory:
   def reset(path: Path): Unit =

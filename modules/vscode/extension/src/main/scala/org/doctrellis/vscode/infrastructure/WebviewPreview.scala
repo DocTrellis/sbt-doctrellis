@@ -688,9 +688,11 @@ private[infrastructure] object PreviewWebviewHtml:
       |  const frame = document.getElementById("doctrellis-preview");
       |  if (!frame || !frame.dataset.doctrellisPreviewUrl) return;
       |  const directUrl = frame.dataset.doctrellisPreviewUrl;
+      |  const bridgeUrl = frame.src;
       |  const bridgeOrigin = frame.dataset.doctrellisBridgeOrigin;
       |  const channelToken = frame.dataset.doctrellisChannelToken;
       |  if (!bridgeOrigin || !channelToken) return;
+      |  const bridgeSandbox = frame.getAttribute("sandbox");
       |  let active = false;
       |  let legacy = false;
       |  let pendingRefresh = null;
@@ -737,6 +739,15 @@ private[infrastructure] object PreviewWebviewHtml:
       |      else announceReady();
       |    }, 2000);
       |  };
+      |  const retryBridge = () => {
+      |    clearTimeout(timeout);
+      |    timeout = null;
+      |    active = false;
+      |    legacy = false;
+      |    frame.setAttribute("sandbox", bridgeSandbox);
+      |    frame.src = bridgeUrl;
+      |    armFallback();
+      |  };
       |  const hello = () => {
       |    if (!legacy && !active && frame.contentWindow) {
       |      frame.contentWindow.postMessage({
@@ -759,6 +770,7 @@ private[infrastructure] object PreviewWebviewHtml:
       |    if (!message || message.protocol !== 1) return;
       |    if (event.source === frame.contentWindow) {
       |      if (event.origin !== bridgeOrigin) return;
+      |      if (legacy) return;
       |      if (message.type === "doctrellis.bridge.ready") {
       |        frame.contentWindow.postMessage({
       |          protocol: 1,
@@ -787,9 +799,12 @@ private[infrastructure] object PreviewWebviewHtml:
       |    if (message.type === "doctrellis.preview.visibility") {
       |      if (typeof message.visible !== "boolean") return;
       |      panelVisible = message.visible;
-      |      if (panelVisible && !active && !legacy) {
-      |        hello();
-      |        armFallback();
+      |      if (panelVisible && !active) {
+      |        if (legacy) retryBridge();
+      |        else {
+      |          hello();
+      |          armFallback();
+      |        }
       |      }
       |      return;
       |    }
@@ -806,8 +821,8 @@ private[infrastructure] object PreviewWebviewHtml:
       |      revision: message.revision
       |    };
       |    if (legacy) {
-      |      frame.src = directUrl;
-      |      accept(pending);
+      |      pendingRefresh = pending;
+      |      retryBridge();
       |    } else if (active) {
       |      frame.contentWindow.postMessage(pending.refresh, bridgeOrigin);
       |      accept(pending);

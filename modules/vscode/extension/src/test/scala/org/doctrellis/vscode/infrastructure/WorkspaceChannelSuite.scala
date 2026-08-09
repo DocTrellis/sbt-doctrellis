@@ -807,7 +807,7 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       assertEquals(destroys, 0)
 
   test(
-    "releasing a reused runtime closes a connection acquired at the stop boundary",
+    "a reused runtime authenticates eagerly and closes its connection",
   ):
     val metadata = WorkspaceChannelMetadata(
       transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
@@ -822,25 +822,21 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         socket = socket,
         metadata = metadata,
       )
-      acquireEntered  <- Deferred[IO, Unit]
-      continueAcquire <- Deferred[IO, Unit]
-      runtime         <- DynamicPreviewRuntime.reused(
-        IO.uncancelable: _ =>
-          acquireEntered.complete(()).void *>
-            continueAcquire.get.as(connection),
+      acquisitions <- Ref.of[IO, Int](0)
+      runtime      <- DynamicPreviewRuntime.reused(
+        acquisitions.update(_ + 1).as(connection),
       )
-      awaitUrl <- runtime.running.announcedUrl match
-        case Some(wait) => wait.attempt.start
+      acquired <- acquisitions.get
+      _        <- runtime.release
+      result   <- runtime.running.announcedUrl match
+        case Some(wait) => wait.attempt
         case None       =>
           IO.raiseError(
             IllegalStateException("expected a dynamic preview URL wait"),
           )
-      _        <- acquireEntered.get
-      _        <- runtime.release
-      _        <- continueAcquire.complete(())
-      result   <- awaitUrl.joinWithNever.timeout(1.second)
       destroys <- IO.delay(destroyCount())
     yield
+      assertEquals(acquired, 1)
       assert(result.isLeft)
       assertEquals(destroys, 1)
 
@@ -908,6 +904,19 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
           ),
         ),
       )
+
+  test("a stalled existing-preview connection falls back to a new launch"):
+    for
+      launches <- Ref.of[IO, Int](0)
+      result   <- WorkspacePreview.reuseOrLaunch(
+        reuse = IO.never[String],
+        launch = launches.update(_ + 1).as("launched"),
+        timeout = 20.millis,
+      )
+      count <- launches.get
+    yield
+      assertEquals(result, "launched")
+      assertEquals(count, 1)
 
   test("IPC disconnect falls back to exact process release"):
     for
