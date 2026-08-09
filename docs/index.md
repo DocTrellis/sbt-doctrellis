@@ -5,6 +5,7 @@ This site documents the architecture and operating contracts of DocTrellis.
 ## Development guides
 
 - [DocTrellis project coding guide](coding-style.md)
+- [Preferred Scala libraries](preferred-scala-libraries.md)
 - [Tapir HTTP contract guide](tapir-http-contracts.md)
 - [Scala 3 functional coding style guide](scala-coding-style.md)
 

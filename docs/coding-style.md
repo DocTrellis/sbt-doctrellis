@@ -5,6 +5,10 @@ DocTrellis follows the reusable
 adds the architecture mapping, platform boundaries, tool configuration, test
 scope, and verification rules specific to this repository.
 
+Scala dependency selection follows the
+[Preferred Scala Libraries guide](preferred-scala-libraries.md). Its examples
+are defaults to evaluate, not dependencies that every module must acquire.
+
 The base guide applies unless this document gives a more specific DocTrellis
 rule. A more specific rule refines the base guide; an apparent contradiction
 must be resolved explicitly rather than worked around.

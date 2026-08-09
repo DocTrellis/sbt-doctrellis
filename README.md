@@ -46,6 +46,7 @@ interpreters and the composition root.
 ## Development guides
 
 - [DocTrellis project coding guide](docs/coding-style.md)
+- [Preferred Scala libraries](docs/preferred-scala-libraries.md)
 - [Reusable Scala 3 functional coding style guide](docs/scala-coding-style.md)
 
 ## Requirements
