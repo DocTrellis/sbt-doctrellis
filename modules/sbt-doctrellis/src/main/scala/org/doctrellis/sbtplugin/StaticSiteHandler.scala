@@ -65,56 +65,64 @@ private[sbtplugin] final class StaticSiteHandler private (
       StaticSiteHandler.decode(requestPath) match
         case Some(StaticSiteHandler.WebviewBridgePath) =>
           StaticSiteHandler.webviewBridgeResponse(includeBody = method == "GET")
-        case Some(decodedPath)
-            if !requestPath.endsWith("/") &&
-              StaticSiteHandler.resolvesDirectory(
-                normalizedRoot,
-                decodedPath,
-              ) =>
-          val query = rawQuery.filter(_.nonEmpty).fold("")(value => s"?$value")
-          StaticSiteHandler.redirectResponse(
-            location = s"$requestPath/$query",
-            includeBody = method == "GET",
-          )
         case Some(decodedPath) =>
           StaticSiteHandler.resolveDecoded(
             normalizedRoot,
             decodedPath,
           ) match
-            case Some(file) if Files.isRegularFile(file) =>
-              val contentType = StaticSiteHandler.contentType(file)
-              val headers     = List(
-                "Content-Type"  -> contentType,
-                "Cache-Control" -> "no-store",
+            case Some(StaticSiteHandler.ResolvedSitePath.Directory(_, _))
+                if !requestPath.endsWith("/") =>
+              val query = rawQuery
+                .filter(_.nonEmpty)
+                .fold("")(value => s"?$value")
+              StaticSiteHandler.redirectResponse(
+                location = s"$requestPath/$query",
+                includeBody = method == "GET",
               )
-              if method == "GET" then
-                val body = StaticSiteHandler.snapshotBody(
-                  file,
-                  maximumInMemoryResponseBytes,
-                  createTemporaryFile,
-                  deleteTemporaryFile,
-                )
-                try
-                  StaticSiteHandler.ResponseSnapshot(
-                    status = 200,
-                    headers = headers,
-                    contentLength = body.length,
-                    body = Some(body),
-                  )
-                catch
-                  case error: Throwable =>
-                    throw StaticSiteHandler.close(body, error)
-              else
-                StaticSiteHandler.ResponseSnapshot(
-                  status = 200,
-                  headers = headers,
-                  contentLength = Files.size(file),
-                  body = None,
-                )
+            case Some(target) =>
+              target.page
+                .filter(Files.isRegularFile(_))
+                .fold(
+                  StaticSiteHandler.notFound(includeBody = method == "GET"),
+                )(snapshotFile(method, _))
             case _ =>
               StaticSiteHandler.notFound(includeBody = method == "GET")
         case None =>
           StaticSiteHandler.notFound(includeBody = method == "GET")
+
+  private def snapshotFile(
+      method: String,
+      file: Path,
+  ): StaticSiteHandler.ResponseSnapshot =
+    val contentType = StaticSiteHandler.contentType(file)
+    val headers     = List(
+      "Content-Type"  -> contentType,
+      "Cache-Control" -> "no-store",
+    )
+    if method == "GET" then
+      val body = StaticSiteHandler.snapshotBody(
+        file,
+        maximumInMemoryResponseBytes,
+        createTemporaryFile,
+        deleteTemporaryFile,
+      )
+      try
+        StaticSiteHandler.ResponseSnapshot(
+          status = 200,
+          headers = headers,
+          contentLength = body.length,
+          body = Some(body),
+        )
+      catch
+        case error: Throwable =>
+          throw StaticSiteHandler.close(body, error)
+    else
+      StaticSiteHandler.ResponseSnapshot(
+        status = 200,
+        headers = headers,
+        contentLength = Files.size(file),
+        body = None,
+      )
 
   private def send(
       exchange: HttpExchange,
@@ -141,6 +149,15 @@ private[sbtplugin] final class StaticSiteHandler private (
         exchange.close()
 
 private[sbtplugin] object StaticSiteHandler:
+  private[sbtplugin] enum ResolvedSitePath:
+    case File(path: Path)
+    case Directory(path: Path, siteRoot: Path)
+
+    def page: Option[Path] = this match
+      case File(path)                => Some(path)
+      case Directory(path, siteRoot) =>
+        realPath(path.resolve("index.html")).filter(_.startsWith(siteRoot))
+
   private val MaximumInMemoryResponseBytes = 1024L * 1024L
   // Bound work here as defense in depth even when HttpServer rejects a long
   // request line before dispatching it to this handler.
@@ -435,37 +452,21 @@ private[sbtplugin] object StaticSiteHandler:
   private[sbtplugin] def resolveDecoded(
       root: Path,
       decoded: String,
-  ): Option[Path] =
+  ): Option[ResolvedSitePath] =
     try
       for
         realRoot <- realPath(root)
         relative  = decoded.stripPrefix("/")
         candidate = realRoot.resolve(relative).normalize()
-        page      =
-          if Files.isDirectory(candidate) then candidate.resolve("index.html")
-          else candidate
-        realPage <- Option
-          .when(page.startsWith(realRoot))(page)
-          .flatMap(realPath)
-        if realPage.startsWith(realRoot)
-      yield realPage
-    catch case _: InvalidPathException => None
-
-  private[sbtplugin] def resolvesDirectory(
-      root: Path,
-      decoded: String,
-  ): Boolean =
-    try
-      (for
-        realRoot <- realPath(root)
-        relative  = decoded.stripPrefix("/")
-        candidate = realRoot.resolve(relative).normalize()
-        realPath <- Option
+        realCandidate <- Option
           .when(candidate.startsWith(realRoot))(candidate)
-          .flatMap(StaticSiteHandler.realPath)
-        if realPath.startsWith(realRoot) && Files.isDirectory(realPath)
-      yield ()).nonEmpty
-    catch case _: InvalidPathException => false
+          .flatMap(realPath)
+        if realCandidate.startsWith(realRoot)
+      yield
+        if Files.isDirectory(realCandidate) then
+          ResolvedSitePath.Directory(realCandidate, realRoot)
+        else ResolvedSitePath.File(realCandidate)
+    catch case _: InvalidPathException => None
 
   private[sbtplugin] def decode(requestPath: String): Option[String] =
     val raw     = Option(requestPath).getOrElse("/")

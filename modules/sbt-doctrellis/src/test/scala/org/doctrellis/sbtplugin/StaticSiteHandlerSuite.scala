@@ -155,6 +155,17 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
       GeneratedDirectory.delete(root)
       Files.deleteIfExists(outside): Unit
 
+  test("does not follow a directory index symlink outside the root"):
+    val root    = Files.createTempDirectory("doctrellis-handler-index-link")
+    val guide   = Files.createDirectories(root.resolve("guide"))
+    val outside = Files.createTempFile("doctrellis-secret-index", ".html")
+    try
+      Files.createSymbolicLink(guide.resolve("index.html"), outside)
+      assertEquals(resolve(root, "/guide/"), None)
+    finally
+      GeneratedDirectory.delete(root)
+      Files.deleteIfExists(outside): Unit
+
   test("HEAD returns metadata without opening a response body"):
     val root = Files.createTempDirectory("doctrellis-handler-head")
     try
@@ -625,6 +636,7 @@ class StaticSiteHandlerSuite extends munit.FunSuite:
     StaticSiteHandler
       .decode(requestPath)
       .flatMap(StaticSiteHandler.resolveDecoded(root, _))
+      .flatMap(_.page)
 
   private final class BlockingExchange(
       started: CountDownLatch,
