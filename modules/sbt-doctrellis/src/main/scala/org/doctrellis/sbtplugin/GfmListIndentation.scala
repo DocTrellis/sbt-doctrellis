@@ -181,7 +181,7 @@ private[sbtplugin] object GfmListIndentation:
     val relativeIndent = indentation - fence.containerIndent
     val content        = input.drop(indentation)
     val marker         = content.takeWhile(_ == fence.marker)
-    relativeIndent >= 0 && relativeIndent <= 3 &&
+    relativeIndent <= 3 &&
     marker.length >= fence.length && content.drop(marker.length).trim.isEmpty
 
   private def splitLines(input: String): Vector[SourceLine] =
