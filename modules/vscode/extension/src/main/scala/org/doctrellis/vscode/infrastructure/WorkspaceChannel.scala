@@ -1,10 +1,12 @@
 package org.doctrellis.vscode.infrastructure
 
+import java.util.concurrent.TimeoutException
+
 import scala.concurrent.duration.*
 import scala.scalajs.js
 import scala.scalajs.js.typedarray.Uint8Array
 
-import cats.effect.{Deferred, IO, Ref, Resource}
+import cats.effect.{Clock, Deferred, IO, Ref, Resource}
 import cats.effect.std.{Dispatcher, Queue}
 import cats.syntax.all.*
 
@@ -50,9 +52,61 @@ private[infrastructure] final case class WorkspaceLaunchMismatch(
       "the workspace IPC endpoint belongs to a different preview launch",
     )
 
-private[infrastructure] final case class WorkspaceMetadataFailure(
+private[infrastructure] enum WorkspaceMetadataFailureKind:
+  case Permanent
+  case PublicationPending
+
+private[infrastructure] final case class WorkspaceMetadataFailure private (
+    detail: String,
+    kind: WorkspaceMetadataFailureKind,
+) extends IllegalStateException(detail):
+  def publicationPending: Boolean =
+    kind == WorkspaceMetadataFailureKind.PublicationPending
+
+  def withRecovery(metadataPath: String): WorkspaceMetadataFailure =
+    WorkspaceMetadataFailure(
+      s"$detail Metadata file: $metadataPath. Stop any existing preview, delete this file, and try again.",
+      kind,
+    )
+
+private[infrastructure] object WorkspaceMetadataFailure:
+  def permanent(detail: String): WorkspaceMetadataFailure =
+    WorkspaceMetadataFailure(detail, WorkspaceMetadataFailureKind.Permanent)
+
+  def pendingPublication(detail: String): WorkspaceMetadataFailure =
+    WorkspaceMetadataFailure(
+      detail,
+      WorkspaceMetadataFailureKind.PublicationPending,
+    )
+
+private[infrastructure] final case class WorkspaceEndpointUnavailable(
+    detail: String,
+    underlying: Throwable | Null = null,
+) extends IllegalStateException(detail, underlying):
+  def at(metadataPath: String): WorkspaceEndpointUnavailable =
+    WorkspaceEndpointUnavailable(
+      s"$detail (workspace metadata: $metadataPath)",
+      underlying,
+    )
+
+private[infrastructure] final case class WorkspaceProtocolFailure(
     detail: String,
 ) extends IllegalStateException(detail)
+
+private[infrastructure] final case class WorkspaceReuseUnavailable(
+    underlying: Throwable,
+    mayLaunchReplacement: Boolean,
+) extends IllegalStateException(
+      s"the existing workspace preview is unavailable: ${underlying.getMessage}",
+      underlying,
+    )
+
+private[infrastructure] object WorkspaceConnectionRetry:
+  def duringOwnedStartup(error: Throwable): Boolean = error match
+    case _: WorkspaceLaunchMismatch | _: WorkspaceEndpointUnavailable => true
+    case failure: WorkspaceMetadataFailure                            =>
+      failure.publicationPending
+    case _ => false
 
 private[infrastructure] object WorkspaceChannel:
   val Protocol             = "doctrellis-preview-v1"
@@ -63,6 +117,7 @@ private[infrastructure] object WorkspaceChannel:
   val OwnerEnvironment     = "DOCTRELLIS_RUNTIME_OWNER"
   val LaunchEnvironment    = "DOCTRELLIS_LAUNCH_ID"
   val MaxFrameBytes        = 8192
+  private val ReadyTimeout = 5.seconds
 
   def endpoint(workspace: Workspace): IO[WorkspaceChannelEndpoint] =
     for
@@ -136,11 +191,10 @@ private[infrastructure] object WorkspaceChannel:
       text <- promise(
         NodeFsPromises.readFile(endpoint.metadataPath, "utf8"),
         "the workspace IPC endpoint is not available",
-      )
+      ).adaptError: error =>
+        WorkspaceEndpointUnavailable(error.getMessage, error)
       metadata <- IO.fromEither(
-        WorkspaceChannelMetadataParser
-          .parse(text, endpoint)
-          .leftMap(WorkspaceMetadataFailure(_)),
+        WorkspaceChannelMetadataParser.parse(text, endpoint),
       )
       _ <- expectedLaunchId
         .filter(_ != metadata.launchId)
@@ -171,13 +225,30 @@ private[infrastructure] object WorkspaceChannel:
   ): IO[WorkspaceChannelConnection] =
     IO.uncancelable: poll =>
       poll(connect(endpoint, expectedLaunchId)).flatMap: connection =>
-        val validate = connection.awaitUrl *>
-          IO.whenA(verifyPing)(connection.ping)
+        val validate = readyWithin(
+          connection.awaitUrl *> IO.whenA(verifyPing)(connection.ping),
+          endpoint,
+          ReadyTimeout,
+        )
         poll(validate.as(connection)).attempt
           .onCancel(connection.close)
           .flatMap:
             case Right(verified) => IO.pure(verified)
             case Left(error)     => connection.close *> IO.raiseError(error)
+
+  private[infrastructure] def readyWithin[A](
+      validation: IO[A],
+      endpoint: WorkspaceChannelEndpoint,
+      timeout: FiniteDuration,
+  ): IO[A] =
+    validation.timeoutTo(
+      timeout,
+      IO.raiseError(
+        WorkspaceEndpointUnavailable(
+          s"workspace IPC handshake did not complete within $timeout (workspace metadata: ${endpoint.metadataPath})",
+        ),
+      ),
+    )
 
   def endpointOwnerAlive(endpoint: WorkspaceChannelEndpoint): IO[Boolean] =
     promise(
@@ -186,9 +257,7 @@ private[infrastructure] object WorkspaceChannel:
     )
       .flatMap: text =>
         IO.fromEither(
-          WorkspaceChannelMetadataParser
-            .ownerPid(text)
-            .leftMap(WorkspaceMetadataFailure(_)),
+          WorkspaceChannelMetadataParser.ownerPid(text),
         )
       .flatMap: pid =>
         IO.delay(NodeRuntime.kill(pid, 0))
@@ -220,7 +289,7 @@ private[infrastructure] object WorkspaceChannel:
             settled = true
             complete(
               Left(
-                IllegalStateException(
+                WorkspaceEndpointUnavailable(
                   s"could not connect to the workspace IPC endpoint: ${NodeProcess.errorMessage(raw)}",
                 ),
               ),
@@ -244,7 +313,7 @@ private[infrastructure] object WorkspaceChannel:
         IllegalStateException(s"$context: ${error.getMessage}", error)
 
 private[infrastructure] object WorkspaceChannelMetadataParser:
-  def ownerPid(text: String): Either[String, Int] =
+  def ownerPid(text: String): Either[WorkspaceMetadataFailure, Int] =
     decode(text).flatMap: raw =>
       integer(raw, "pid").flatMap: pid =>
         require(pid > 0, "IPC metadata pid must be positive").as(pid)
@@ -252,7 +321,7 @@ private[infrastructure] object WorkspaceChannelMetadataParser:
   def parse(
       text: String,
       endpoint: WorkspaceChannelEndpoint,
-  ): Either[String, WorkspaceChannelMetadata] =
+  ): Either[WorkspaceMetadataFailure, WorkspaceChannelMetadata] =
     decode(text).flatMap: raw =>
       for
         version <- integer(raw, "version")
@@ -288,9 +357,22 @@ private[infrastructure] object WorkspaceChannelMetadataParser:
               host <- string(raw, "host")
               _ <- require(host == "127.0.0.1", "IPC TCP host must be loopback")
               port <- integer(raw, "port")
-              _ <- require(port > 0 && port <= 65535, "IPC TCP port is invalid")
+              _    <-
+                if port == 0 then
+                  Left(
+                    WorkspaceMetadataFailure.pendingPublication(
+                      "IPC TCP port has not been published yet",
+                    ),
+                  )
+                else
+                  require(port > 0 && port <= 65535, "IPC TCP port is invalid")
             yield WorkspaceChannelTransport.Tcp(host, port)
-          case other => Left(s"unknown IPC transport '$other'")
+          case other =>
+            Left(
+              WorkspaceMetadataFailure.permanent(
+                s"unknown IPC transport '$other'",
+              ),
+            )
       yield WorkspaceChannelMetadata(
         transport = transport,
         pid = pid,
@@ -299,7 +381,9 @@ private[infrastructure] object WorkspaceChannelMetadataParser:
         token = token,
       )
 
-  private def decode(text: String): Either[String, js.Dynamic] =
+  private def decode(
+      text: String,
+  ): Either[WorkspaceMetadataFailure, js.Dynamic] =
     try
       val value = js.JSON.parse(text)
       Either.cond(
@@ -307,32 +391,48 @@ private[infrastructure] object WorkspaceChannelMetadataParser:
           value,
         ),
         value.asInstanceOf[js.Dynamic],
-        "IPC metadata must be a JSON object",
+        WorkspaceMetadataFailure.permanent(
+          "IPC metadata must be a JSON object",
+        ),
       )
     catch
       case error: js.JavaScriptException =>
-        Left(s"IPC metadata is malformed JSON: ${error.getMessage}")
+        Left(
+          WorkspaceMetadataFailure.permanent(
+            s"IPC metadata is malformed JSON: ${error.getMessage}",
+          ),
+        )
 
-  private def string(value: js.Dynamic, name: String): Either[String, String] =
+  private def string(
+      value: js.Dynamic,
+      name: String,
+  ): Either[WorkspaceMetadataFailure, String] =
     val field = value.selectDynamic(name)
     Either.cond(
       !js.isUndefined(field) && js.typeOf(field) == "string",
       field.asInstanceOf[String],
-      s"IPC metadata field '$name' must be a string",
+      WorkspaceMetadataFailure.permanent(
+        s"IPC metadata field '$name' must be a string",
+      ),
     )
 
   private def nonEmpty(
       value: js.Dynamic,
       name: String,
-  ): Either[String, String] =
+  ): Either[WorkspaceMetadataFailure, String] =
     string(value, name).flatMap: result =>
       Either.cond(
         result.nonEmpty,
         result,
-        s"IPC metadata field '$name' must not be empty",
+        WorkspaceMetadataFailure.permanent(
+          s"IPC metadata field '$name' must not be empty",
+        ),
       )
 
-  private def integer(value: js.Dynamic, name: String): Either[String, Int] =
+  private def integer(
+      value: js.Dynamic,
+      name: String,
+  ): Either[WorkspaceMetadataFailure, Int] =
     val field = value.selectDynamic(name)
     val valid = !js.isUndefined(field) && js.typeOf(field) == "number" &&
       field.asInstanceOf[Double].isWhole &&
@@ -341,14 +441,20 @@ private[infrastructure] object WorkspaceChannelMetadataParser:
     Either.cond(
       valid,
       field.asInstanceOf[Double].toInt,
-      s"IPC metadata field '$name' must be an integer",
+      WorkspaceMetadataFailure.permanent(
+        s"IPC metadata field '$name' must be an integer",
+      ),
     )
 
   private def require(
       condition: Boolean,
       problem: => String,
-  ): Either[String, Unit] =
-    Either.cond(condition, (), problem)
+  ): Either[WorkspaceMetadataFailure, Unit] =
+    Either.cond(
+      condition,
+      (),
+      WorkspaceMetadataFailure.permanent(problem),
+    )
 
   private def isLowerHex(value: Char): Boolean =
     value >= '0' && value <= '9' || value >= 'a' && value <= 'f'
@@ -686,7 +792,7 @@ private[infrastructure] final class WorkspaceChannelConnection private (
     listeners: WorkspaceChannelListeners,
 ):
   private def activate: IO[Unit] =
-    IO.delay:
+    socketOperation("could not initialize the workspace IPC connection"):
       socket.on("data", listeners.data): Unit
       socket.on("error", listeners.error): Unit
       socket.once("close", listeners.close): Unit
@@ -718,15 +824,15 @@ private[infrastructure] final class WorkspaceChannelConnection private (
             case some @ Some(_) => some            -> None
           .flatMap:
             case Some(requestId) =>
-              IO.delay(
+              socketOperation("could not ping the workspace IPC endpoint")(
                 socket.write(
                   WorkspaceChannelProtocol.ping(
                     token = metadata.token,
                     clientId = clientId,
                     requestId = requestId,
                   ),
-                ),
-              ).void
+                ): Unit,
+              )
             case None => IO.unit
         *> pongResult.get.flatMap(_.liftTo[IO])
 
@@ -739,19 +845,27 @@ private[infrastructure] final class WorkspaceChannelConnection private (
             case None           => Some(candidate) -> candidate
             case Some(existing) => Some(existing)  -> existing
           .flatMap: requestId =>
-            IO.delay(
+            socketOperation("could not stop the workspace IPC endpoint")(
               socket.write(
                 WorkspaceChannelProtocol.stop(
                   token = metadata.token,
                   clientId = clientId,
                   requestId = requestId,
                 ),
-              ),
-            ).void *> awaitExit.flatMap:
+              ): Unit,
+            ) *> awaitExit.flatMap:
               case ProcessExit.Failed(problem, _) =>
                 IO.raiseError(IllegalStateException(problem))
               case ProcessExit.Terminated(_) | ProcessExit.Unknown =>
                 IO.unit
+
+  private def socketOperation(context: String)(operation: => Unit): IO[Unit] =
+    IO.delay(operation)
+      .adaptError: error =>
+        WorkspaceEndpointUnavailable(
+          s"$context: ${ThrowableMessage.from(error)}",
+          error,
+        )
 
   def close: IO[Unit] =
     closed
@@ -835,7 +949,7 @@ private[infrastructure] object WorkspaceChannelConnection:
       revision  <- Ref.of[IO, Option[SiteRevision]](None)
       lastError <- Ref.of[IO, Option[String]](None)
       fail = (problem: String) =>
-        val error = IllegalStateException(problem)
+        val error = WorkspaceProtocolFailure(problem)
         channelState.set(ChannelState.Terminated) *>
           ready.complete(Left(error)).void *>
           pong.complete(Left(error)).void *>
@@ -941,7 +1055,7 @@ private[infrastructure] object WorkspaceChannelConnection:
               channelState.set(ChannelState.Terminated) *> lastError.get
                 .flatMap:
                   case Some(problem) =>
-                    val error = IllegalStateException(problem)
+                    val error = WorkspaceEndpointUnavailable(problem)
                     ready.complete(Left(error)).void *>
                       pong.complete(Left(error)).void *>
                       siteRevisions.offer(
@@ -950,7 +1064,7 @@ private[infrastructure] object WorkspaceChannelConnection:
                       terminal.complete(Left(error)).void
                   case None =>
                     val problem = "workspace IPC connection ended"
-                    val error   = IllegalStateException(problem)
+                    val error   = WorkspaceEndpointUnavailable(problem)
                     ready.complete(Left(error)).void *>
                       pong.complete(Left(error)).void *>
                       siteRevisions.offer(WorkspaceSiteRevision.Ended) *>
@@ -986,7 +1100,8 @@ private[infrastructure] object WorkspaceChannelConnection:
     )
 
 private[infrastructure] object WorkspacePreview:
-  private val ExistingPreviewConnectTimeout = 1.second
+  private val ExistingPreviewConnectTimeout   = 2.minutes
+  private val UnavailableEndpointRetryTimeout = 5.seconds
 
   def launch(
       dispatcher: Dispatcher[IO],
@@ -1002,10 +1117,7 @@ private[infrastructure] object WorkspacePreview:
         Resource
           .eval(WorkspaceChannel.endpoint(workspace))
           .flatMap: endpoint =>
-            Resource
-              .make(acquire(dispatcher, append, endpoint, workspace, command))(
-                _.release,
-              )
+            acquire(dispatcher, append, endpoint, workspace, command)
               .map(_.running)
 
   private def acquire(
@@ -1014,39 +1126,48 @@ private[infrastructure] object WorkspacePreview:
       endpoint: WorkspaceChannelEndpoint,
       workspace: Workspace,
       command: PreviewCommand,
-  ): IO[DynamicPreviewRuntime] =
-    WorkspaceChannel
-      .endpointOwnerAlive(endpoint)
+  ): Resource[IO, DynamicPreviewRuntime] =
+    Resource
+      .eval(WorkspaceChannel.endpointOwnerAlive(endpoint))
       .flatMap:
         case true =>
-          val connect = reusableConnection(endpoint).flatTap(_ =>
-            append(
-              s"[${workspace.name}] Reusing the existing workspace preview as a read-only lease.\n",
-            ).handleError(_ => ()),
-          )
-          reuseOrLaunch(
-            reuse = DynamicPreviewRuntime.reused(connect),
-            launch = launchOwned(
-              dispatcher,
-              append,
-              endpoint,
-              workspace,
-              command,
-            ),
-          )
+          DynamicPreviewRuntime
+            .reused(
+              reusableConnection(endpoint, append, workspace.name),
+            )
+            .evalTap(_ =>
+              append(
+                s"[${workspace.name}] Reusing the existing workspace preview as a read-only lease.\n",
+              ).handleError(_ => ()),
+            )
+            .handleErrorWith:
+              case failure: WorkspaceReuseUnavailable
+                  if failure.mayLaunchReplacement =>
+                Resource.eval(
+                  append(
+                    s"[${workspace.name}] ${failure.getMessage}; starting a replacement.\n",
+                  ).handleError(_ => ()),
+                ) *> ownedResource(
+                  dispatcher,
+                  append,
+                  endpoint,
+                  workspace,
+                  command,
+                )
+              case error => Resource.eval(IO.raiseError(error))
         case false =>
-          launchOwned(dispatcher, append, endpoint, workspace, command)
+          ownedResource(dispatcher, append, endpoint, workspace, command)
 
-  private[infrastructure] def reuseOrLaunch[A](
-      reuse: IO[A],
-      launch: IO[A],
-      timeout: FiniteDuration = ExistingPreviewConnectTimeout,
-  ): IO[A] =
-    reuse
-      .map(Some(_))
-      .handleError(_ => None)
-      .timeoutTo(timeout, IO.none)
-      .flatMap(_.fold(launch)(IO.pure))
+  private def ownedResource(
+      dispatcher: Dispatcher[IO],
+      append: String => IO[Unit],
+      endpoint: WorkspaceChannelEndpoint,
+      workspace: Workspace,
+      command: PreviewCommand,
+  ): Resource[IO, DynamicPreviewRuntime] =
+    Resource.make(
+      launchOwned(dispatcher, append, endpoint, workspace, command),
+    )(_.release)
 
   private def launchOwned(
       dispatcher: Dispatcher[IO],
@@ -1087,22 +1208,157 @@ private[infrastructure] object WorkspacePreview:
 
   private def reusableConnection(
       endpoint: WorkspaceChannelEndpoint,
+      append: String => IO[Unit],
+      workspaceName: String,
   ): IO[WorkspaceChannelConnection] =
-    def connect: IO[WorkspaceChannelConnection] =
-      WorkspaceChannel
-        .connectReady(
-          endpoint = endpoint,
-          verifyPing = true,
-          expectedLaunchId = None,
-        )
-        .handleErrorWith: error =>
+    for
+      endpointRetryStarted  <- Ref.of[IO, Option[FiniteDuration]](None)
+      endpointRetryReported <- Ref.of[IO, Boolean](false)
+      publicationReported   <- Ref.of[IO, Boolean](false)
+      connection            <-
+        def connect: IO[WorkspaceChannelConnection] =
+          WorkspaceChannel
+            .connectReady(
+              endpoint = endpoint,
+              verifyPing = true,
+              expectedLaunchId = None,
+            )
+            .handleErrorWith: error =>
+              error match
+                case failure: WorkspaceMetadataFailure
+                    if !failure.publicationPending =>
+                  failOrReplaceIfOwnerExited(
+                    failure.withRecovery(endpoint.metadataPath),
+                  )
+                case failure: WorkspaceProtocolFailure =>
+                  IO.raiseError(
+                    WorkspaceReuseUnavailable(
+                      failure,
+                      mayLaunchReplacement = true,
+                    ),
+                  )
+                case failure: WorkspaceMetadataFailure =>
+                  reportOnce(publicationReported)(
+                    append(
+                      s"[$workspaceName] Existing preview is still publishing its endpoint; waiting for up to $ExistingPreviewConnectTimeout.\n",
+                    ).handleError(_ => ()),
+                  ) *> endpointRetryStarted.set(None) *> retryIfOwned(failure)
+                case failure: WorkspaceEndpointUnavailable =>
+                  retryUnavailableEndpoint(
+                    retry = retryIfOwned(failure),
+                    endpoint = endpoint,
+                    lastError = failure,
+                    timeout = UnavailableEndpointRetryTimeout,
+                    retryStarted = endpointRetryStarted,
+                    now = Clock[IO].monotonic,
+                    onFirstRetry = reportOnce(endpointRetryReported)(
+                      append(
+                        s"[$workspaceName] Existing preview endpoint is unavailable; retrying for up to $UnavailableEndpointRetryTimeout.\n",
+                      ).handleError(_ => ()),
+                    ),
+                  )
+                case other =>
+                  IO.raiseError(replacementAfterReuseFailure(other, endpoint))
+
+        def retryIfOwned(error: Throwable): IO[WorkspaceChannelConnection] =
           WorkspaceChannel
             .endpointOwnerAlive(endpoint)
             .flatMap:
               case true  => IO.sleep(50.millis) *> connect
-              case false => IO.raiseError(error)
+              case false =>
+                IO.raiseError(
+                  WorkspaceReuseUnavailable(
+                    withEndpoint(error, endpoint),
+                    mayLaunchReplacement = true,
+                  ),
+                )
 
-    connect
+        def failOrReplaceIfOwnerExited(
+            error: Throwable,
+        ): IO[WorkspaceChannelConnection] =
+          WorkspaceChannel
+            .endpointOwnerAlive(endpoint)
+            .flatMap: alive =>
+              IO.raiseError(
+                WorkspaceReuseUnavailable(
+                  error,
+                  mayLaunchReplacement = !alive,
+                ),
+              )
+
+        withinReuseDeadline(connect, endpoint, ExistingPreviewConnectTimeout)
+    yield connection
+
+  private def reportOnce(reported: Ref[IO, Boolean])(
+      report: IO[Unit],
+  ): IO[Unit] =
+    reported.getAndSet(true).ifM(IO.unit, report)
+
+  private[infrastructure] def replacementAfterReuseFailure(
+      error: Throwable,
+      endpoint: WorkspaceChannelEndpoint,
+  ): WorkspaceReuseUnavailable =
+    WorkspaceReuseUnavailable(
+      withEndpoint(error, endpoint),
+      mayLaunchReplacement = true,
+    )
+
+  private def withEndpoint(
+      error: Throwable,
+      endpoint: WorkspaceChannelEndpoint,
+  ): Throwable = error match
+    case failure: WorkspaceMetadataFailure =>
+      failure.withRecovery(endpoint.metadataPath)
+    case failure: WorkspaceEndpointUnavailable =>
+      failure.at(endpoint.metadataPath)
+    case other =>
+      WorkspaceEndpointUnavailable(
+        ThrowableMessage.from(other),
+        other,
+      ).at(endpoint.metadataPath)
+
+  private[infrastructure] def withinReuseDeadline[A](
+      reuse: IO[A],
+      endpoint: WorkspaceChannelEndpoint,
+      timeout: FiniteDuration,
+  ): IO[A] =
+    reuse.timeoutTo(
+      timeout,
+      IO.raiseError(
+        WorkspaceReuseUnavailable(
+          TimeoutException(
+            s"could not connect within $timeout (workspace metadata: ${endpoint.metadataPath})",
+          ),
+          mayLaunchReplacement = true,
+        ),
+      ),
+    )
+
+  private[infrastructure] def retryUnavailableEndpoint[A](
+      retry: IO[A],
+      endpoint: WorkspaceChannelEndpoint,
+      lastError: Throwable,
+      timeout: FiniteDuration,
+      retryStarted: Ref[IO, Option[FiniteDuration]],
+      now: IO[FiniteDuration],
+      onFirstRetry: IO[Unit],
+  ): IO[A] =
+    now.flatMap: current =>
+      retryStarted
+        .modify:
+          case None                  => Some(current) -> (current, true)
+          case started @ Some(value) => started       -> (value, false)
+        .flatMap: (started, firstRetry) =>
+          if current - started >= timeout then
+            IO.raiseError(
+              WorkspaceReuseUnavailable(
+                TimeoutException(
+                  s"the existing preview endpoint remained unavailable for $timeout (workspace metadata: ${endpoint.metadataPath}): ${lastError.getMessage}",
+                ),
+                mayLaunchReplacement = true,
+              ),
+            )
+          else IO.whenA(firstRetry)(onFirstRetry) *> retry
 
 private[infrastructure] final class DynamicPreviewRuntime private (
     val running: RunningProcess[IO],
@@ -1138,49 +1394,18 @@ private[infrastructure] object DynamicPreviewShutdown:
 private[infrastructure] object DynamicPreviewRuntime:
   def reused(
       acquire: IO[WorkspaceChannelConnection],
-  ): IO[DynamicPreviewRuntime] =
-    IO.uncancelable: poll =>
-      poll(acquire).flatMap: active =>
-        val initialize =
-          for connection <- Ref.of[IO, DynamicPreviewConnection](
-              DynamicPreviewConnection.Active(active),
-            )
-          yield
-            def connected: IO[WorkspaceChannelConnection] =
-              connection.get.flatMap:
-                case DynamicPreviewConnection.Active(value) => IO.pure(value)
-                case DynamicPreviewConnection.Pending       =>
-                  IO.raiseError(
-                    IllegalStateException(
-                      "the reused preview connection is unavailable",
-                    ),
-                  )
-                case DynamicPreviewConnection.Releasing =>
-                  IO.raiseError(
-                    IllegalStateException("the reused preview is closing"),
-                  )
-
-            val release = connection
-              .modify:
-                case DynamicPreviewConnection.Active(value) =>
-                  DynamicPreviewConnection.Releasing -> Some(value)
-                case DynamicPreviewConnection.Pending |
-                    DynamicPreviewConnection.Releasing =>
-                  DynamicPreviewConnection.Releasing -> None
-              .flatMap(_.traverse_(_.close))
-
-            new DynamicPreviewRuntime(
-              running = RunningProcess.announced(
-                awaitExit = connected.flatMap(_.awaitExit),
-                awaitUrl = connected.flatMap(_.awaitUrl),
-                nextSiteRevision = connected.flatMap(_.nextSiteRevision),
-              ),
-              release = release,
-            )
-
-        poll(initialize)
-          .onCancel(active.close.attempt.void)
-          .onError(_ => active.close.attempt.void)
+  ): Resource[IO, DynamicPreviewRuntime] =
+    Resource
+      .makeFull[IO, WorkspaceChannelConnection](poll => poll(acquire))(_.close)
+      .map: active =>
+        new DynamicPreviewRuntime(
+          running = RunningProcess.announced(
+            awaitExit = active.awaitExit,
+            awaitUrl = active.awaitUrl,
+            nextSiteRevision = active.nextSiteRevision,
+          ),
+          release = IO.unit,
+        )
 
   private[infrastructure] def installConnection(
       connection: Ref[IO, DynamicPreviewConnection],
@@ -1270,7 +1495,17 @@ private[infrastructure] object DynamicPreviewRuntime:
           ).attempt
             .flatMap:
               case Right(value) => IO.pure(value)
-              case Left(error)  => retryWhileStarting(error)
+              case Left(failure: WorkspaceMetadataFailure)
+                  if !failure.publicationPending =>
+                WorkspaceChannel
+                  .endpointOwnerAlive(endpoint)
+                  .flatMap:
+                    case true  => IO.raiseError(failure)
+                    case false => retryWhileStarting(failure)
+              case Left(error)
+                  if WorkspaceConnectionRetry.duringOwnedStartup(error) =>
+                retryWhileStarting(error)
+              case Left(error) => IO.raiseError(error)
 
     val release = connection
       .modify:

@@ -366,6 +366,27 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         "\"host\":\"0.0.0.0\",\"port\":43123",
       )
     assert(WorkspaceChannelMetadataParser.parse(tcp, endpoint).isLeft)
+    val pendingPort = tcp
+      .replace("\"0.0.0.0\"", "\"127.0.0.1\"")
+      .replace("43123", "0")
+    val pendingFailure = WorkspaceChannelMetadataParser
+      .parse(pendingPort, endpoint)
+      .swap
+      .toOption
+      .getOrElse(fail("port-zero metadata must fail parsing"))
+    val versionFailure = WorkspaceChannelMetadataParser
+      .parse(valid.replace("\"version\":1", "\"version\":2"), endpoint)
+      .swap
+      .toOption
+      .getOrElse(fail("future-version metadata must fail parsing"))
+    val invalidPortFailure = WorkspaceChannelMetadataParser
+      .parse(pendingPort.replace("\"port\":0", "\"port\":70000"), endpoint)
+      .swap
+      .toOption
+      .getOrElse(fail("out-of-range port metadata must fail parsing"))
+    assert(pendingFailure.publicationPending)
+    assert(!versionFailure.publicationPending)
+    assert(!invalidPortFailure.publicationPending)
 
   test("an owned preview rejects metadata from a competing launch"):
     promise(
@@ -447,11 +468,30 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       events <- IO.delay(lifecycle())
     yield
       assert(result.left.exists(_.getMessage.contains("write failed")))
+      assert(result.left.exists(_.isInstanceOf[WorkspaceEndpointUnavailable]))
       assert(events.contains("off:data"))
       assert(events.contains("off:error"))
       assert(events.contains("off:close"))
       assert(!events.contains("emit:close"))
       assert(events.indexOf("off:close") < events.indexOf("destroy"))
+
+  test("a synchronous ping write failure is classified as unavailable"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val socket = failingPingSocket()
+    WorkspaceChannelConnection
+      .create(socket = socket, metadata = metadata)
+      .bracket(_.ping.attempt)(_.close)
+      .map: result =>
+        assert(result.left.exists(_.getMessage.contains("write failed")))
+        assert(
+          result.left.exists(_.isInstanceOf[WorkspaceEndpointUnavailable]),
+        )
 
   test("a connection preserves an uncorrelated protocol error diagnostic"):
     val metadata = WorkspaceChannelMetadata(
@@ -823,22 +863,187 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         metadata = metadata,
       )
       acquisitions <- Ref.of[IO, Int](0)
-      runtime      <- DynamicPreviewRuntime.reused(
-        acquisitions.update(_ + 1).as(connection),
-      )
-      acquired <- acquisitions.get
-      _        <- runtime.release
-      result   <- runtime.running.announcedUrl match
-        case Some(wait) => wait.attempt
-        case None       =>
-          IO.raiseError(
-            IllegalStateException("expected a dynamic preview URL wait"),
-          )
+      acquired     <- DynamicPreviewRuntime
+        .reused(acquisitions.update(_ + 1).as(connection))
+        .use(_ => acquisitions.get)
       destroys <- IO.delay(destroyCount())
     yield
       assertEquals(acquired, 1)
-      assert(result.isLeft)
       assertEquals(destroys, 1)
+
+  test("canceling reused authentication closes a socket returned at the edge"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, destroyCount) = trackedInertSocket()
+    for
+      connection <- WorkspaceChannelConnection.create(
+        socket = socket,
+        metadata = metadata,
+      )
+      entered <- Deferred[IO, Unit]
+      resume  <- Deferred[IO, Unit]
+      fiber   <- DynamicPreviewRuntime
+        .reused(
+          IO.uncancelable: _ =>
+            entered.complete(()).void *> resume.get.as(connection),
+        )
+        .use(_ => IO.never)
+        .start
+      _        <- entered.get
+      canceled <- fiber.cancel.start
+      _        <- resume.complete(())
+      _        <- canceled.joinWithNever
+      destroys <- IO.delay(destroyCount())
+    yield assertEquals(destroys, 1)
+
+  test("canceling a stalled reused-preview acquisition does not hang"):
+    for
+      fiber <- DynamicPreviewRuntime
+        .reused(IO.never)
+        .use(_ => IO.unit)
+        .start
+      _ <- fiber.cancel.timeout(1.second)
+    yield ()
+
+  test("canceling reused-preview logging closes the acquired connection"):
+    val metadata = WorkspaceChannelMetadata(
+      transport = WorkspaceChannelTransport.Tcp("127.0.0.1", 43123),
+      pid = 42,
+      sessionId = "session",
+      launchId = "launch",
+      token = "0" * 64,
+    )
+    val (socket, destroyCount) = trackedInertSocket()
+    for
+      connection <- WorkspaceChannelConnection.create(
+        socket = socket,
+        metadata = metadata,
+      )
+      logging <- Deferred[IO, Unit]
+      fiber   <- DynamicPreviewRuntime
+        .reused(IO.pure(connection))
+        .evalTap(_ => logging.complete(()).void *> IO.never)
+        .use(_ => IO.unit)
+        .start
+      _        <- logging.get
+      _        <- fiber.cancel
+      destroys <- IO.delay(destroyCount())
+    yield assertEquals(destroys, 1)
+
+  test("reused-preview acquisition has a total deadline"):
+    val endpoint = WorkspaceChannelEndpoint(
+      canonicalWorkspace = "/workspace",
+      runtimeDirectory = "/runtime",
+      metadataPath = "/runtime/workspace.json",
+      socketPrefix = "/runtime/workspace.",
+      workspaceHash = "hash",
+      runtimeOwner = None,
+    )
+    WorkspacePreview
+      .withinReuseDeadline(IO.never, endpoint, 20.millis)
+      .attempt
+      .map: result =>
+        val failure = result.swap.toOption.collect:
+          case value: WorkspaceReuseUnavailable => value
+        assert(failure.nonEmpty)
+        assert(failure.exists(_.getMessage.contains(endpoint.metadataPath)))
+        assert(failure.forall(_.mayLaunchReplacement))
+
+  test("a stalled IPC handshake has an attempt deadline"):
+    val endpoint = WorkspaceChannelEndpoint(
+      canonicalWorkspace = "/workspace",
+      runtimeDirectory = "/runtime",
+      metadataPath = "/runtime/workspace.json",
+      socketPrefix = "/runtime/workspace.",
+      workspaceHash = "hash",
+      runtimeOwner = None,
+    )
+    WorkspaceChannel
+      .readyWithin(IO.never, endpoint, 20.millis)
+      .attempt
+      .map: result =>
+        val failure = result.swap.toOption.collect:
+          case value: WorkspaceEndpointUnavailable => value
+        assert(failure.nonEmpty)
+        assert(failure.exists(_.getMessage.contains(endpoint.metadataPath)))
+
+  test("an unavailable reused endpoint has a short independent deadline"):
+    val endpoint = WorkspaceChannelEndpoint(
+      canonicalWorkspace = "/workspace",
+      runtimeDirectory = "/runtime",
+      metadataPath = "/runtime/workspace.json",
+      socketPrefix = "/runtime/workspace.",
+      workspaceHash = "hash",
+      runtimeOwner = None,
+    )
+    for
+      retryStarted <- Ref.of[IO, Option[FiniteDuration]](None)
+      reports      <- Ref.of[IO, Int](0)
+      first        <- WorkspacePreview.retryUnavailableEndpoint(
+        retry = IO.pure("first"),
+        endpoint = endpoint,
+        lastError = WorkspaceEndpointUnavailable("connection refused"),
+        timeout = 20.millis,
+        retryStarted = retryStarted,
+        now = IO.pure(Duration.Zero),
+        onFirstRetry = reports.update(_ + 1),
+      )
+      second <- WorkspacePreview.retryUnavailableEndpoint(
+        retry = IO.pure("second"),
+        endpoint = endpoint,
+        lastError = WorkspaceEndpointUnavailable("connection refused"),
+        timeout = 20.millis,
+        retryStarted = retryStarted,
+        now = IO.pure(10.millis),
+        onFirstRetry = reports.update(_ + 1),
+      )
+      result <- WorkspacePreview
+        .retryUnavailableEndpoint(
+          retry = IO.never,
+          endpoint = endpoint,
+          lastError = WorkspaceEndpointUnavailable("connection refused"),
+          timeout = 20.millis,
+          retryStarted = retryStarted,
+          now = IO.pure(20.millis),
+          onFirstRetry = reports.update(_ + 1),
+        )
+        .attempt
+      reportCount <- reports.get
+    yield
+      assertEquals(first, "first")
+      assertEquals(second, "second")
+      assertEquals(reportCount, 1)
+      val failure = result.swap.toOption.collect:
+        case value: WorkspaceReuseUnavailable => value
+      assert(failure.nonEmpty)
+      assert(failure.exists(_.getMessage.contains("connection refused")))
+      assert(failure.exists(_.getMessage.contains(endpoint.metadataPath)))
+      assert(failure.forall(_.mayLaunchReplacement))
+
+  test("an unexpected reuse error permits a diagnosed replacement"):
+    val endpoint = WorkspaceChannelEndpoint(
+      canonicalWorkspace = "/workspace",
+      runtimeDirectory = "/runtime",
+      metadataPath = "/runtime/workspace.json",
+      socketPrefix = "/runtime/workspace.",
+      workspaceHash = "hash",
+      runtimeOwner = None,
+    )
+    val underlying = IllegalStateException("unexpected reuse failure")
+    val failure    = WorkspacePreview.replacementAfterReuseFailure(
+      underlying,
+      endpoint,
+    )
+
+    assert(failure.mayLaunchReplacement)
+    assert(failure.getMessage.contains("unexpected reuse failure"))
+    assert(failure.getMessage.contains(endpoint.metadataPath))
+    assertEquals(failure.getCause.getCause, underlying)
 
   test("workspace endpoints are stable, distinct, short, and outside projects"):
     val root  = TestNodeRuntime.cwd()
@@ -905,18 +1110,44 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
         ),
       )
 
-  test("a stalled existing-preview connection falls back to a new launch"):
-    for
-      launches <- Ref.of[IO, Int](0)
-      result   <- WorkspacePreview.reuseOrLaunch(
-        reuse = IO.never[String],
-        launch = launches.update(_ + 1).as("launched"),
-        timeout = 20.millis,
+  test("permanent metadata errors are not publication retries"):
+    IO:
+      val version = WorkspaceMetadataFailure.permanent(
+        "unsupported IPC metadata version 2",
       )
-      count <- launches.get
-    yield
-      assertEquals(result, "launched")
-      assertEquals(count, 1)
+      val malformed = WorkspaceMetadataFailure.permanent(
+        "IPC metadata is malformed JSON: unexpected token",
+      )
+      val provisional = WorkspaceMetadataFailure.pendingPublication(
+        "IPC TCP port is invalid",
+      )
+      assert(!version.publicationPending)
+      assert(!malformed.publicationPending)
+      assert(provisional.publicationPending)
+      assert(
+        version
+          .withRecovery("/tmp/workspace.json")
+          .getMessage
+          .contains("/tmp/workspace.json"),
+      )
+      assert(!WorkspaceConnectionRetry.duringOwnedStartup(version))
+      assert(!WorkspaceConnectionRetry.duringOwnedStartup(malformed))
+      assert(WorkspaceConnectionRetry.duringOwnedStartup(provisional))
+      assert(
+        WorkspaceConnectionRetry.duringOwnedStartup(
+          WorkspaceEndpointUnavailable("not published"),
+        ),
+      )
+      assert(
+        WorkspaceConnectionRetry.duringOwnedStartup(
+          WorkspaceLaunchMismatch("expected", "actual"),
+        ),
+      )
+      assert(
+        !WorkspaceConnectionRetry.duringOwnedStartup(
+          WorkspaceProtocolFailure("invalid server response"),
+        ),
+      )
 
   test("IPC disconnect falls back to exact process release"):
     for
@@ -1096,6 +1327,28 @@ class WorkspaceChannelSuite extends CatsEffectSuite:
       ): js.Function0[Unit],
     )
     socket.asInstanceOf[NodeSocket] -> (() => events.toVector)
+
+  private def failingPingSocket(): NodeSocket =
+    val socket   = js.Dynamic.literal()
+    var writes   = 0
+    val register =
+      ((_: String, _: js.Function) => socket): js.Function2[
+        String,
+        js.Function,
+        js.Dynamic,
+      ]
+    socket.updateDynamic("on")(register)
+    socket.updateDynamic("once")(register)
+    socket.updateDynamic("off")(register)
+    socket.updateDynamic("write")(
+      ((_: String) =>
+        writes += 1
+        if writes > 1 then throw IllegalStateException("write failed")
+        true,
+      ): js.Function1[String, Boolean],
+    )
+    socket.updateDynamic("destroy")((() => ()): js.Function0[Unit])
+    socket.asInstanceOf[NodeSocket]
 
   private def bytes(values: Int*): Uint8Array =
     val result = new Uint8Array(values.length)

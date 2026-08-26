@@ -197,6 +197,9 @@ class NodeProcessSuite extends CatsEffectSuite:
           assert(result.isLeft)
           assert(actual.contains("ENOENT"))
 
+  test("reports metadata version skew without launching a replacement"):
+    Dispatcher.parallel[IO](await = false).use(testMetadataVersionSkew)
+
   test("stops the actual basic sbt preview without leaving its listener"):
     if !runExampleIntegration then IO.unit
     else Dispatcher.parallel[IO](await = false).use(testExampleLifecycle)
@@ -255,6 +258,62 @@ class NodeProcessSuite extends CatsEffectSuite:
       assert(!stopped)
       assert(rebound)
       assert(!alive)
+
+  private def testMetadataVersionSkew(
+      dispatcher: Dispatcher[IO],
+  ): IO[Unit] =
+    for
+      endpoint <- WorkspaceChannel.endpoint(workspace)
+      ready    <- Deferred[IO, Started]
+      log      <- Ref.of[IO, String]("")
+      result   <- managedProcess(
+        dispatcher = dispatcher,
+        command = command(serverScript(port = 0, ignoreTerm = false)),
+        append = capture(log, ready),
+        timeouts = ProcessShutdownTimeouts.default,
+      ).use:
+        case (_, stopFixture) =>
+          for
+            fixture <- ready.get.timeout(5.seconds)
+            incompatible =
+              s"""{"version":2,"protocol":"${WorkspaceChannel.Protocol}","transport":"tcp","host":"127.0.0.1","port":${fixture.port},"pid":${fixture.pid},"sessionId":"future-session","launchId":"future-launch","token":"${"0" * 64}"}"""
+            _ <- promise(
+              TestNodeFsPromises.writeFile(
+                endpoint.metadataPath,
+                incompatible,
+              ),
+            )
+            launchLog <- Ref.of[IO, String]("")
+            attempted <- WorkspacePreview
+              .launch(dispatcher, chunk => launchLog.update(_ + chunk))(
+                workspace,
+                missingCommand.copy(endpoint = PreviewEndpoint.Announced),
+              )
+              .use(_ => IO.unit)
+              .attempt
+            output <- launchLog.get
+            served <- NodeHttpProbe.ready(
+              right(PreviewUrl.parse(fixture.url)),
+            )
+            _ <- promise(
+              TestNodeFsPromises.rm(
+                endpoint.metadataPath,
+                js.Dynamic.literal(force = true),
+              ),
+            )
+            _ <- stopFixture
+          yield (attempted, output, served)
+      (attempted, output, served) = result
+    yield
+      assert(
+        attempted.swap.exists(error =>
+          Option(error.getMessage).exists(
+            _.contains("unsupported IPC metadata version 2"),
+          ),
+        ),
+      )
+      assert(!output.contains("spawn failed"))
+      assert(served)
 
   private def testForcedTree(dispatcher: Dispatcher[IO]): IO[Unit] =
     for
@@ -582,9 +641,7 @@ class NodeProcessSuite extends CatsEffectSuite:
               NodeFsPromises.readFile(endpoint.metadataPath, "utf8"),
             )
             metadata <- IO.fromEither(
-              WorkspaceChannelMetadataParser
-                .parse(metadataText, endpoint)
-                .leftMap(IllegalStateException(_)),
+              WorkspaceChannelMetadataParser.parse(metadataText, endpoint),
             )
             socketPath = metadata.transport match
               case WorkspaceChannelTransport.Unix(path) => Some(path)
