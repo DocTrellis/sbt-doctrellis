@@ -164,6 +164,41 @@ class WebviewPreviewSuite extends CatsEffectSuite:
             assert(panel.html.contains("sandbox=\"\""))
             assert(!panel.html.contains("allow-scripts allow-same-origin"))
 
+  test("reports bridge discovery failures before using the direct frame"):
+    val failure     = IllegalStateException("bridge resolution failed")
+    val resolutions = mutable.ListBuffer.empty[PreviewUrl]
+    val reported    = mutable.ListBuffer.empty[(Workspace, Throwable)]
+    val backend     = new FakeBackend:
+      override def resolveBridge(url: PreviewUrl): IO[Option[String]] =
+        IO.delay(resolutions += url) *> IO.raiseError(failure)
+
+      override def reportBridgeFailure(
+          workspace: Workspace,
+          error: Throwable,
+      ): IO[Unit] = IO.delay(reported += workspace -> error).void
+
+    PreviewPanelRegistry
+      .resource(backend)
+      .use: registry =>
+        for
+          _ <- registry.show(
+            first,
+            PreviewViewState.Ready(url(4242), supportsLiveRefresh = true),
+          )
+          _ <- registry.update(
+            first,
+            PreviewViewState.Refreshed(url(4242), revision(2)),
+          )
+        yield
+          val panel = at(backend.created, 0)
+          assertEquals(resolutions.toList, List(url(4242), url(4242)))
+          assertEquals(
+            reported.toList,
+            List(first -> failure),
+          )
+          assert(panel.html.contains("sandbox=\"\""))
+          assert(!panel.html.contains("allow-scripts allow-same-origin"))
+
   test("refreshes through the bridge without replacing the current frame"):
     val bridgeResolutions = mutable.ListBuffer.empty[PreviewUrl]
     val backend           = new FakeBackend:

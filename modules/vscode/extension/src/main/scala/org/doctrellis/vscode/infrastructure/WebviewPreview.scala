@@ -32,6 +32,10 @@ private[infrastructure] trait PreviewPanelBackend:
   // A backend without bridge discovery always selects the direct iframe.
   def resolveBridge(url: PreviewUrl): IO[Option[String]] =
     IO.pure(url).as(None)
+  def reportBridgeFailure(
+      workspace: Workspace,
+      error: Throwable,
+  ): IO[Unit] = IO.pure((workspace, error)).void
   def create(
       workspace: Workspace,
       onDispose: IO[Unit],
@@ -107,6 +111,7 @@ private final case class CachedBridge(
 private final case class BridgeSession(
     generation: Object,
     cached: Option[CachedBridge],
+    failureReported: Boolean,
 )
 
 private final case class PanelInstallation(
@@ -594,25 +599,52 @@ private[infrastructure] final class PreviewPanelRegistry private (
           case _ =>
             backend
               .resolveBridge(url)
-              .handleError(_ => None)
-              .flatTap: resolved =>
-                bridges.update: current =>
-                  current.get(workspace.key) match
-                    case Some(actual)
-                        if actual.generation.eq(session.generation) =>
-                      current.updated(
-                        workspace.key,
-                        actual.copy(cached = Some(CachedBridge(url, resolved))),
+              .attempt
+              .flatMap:
+                case Left(error) =>
+                  bridges
+                    .modify: current =>
+                      current.get(workspace.key) match
+                        case Some(actual)
+                            if actual.generation.eq(session.generation) &&
+                              !actual.failureReported =>
+                          current.updated(
+                            workspace.key,
+                            actual.copy(failureReported = true),
+                          ) -> true
+                        case _ => current -> false
+                    .flatMap: report =>
+                      IO.whenA(report)(
+                        backend
+                          .reportBridgeFailure(workspace, error)
+                          .attempt
+                          .void,
                       )
-                    case _ => current
+                    .as(None)
+                case Right(resolved) =>
+                  bridges
+                    .update: current =>
+                      current.get(workspace.key) match
+                        case Some(actual)
+                            if actual.generation.eq(session.generation) =>
+                          current.updated(
+                            workspace.key,
+                            actual.copy(
+                              cached = Some(CachedBridge(url, resolved)),
+                              failureReported = false,
+                            ),
+                          )
+                        case _ => current
+                    .as(resolved)
 
   private def bridgeSession(key: WorkspaceId): IO[BridgeSession] =
-    IO.delay(BridgeSession(new Object, cached = None))
-      .flatMap: fresh =>
-        bridges.modify: current =>
-          current.get(key) match
-            case Some(existing) => current                     -> existing
-            case None           => current.updated(key, fresh) -> fresh
+    IO.delay(
+      BridgeSession(new Object, cached = None, failureReported = false),
+    ).flatMap: fresh =>
+      bridges.modify: current =>
+        current.get(key) match
+          case Some(existing) => current                     -> existing
+          case None           => current.updated(key, fresh) -> fresh
 
   private def resetBridgeSession(
       key: WorkspaceId,
@@ -620,9 +652,10 @@ private[infrastructure] final class PreviewPanelRegistry private (
   ): IO[Unit] =
     state match
       case PreviewViewState.Starting =>
-        IO.delay(BridgeSession(new Object, cached = None))
-          .flatMap: fresh =>
-            bridges.update(_.updated(key, fresh))
+        IO.delay(
+          BridgeSession(new Object, cached = None, failureReported = false),
+        ).flatMap: fresh =>
+          bridges.update(_.updated(key, fresh))
       case PreviewViewState.Stopped | PreviewViewState.Failed(_) |
           PreviewViewState.Exited(_) =>
         bridges.update(_.removed(key))
@@ -726,10 +759,7 @@ private[infrastructure] object PreviewWebviewHtml:
       |    frame.setAttribute("sandbox", "");
       |    frame.removeAttribute("data-doctrellis-preview-url");
       |    frame.src = directUrl;
-      |    if (pendingRefresh) {
-      |      accept(pendingRefresh);
-      |      pendingRefresh = null;
-      |    }
+      |    pendingRefresh = null;
       |  };
       |  const armFallback = () => {
       |    clearTimeout(timeout);
@@ -786,7 +816,6 @@ private[infrastructure] object PreviewWebviewHtml:
       |            pendingRefresh.refresh,
       |            bridgeOrigin
       |          );
-      |          accept(pendingRefresh);
       |          pendingRefresh = null;
       |        }
       |      } else if (message.type === "doctrellis.bridge.rejected") {
@@ -820,12 +849,14 @@ private[infrastructure] object PreviewWebviewHtml:
       |      refreshId: message.refreshId,
       |      revision: message.revision
       |    };
+      |    // Acknowledge receipt immediately; bridge delivery may require the
+      |    // legacy fallback timer and must not hold up the host refresh loop.
+      |    accept(pending);
       |    if (legacy) {
       |      pendingRefresh = pending;
       |      retryBridge();
       |    } else if (active) {
       |      frame.contentWindow.postMessage(pending.refresh, bridgeOrigin);
-      |      accept(pending);
       |    } else pendingRefresh = pending;
       |  });
       |})();""".stripMargin
@@ -1026,6 +1057,14 @@ private[infrastructure] final class VscodePreviewPanelBackend(
       NodeHttpBridgeProbe
         .available(bridge)
         .ifM(resolve(bridge).map(Some(_)), IO.none)
+
+  override def reportBridgeFailure(
+      workspace: Workspace,
+      error: Throwable,
+  ): IO[Unit] =
+    log(
+      s"[${workspace.name}] Failed to resolve the DocTrellis Webview bridge; using the direct preview: ${ThrowableMessage.from(error)}\n",
+    )
 
   def create(
       workspace: Workspace,

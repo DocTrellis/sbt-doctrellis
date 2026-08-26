@@ -26,11 +26,15 @@ class PreviewWebviewScriptSuite extends FunSuite:
     harness.fireNextTimeout()
 
     assertEquals(harness.frameUrl, harness.bridgeUrl)
-    assertEquals(harness.refreshAcknowledgements, Nil)
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
     assertEquals(harness.pendingTimerCount, 0)
     assertEquals(
       harness.vscodeMessageTypes,
-      List("doctrellis.preview.ready", "doctrellis.preview.ready"),
+      List(
+        "doctrellis.preview.ready",
+        "doctrellis.preview.refresh-accepted",
+        "doctrellis.preview.ready",
+      ),
     )
     assertEquals(
       harness.wrapperReadyTokens,
@@ -55,11 +59,11 @@ class PreviewWebviewScriptSuite extends FunSuite:
     )
     assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
 
-  test("acknowledges a queued refresh only after the legacy reload starts"):
+  test("acknowledges a queued refresh while the bridge is activating"):
     val harness = WrapperScriptHarness()
 
     harness.sendRefresh("attempt-1", "2")
-    assertEquals(harness.refreshAcknowledgements, Nil)
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
 
     harness.fireNextTimeout()
     assertEquals(harness.frameUrl, harness.directUrl)
@@ -73,7 +77,7 @@ class PreviewWebviewScriptSuite extends FunSuite:
 
     harness.sendRefresh("attempt-1", "2")
     assertEquals(harness.frameUrl, harness.bridgeUrl)
-    assertEquals(harness.refreshAcknowledgements, Nil)
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
     assertEquals(harness.pendingTimerCount, 1)
 
     harness.fireFrameLoad()
@@ -164,7 +168,7 @@ class PreviewWebviewScriptSuite extends FunSuite:
     harness.sendBridgeActive(source = js.Dynamic.literal())
 
     assertEquals(harness.bridgeMessageTypes, Nil)
-    assertEquals(harness.refreshAcknowledgements, Nil)
+    assertEquals(harness.refreshAcknowledgements, List("attempt-1"))
 
     harness.sendBridgeActive()
 
