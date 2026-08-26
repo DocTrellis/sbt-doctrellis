@@ -1,5 +1,6 @@
 package org.doctrellis.sbtplugin
 
+import java.io.{ByteArrayOutputStream, PrintStream}
 import java.net.{URL, URLClassLoader}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, LinkOption, Path, StandardCopyOption}
@@ -10,9 +11,19 @@ import scala.util.control.NonFatal
 
 import mdoc.interfaces.{DiagnosticSeverity, Mdoc}
 
+private[sbtplugin] final class MdocDocumentFailure(message: String)
+    extends IllegalStateException(message)
+
+private[sbtplugin] final class MdocEngineFailure(cause: Throwable)
+    extends IllegalStateException(
+      s"DocTrellis mdoc engine failed: ${Option(cause.getMessage).filter(_.nonEmpty).getOrElse(cause.toString)}",
+      cause,
+    )
+
 private[sbtplugin] final class MdocProcessor private (
     loader: IsolatedMdocClassLoader,
     engine: Mdoc,
+    console: MdocConsole,
     variables: Map[String, String],
     info: String => Unit,
     warn: String => Unit,
@@ -27,6 +38,7 @@ private[sbtplugin] final class MdocProcessor private (
     ): (relative, input, target) =>
       MdocProcessor.evaluate(
         engine,
+        console,
         relative,
         input,
         target,
@@ -48,6 +60,7 @@ private[sbtplugin] final class MdocProcessor private (
             case Some(existing) => existing.addSuppressed(error)
 
     release(engine.shutdown())
+    release(console.close())
     release(loader.close())
     failure.foreach(throw _)
 
@@ -61,7 +74,8 @@ private[sbtplugin] object MdocProcessor:
       info: String => Unit,
       warn: String => Unit,
   ): MdocProcessor =
-    val loader = IsolatedMdocClassLoader(
+    val console = MdocConsole()
+    val loader  = IsolatedMdocClassLoader(
       classpath.map(_.toUri.toURL).toArray,
       classOf[Mdoc].getClassLoader,
     )
@@ -72,36 +86,18 @@ private[sbtplugin] object MdocProcessor:
         classpath = classpath,
         scalacOptions = scalacOptions,
         settings = settings,
+        console = console,
       )
-      new MdocProcessor(loader, configured, variables, info, warn)
+      new MdocProcessor(loader, configured, console, variables, info, warn)
     catch
       case error: Throwable =>
-        try loader.close()
-        catch case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        def cleanup(action: => Unit): Unit =
+          try action
+          catch
+            case cleanupError: Throwable => error.addSuppressed(cleanupError)
+        cleanup(console.close())
+        cleanup(loader.close())
         throw error
-
-  def process(
-      workspaceDirectory: Path,
-      sourceDirectory: Path,
-      outputDirectory: Path,
-      classpath: Seq[Path],
-      scalacOptions: Seq[String],
-      settings: Seq[String],
-      variables: Map[String, String],
-      info: String => Unit,
-      warn: String => Unit,
-  ): Unit =
-    MdocResource.use(
-      open(
-        workspaceDirectory,
-        classpath,
-        scalacOptions,
-        settings,
-        variables,
-        info,
-        warn,
-      ),
-    )(_.close())(_.process(sourceDirectory, outputDirectory))
 
   private[sbtplugin] def processSourceTree(
       source: Path,
@@ -132,6 +128,7 @@ private[sbtplugin] object MdocProcessor:
       classpath: Seq[Path],
       scalacOptions: Seq[String],
       settings: Seq[String],
+      console: MdocConsole,
   ): Mdoc =
     var current = engine
     try
@@ -139,6 +136,7 @@ private[sbtplugin] object MdocProcessor:
       current = current.withClasspath(classpath.asJava)
       current = current.withScalacOptions(scalacOptions.asJava)
       current = current.withSettings(settings.asJava)
+      current = current.withConsoleReporter(console.stream)
       current
     catch
       case error: Throwable =>
@@ -167,6 +165,7 @@ private[sbtplugin] object MdocProcessor:
 
   private def evaluate(
       engine: Mdoc,
+      console: MdocConsole,
       relative: Path,
       input: Path,
       output: Path,
@@ -174,12 +173,16 @@ private[sbtplugin] object MdocProcessor:
       info: String => Unit,
       warn: String => Unit,
   ): Unit =
-    val result = engine.evaluateMarkdownDocument(
-      relative.toString,
-      Files.readString(input, StandardCharsets.UTF_8),
-      variables.asJava,
-    )
-    val diagnostics = result.diagnostics().asScala.toVector
+    console.reset()
+    val source                 = Files.readString(input, StandardCharsets.UTF_8)
+    val (content, diagnostics) = MdocEngineEvaluation:
+      val result = engine.evaluateMarkdownDocument(
+        relative.toString,
+        source,
+        variables.asJava,
+      )
+      result.content() -> result.diagnostics().asScala.toVector
+    val consoleOutput = MdocConsoleOutput.normalize(console.result())
     diagnostics.foreach: diagnostic =>
       val position = diagnostic.position()
       val message  =
@@ -188,18 +191,61 @@ private[sbtplugin] object MdocProcessor:
       else if diagnostic.severity() == DiagnosticSeverity.Info then
         info(message)
 
-    val errors = diagnostics.filter(_.severity() == DiagnosticSeverity.Error)
+    val diagnosticErrors = diagnostics
+      .filter(_.severity() == DiagnosticSeverity.Error)
+      .map: diagnostic =>
+        val position = diagnostic.position()
+        s"$relative:${position.startLine() + 1}:${position.startColumn() + 1}: ${diagnostic.message()}"
+    val consoleErrors = Option
+      .when(MdocConsoleOutput.hasErrors(consoleOutput))(
+        s"$relative:\n$consoleOutput",
+      )
+      .toVector
+    val errors = diagnosticErrors ++ consoleErrors
     if errors.nonEmpty then
       val rendered = errors
-        .map: diagnostic =>
-          val position = diagnostic.position()
-          s"$relative:${position.startLine() + 1}:${position.startColumn() + 1}: ${diagnostic.message()}"
         .mkString("\n")
-      throw IllegalStateException(
+      throw MdocDocumentFailure(
         s"DocTrellis mdoc processing failed:\n$rendered",
       )
 
-    Files.writeString(output, result.content(), StandardCharsets.UTF_8): Unit
+    if consoleOutput.nonEmpty then warn(s"$relative:\n$consoleOutput")
+
+    Files.writeString(output, content, StandardCharsets.UTF_8): Unit
+
+private[sbtplugin] object MdocEngineEvaluation:
+  def apply[A](operation: => A): A =
+    try operation
+    catch case NonFatal(error) => throw MdocEngineFailure(error)
+
+private[sbtplugin] final class MdocConsole private (
+    buffer: ByteArrayOutputStream,
+    val stream: PrintStream,
+) extends AutoCloseable:
+  def reset(): Unit = buffer.reset()
+
+  def result(): String =
+    stream.flush()
+    buffer.toString(StandardCharsets.UTF_8)
+
+  override def close(): Unit = stream.close()
+
+private[sbtplugin] object MdocConsole:
+  def apply(): MdocConsole =
+    val buffer = ByteArrayOutputStream()
+    new MdocConsole(
+      buffer,
+      PrintStream(buffer, true, StandardCharsets.UTF_8),
+    )
+
+private[sbtplugin] object MdocConsoleOutput:
+  private val AnsiEscape = "\u001b\\[[0-9;]*m".r
+
+  def normalize(value: String): String =
+    AnsiEscape.replaceAllIn(value, "").trim
+
+  def hasErrors(value: String): Boolean =
+    value.linesIterator.exists(_.startsWith("error:"))
 
 private[sbtplugin] object MdocResource:
   def use[A, B](resource: => A)(release: A => Unit)(operation: A => B): B =

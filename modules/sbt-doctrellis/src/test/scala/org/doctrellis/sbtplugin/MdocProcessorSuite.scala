@@ -3,6 +3,26 @@ package org.doctrellis.sbtplugin
 import java.nio.file.{Files, LinkOption}
 
 class MdocProcessorSuite extends munit.FunSuite:
+  test("classifies only failures crossing the mdoc engine boundary"):
+    val underlying = IllegalStateException("engine exploded")
+    val failure    = intercept[MdocEngineFailure]:
+      MdocEngineEvaluation(throw underlying)
+
+    assertEquals(failure.getCause, underlying)
+    assert(failure.getMessage.contains("engine exploded"))
+
+  test("recognizes compiler errors in the mdoc console reporter output"):
+    val output =
+      "\u001b[31merror\u001b[39m: <input>:1:1: Not found: missing\nmissing\n^^^^^^^\n"
+    val normalized = MdocConsoleOutput.normalize(output)
+
+    assertEquals(
+      normalized,
+      "error: <input>:1:1: Not found: missing\nmissing\n^^^^^^^",
+    )
+    assert(MdocConsoleOutput.hasErrors(normalized))
+    assert(!MdocConsoleOutput.hasErrors("warning: unused import"))
+
   test("skips directory symlinks while preserving file symlink inputs"):
     assume(!isWindows, "requires Unix symbolic-link semantics")
     val root     = Files.createTempDirectory("doctrellis-mdoc-links-")

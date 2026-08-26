@@ -4,6 +4,7 @@ $ exec grep -Fq res0: target/doctrellis/mdoc/index.md
 $ exists target/doctrellis/site/index.html
 $ exec grep -Fq Scripted target/doctrellis/site/index.html
 $ exec grep -Fq res0 target/doctrellis/site/index.html
+$ exec grep -Fq 'classpath value before' target/doctrellis/site/index.html
 $ exec grep -Fq 'type="checkbox"' target/doctrellis/site/index.html
 $ exec grep -Fq 'disabled="disabled"' target/doctrellis/site/index.html
 $ exec grep -Fq 'checked="checked"' target/doctrellis/site/index.html
@@ -23,4 +24,5 @@ $ copy-file fixtures/broken-link.md docs/broken-link.md
 -> doctrellisBuild
 $ delete docs/broken-link.md
 > writeScriptedPluginVersion
-$ exec sh live-preview-test.sh scripted-plugin.version
+> writeScriptedClasspathArtifact
+$ exec sh live-preview-test.sh scripted-plugin.version scripted-classpath-artifact

@@ -10,6 +10,16 @@ if [ -z "$plugin_version" ]; then
   echo "plugin version file is empty: $plugin_version_file" >&2
   exit 1
 fi
+classpath_artifact_file=${2:?classpath artifact file is required}
+if [ ! -f "$classpath_artifact_file" ]; then
+  echo "classpath artifact file does not exist: $classpath_artifact_file" >&2
+  exit 1
+fi
+classpath_artifact=$(sed -n '1p' "$classpath_artifact_file")
+if [ ! -e "$classpath_artifact" ]; then
+  echo "classpath artifact does not exist: $classpath_artifact" >&2
+  exit 1
+fi
 
 preview_log=live-preview.log
 preview_pid=
@@ -133,6 +143,22 @@ wait_for() {
   done
 }
 
+rebuild_failure_count() {
+  grep -Fc \
+    'rebuild failed; continuing to serve the last successful site' \
+    "$preview_log" 2>/dev/null || true
+}
+
+has_rebuild_failure_count() {
+  minimum=$1
+  actual=$(rebuild_failure_count)
+  [ "$actual" -ge "$minimum" ]
+}
+
+mdoc_reload_count() {
+  grep -Fc 'reloading the mdoc engine' "$preview_log" 2>/dev/null || true
+}
+
 start_preview() {
   sbt_command=$(command -v sbt)
   if command -v setsid >/dev/null 2>&1; then
@@ -177,9 +203,54 @@ wait_for "preview startup" grep -Fq 'DocTrellis preview ready at http://127.0.0.
 printf '\n## Live preview edit\n\nLive watch revision marker.\n' >>docs/index.md
 wait_for "the first watched rebuild" grep -Fq 'Live watch revision marker.' target/doctrellis/site/index.html
 
+refresh_classes=target/classpath-refresh
+refresh_artifact=target/classpath-refresh.jar
+if ! command -v javac >/dev/null 2>&1; then
+  echo "javac is required for the classpath refresh test" >&2
+  exit 1
+fi
+if ! command -v jar >/dev/null 2>&1; then
+  echo "jar is required for the classpath refresh test" >&2
+  exit 1
+fi
+mkdir -p "$refresh_classes"
+javac --release 17 -d "$refresh_classes" fixtures/FreshValue.java
+jar cf "$refresh_artifact" -C "$refresh_classes" \
+  org/doctrellis/example/FreshValue.class
+mv -f "$refresh_artifact" "$classpath_artifact"
+if [ -L "$classpath_artifact" ]; then
+  echo "classpath refresh followed the sbt output symlink" >&2
+  exit 1
+fi
+printf '\nClasspath refresh marker.\n' >>docs/index.md
+wait_for "the classpath-triggered mdoc reload" grep -Fq \
+  'DocTrellis: classpath changed; reloading the mdoc engine' "$preview_log"
+wait_for "the classpath-triggered rebuild" grep -Fq \
+  'Classpath refresh marker.' target/doctrellis/site/index.html
+grep -Fq 'classpath value after' target/doctrellis/site/index.html
+
+reload_count_before=$(mdoc_reload_count)
+failure_count_before=$(rebuild_failure_count)
+cp fixtures/broken-mdoc.md docs/broken-mdoc.md
+wait_for "a non-terminal mdoc failure" has_rebuild_failure_count \
+  "$((failure_count_before + 1))"
+grep -Fq 'Classpath refresh marker.' target/doctrellis/site/index.html
+
+rm docs/broken-mdoc.md
+printf '\nRecovered mdoc preview marker.\n' >>docs/index.md
+wait_for "recovery after an mdoc failure" grep -Fq \
+  'Recovered mdoc preview marker.' target/doctrellis/site/index.html
+reload_count_after=$(mdoc_reload_count)
+if [ "$reload_count_after" -ne "$reload_count_before" ]; then
+  echo "a document error unnecessarily reloaded the mdoc engine" >&2
+  exit 1
+fi
+
+failure_count_before=$(rebuild_failure_count)
 cp fixtures/broken-link.md docs/broken-link.md
-wait_for "a non-terminal rebuild failure" grep -Fq 'rebuild failed; continuing to serve the last successful site' "$preview_log"
-grep -Fq 'Live watch revision marker.' target/doctrellis/site/index.html
+wait_for "a non-terminal Laika failure" has_rebuild_failure_count \
+  "$((failure_count_before + 1))"
+grep -Fq 'Recovered mdoc preview marker.' target/doctrellis/site/index.html
 
 rm docs/broken-link.md
 printf '\nRecovered live preview marker.\n' >>docs/index.md

@@ -1,6 +1,6 @@
 package org.doctrellis.sbtplugin
 
-import java.nio.file.Files
+import java.nio.file.{Files, LinkOption}
 import java.util.UUID
 
 import sbt.util.LogExchange
@@ -87,6 +87,60 @@ class DocTrellisBuildSuite extends munit.FunSuite:
           "new site",
         )
       finally nextPreview.close()
+
+  test("classpath fingerprints detect recompiled directory entries"):
+    val root     = Files.createTempDirectory("doctrellis-classpath-")
+    val classes  = Files.createDirectories(root.resolve("classes"))
+    val compiled = Files.writeString(
+      classes.resolve("Library.class"),
+      "first version",
+    )
+    try
+      val initialTime =
+        Files.getLastModifiedTime(compiled, LinkOption.NOFOLLOW_LINKS)
+      val initial   = ClasspathFingerprint.capture(Vector(classes))
+      val unchanged = ClasspathFingerprint.capture(Vector(classes))
+      Files.writeString(compiled, "other version")
+      Files.setLastModifiedTime(
+        compiled,
+        java.nio.file.attribute.FileTime.fromMillis(
+          initialTime.toMillis + 2000L,
+        ),
+      )
+      val recompiled = ClasspathFingerprint.capture(Vector(classes))
+      Files.writeString(classes.resolve("Added.class"), "added")
+      val added = ClasspathFingerprint.capture(Vector(classes))
+
+      assertEquals(unchanged, initial)
+      assertNotEquals(recompiled, initial)
+      assertNotEquals(added, recompiled)
+    finally GeneratedDirectory.delete(root)
+
+  test("classpath fingerprints tolerate entries replaced during capture"):
+    val root     = Files.createTempDirectory("doctrellis-classpath-unstable-")
+    val missing  = root.resolve("missing")
+    val dangling = root.resolve("classes")
+    try
+      Files.createSymbolicLink(dangling, missing)
+      val fingerprint = ClasspathFingerprint.capture(Vector(dangling))
+      assertEquals(fingerprint.entries.map(_.kind), Vector("unstable"))
+    finally GeneratedDirectory.delete(root)
+
+  test("classpath fingerprints detect an atomically replaced sbt output"):
+    val root   = Files.createTempDirectory("doctrellis-classpath-link-")
+    val first  = Files.writeString(root.resolve("sha256-first.jar"), "same")
+    val second = Files.writeString(root.resolve("sha256-second.jar"), "same")
+    val output = root.resolve("project.jar")
+    try
+      Files.setLastModifiedTime(second, Files.getLastModifiedTime(first))
+      Files.createSymbolicLink(output, first.getFileName)
+      val initial = ClasspathFingerprint.capture(Vector(output))
+      Files.delete(output)
+      Files.createSymbolicLink(output, second.getFileName)
+      val replaced = ClasspathFingerprint.capture(Vector(output))
+
+      assertNotEquals(replaced, initial)
+    finally GeneratedDirectory.delete(root)
 
   private def program(layout: DocTrellisLayout): DocTrellisBuildProgram =
     DocTrellisBuildProgram(
